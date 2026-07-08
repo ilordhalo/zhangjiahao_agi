@@ -145,8 +145,9 @@ def collect_install_config(
     project_root: Path,
     runtime_mode: str,
     assume_yes: bool,
-    input_func: Callable[[str], str] = input,
+    input_func: Callable[[str], str] | None = None,
 ) -> InstallConfig:
+    input_func = input_func or input
     defaults = detect_git_defaults(project_root)
 
     if assume_yes:
@@ -208,7 +209,7 @@ def install_project(
     runtime_mode: str = "embedded",
     assume_yes: bool = False,
     skip_runtime_download: bool = False,
-    input_func: Callable[[str], str] = input,
+    input_func: Callable[[str], str] | None = None,
 ) -> Path:
     root = project_root or Path.cwd()
     config = collect_install_config(root, runtime_mode, assume_yes, input_func=input_func)

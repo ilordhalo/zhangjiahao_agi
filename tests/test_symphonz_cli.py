@@ -1,8 +1,10 @@
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 import unittest
 
+from symphonz.cli import main
 from symphonz.install import (
     InstallConfig,
     collect_install_config,
@@ -43,10 +45,6 @@ class ConfigTests(unittest.TestCase):
             parsed = read_config(path)
             self.assertEqual(parsed["linear"]["project_slug"], "zhangjiahao-agi-186a15c896ac")
             self.assertEqual(parsed["git"]["gitlab_base_url"], "https://zhangjiahao.me:9011")
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class InstallInputTests(unittest.TestCase):
@@ -176,3 +174,35 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(env["SYMPHONZ_MR_TARGET"], "main")
             self.assertEqual(env["SYMPHONZ_GIT_PROVIDER"], "gitlab")
             self.assertEqual(env["GITLAB_BASE_URL"], "https://gitlab.example.com")
+
+
+class CliSmokeTests(unittest.TestCase):
+    def test_main_rejects_missing_command(self):
+        with self.assertRaises(SystemExit) as raised:
+            main([])
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_install_global_with_answers_creates_project_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "remote", "add", "origin", "https://example.com/group/repo.git"], cwd=root, check=True)
+            old_cwd = Path.cwd()
+            answers = iter(["LINEAR_API_KEY", "project-slug", "", "", "", "", ""])
+
+            try:
+                os.chdir(root)
+                from unittest.mock import patch
+
+                with patch("builtins.input", lambda prompt: next(answers)):
+                    exit_code = main(["install", "--runtime", "global"])
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((root / ".symphonz" / "config.toml").exists())
+            self.assertTrue((root / ".symphonz" / "WORKFLOW.md").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

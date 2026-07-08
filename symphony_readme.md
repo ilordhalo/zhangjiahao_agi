@@ -30,3 +30,27 @@ issue 必须在配置的 Linear Project 里。
 issue 加标签：codex-ready
 状态设为：Todo
 Symphony 会轮询后交给 Codex 执行。
+
+## symphonz CLI
+
+This repository now owns the `symphonz` installer/launcher for project-local Symphony orchestration.
+
+Local development:
+
+```bash
+python3 -m unittest discover -v
+./bin/symphonz install --runtime global
+./bin/symphonz run --print-command
+```
+
+Use embedded runtime mode for a self-contained project install:
+
+```bash
+./bin/symphonz install
+```
+
+Use global runtime mode when `symphony` is already available on the machine:
+
+```bash
+./bin/symphonz install --runtime global
+```
