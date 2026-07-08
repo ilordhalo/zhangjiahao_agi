@@ -2,7 +2,7 @@
 tracker:
   kind: linear
   api_key: $LINEAR_API_KEY
-  project_slug: "zhangjiahao-agi-186a15c896ac"
+  project_slug: "REPLACE_WITH_LINEAR_PROJECT_SLUG"
   required_labels: []
   active_states:
     - Todo
@@ -22,7 +22,7 @@ workspace:
 hooks:
   after_create: |
     set -eu
-    git clone --depth 1 "${SYMPHONZ_REPO_URL:-https://github.com/ilordhalo/zhangjiahao_agi.git}" .
+    git clone --depth 1 "${SYMPHONZ_REPO_URL:-https://example.com/your-org/your-repo.git}" .
     git fetch origin "${SYMPHONZ_BASE_BRANCH:-main}" --depth 1 || true
 agent:
   max_concurrent_agents: 10
@@ -67,7 +67,7 @@ Runtime context:
 - This workspace path is `.symphonz/workspace/<issue_identifier>` under the installed project root.
 - The workspace was populated by cloning `SYMPHONZ_REPO_URL`.
 - The default base branch is `SYMPHONZ_BASE_BRANCH` or `main`.
-- GitLab is the default review target. Use `GITLAB_BASE_URL` when present; for this project the expected base URL is `https://zhangjiahao.me:9011`.
+- GitLab is the default review target. Use `GITLAB_BASE_URL` when present; for this project the expected base URL is `https://gitlab.example.com`.
 
 ## Operating Rules
 

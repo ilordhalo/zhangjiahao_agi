@@ -19,7 +19,7 @@
 - Linear issue workspace directories use the issue identifier managed by Symphony.
 - `Done` is a publish trigger, not a terminal state.
 - GitLab is the default review target.
-- Default GitLab base URL is `https://zhangjiahao.me:9011`.
+- Default GitLab base URL is `https://gitlab.example.com`.
 - Default base branch and merge request target are `main`.
 - Use only Python standard library dependencies for the first CLI version.
 
@@ -73,12 +73,12 @@ class ConfigTests(unittest.TestCase):
                 runtime_mode="embedded",
                 runtime_command=".symphonz/bin/symphony",
                 linear_api_key_env="LINEAR_API_KEY",
-                linear_project_slug="zhangjiahao-agi-186a15c896ac",
+                linear_project_slug="REPLACE_WITH_LINEAR_PROJECT_SLUG",
                 git_provider="gitlab",
-                repo_url="https://github.com/ilordhalo/zhangjiahao_agi.git",
+                repo_url="https://example.com/your-org/your-repo.git",
                 base_branch="main",
                 mr_target="main",
-                gitlab_base_url="https://zhangjiahao.me:9011",
+                gitlab_base_url="https://gitlab.example.com",
                 workspace_root=".symphonz/workspace",
                 logs_root=".symphonz/logs",
             )
@@ -91,8 +91,8 @@ class ConfigTests(unittest.TestCase):
             self.assertIn('api_key_env = "LINEAR_API_KEY"', content)
             self.assertNotIn("lin_api_", content)
             parsed = read_config(path)
-            self.assertEqual(parsed["linear"]["project_slug"], "zhangjiahao-agi-186a15c896ac")
-            self.assertEqual(parsed["git"]["gitlab_base_url"], "https://zhangjiahao.me:9011")
+            self.assertEqual(parsed["linear"]["project_slug"], "REPLACE_WITH_LINEAR_PROJECT_SLUG")
+            self.assertEqual(parsed["git"]["gitlab_base_url"], "https://gitlab.example.com")
 
 
 if __name__ == "__main__":
@@ -320,7 +320,7 @@ from collections.abc import Callable
 import subprocess
 
 
-DEFAULT_GITLAB_BASE_URL = "https://zhangjiahao.me:9011"
+DEFAULT_GITLAB_BASE_URL = "https://gitlab.example.com"
 
 
 def run_git(project_root: Path, args: list[str]) -> str:

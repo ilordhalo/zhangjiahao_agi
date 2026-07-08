@@ -25,12 +25,12 @@ class ConfigTests(unittest.TestCase):
                 runtime_mode="embedded",
                 runtime_command=".symphonz/bin/symphony",
                 linear_api_key_env="LINEAR_API_KEY",
-                linear_project_slug="zhangjiahao-agi-186a15c896ac",
+                linear_project_slug="REPLACE_WITH_LINEAR_PROJECT_SLUG",
                 git_provider="gitlab",
-                repo_url="https://github.com/ilordhalo/zhangjiahao_agi.git",
+                repo_url="https://example.com/your-org/your-repo.git",
                 base_branch="main",
                 mr_target="main",
-                gitlab_base_url="https://zhangjiahao.me:9011",
+                gitlab_base_url="https://gitlab.example.com",
                 workspace_root=".symphonz/workspace",
                 logs_root=".symphonz/logs",
             )
@@ -43,8 +43,8 @@ class ConfigTests(unittest.TestCase):
             self.assertIn('api_key_env = "LINEAR_API_KEY"', content)
             self.assertNotIn("lin_api_", content)
             parsed = read_config(path)
-            self.assertEqual(parsed["linear"]["project_slug"], "zhangjiahao-agi-186a15c896ac")
-            self.assertEqual(parsed["git"]["gitlab_base_url"], "https://zhangjiahao.me:9011")
+            self.assertEqual(parsed["linear"]["project_slug"], "REPLACE_WITH_LINEAR_PROJECT_SLUG")
+            self.assertEqual(parsed["git"]["gitlab_base_url"], "https://gitlab.example.com")
 
 
 class InstallInputTests(unittest.TestCase):
@@ -86,6 +86,12 @@ class InstallInputTests(unittest.TestCase):
 
 
 class WorkflowInstallTests(unittest.TestCase):
+    personal_values = [
+        bytes.fromhex("7a68616e676a696168616f2d6167692d313836613135633839366163").decode(),
+        bytes.fromhex("7a68616e676a696168616f2e6d65").decode(),
+        bytes.fromhex("696c6f726468616c6f2f7a68616e676a696168616f5f616769").decode(),
+    ]
+
     def make_config(self) -> InstallConfig:
         return InstallConfig(
             runtime_mode="global",
@@ -113,6 +119,12 @@ class WorkflowInstallTests(unittest.TestCase):
         self.assertIn('https://gitlab.example.com', rendered)
         self.assertIn("- `Done` -> implementation is considered complete", rendered)
 
+    def test_default_workflow_template_contains_no_personal_values(self):
+        template = Path("WORKFLOW.md").read_text()
+
+        for value in self.personal_values:
+            self.assertNotIn(value, template)
+
     def test_install_project_global_creates_expected_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -134,6 +146,10 @@ class WorkflowInstallTests(unittest.TestCase):
             self.assertTrue((root / ".symphonz" / "logs").is_dir())
             self.assertFalse((root / ".symphonz" / "runtime").exists())
             self.assertIn(".symphonz/workspace/", (root / ".gitignore").read_text())
+
+            rendered = (root / ".symphonz" / "WORKFLOW.md").read_text()
+            for value in self.personal_values:
+                self.assertNotIn(value, rendered)
 
 
 class RuntimeTests(unittest.TestCase):

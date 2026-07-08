@@ -3,7 +3,7 @@ set -eu
 
 PREFIX="${HOME}/.symphonz"
 SOURCE_DIR=""
-REPO_URL="${SYMPHONZ_REPO_URL:-https://github.com/ilordhalo/zhangjiahao_agi}"
+REPO_URL="${SYMPHONZ_REPO_URL:-https://github.com/your-org/your-repo}"
 REF="${SYMPHONZ_REF:-main}"
 
 usage() {
@@ -15,7 +15,7 @@ Installs symphonz to:
   PATH/lib/symphonz
 
 Examples:
-  curl -fsSL https://raw.githubusercontent.com/ilordhalo/zhangjiahao_agi/main/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/your-org/your-repo/main/install.sh | sh
   sh install.sh --prefix "$HOME/.local" --source .
 EOF
 }

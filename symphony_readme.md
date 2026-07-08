@@ -5,13 +5,13 @@
 project_slug: "REPLACE_WITH_LINEAR_PROJECT_SLUG"
 
 在 shell 里设置新的 Linear key
-export LINEAR_API_KEY="新的_lin_api_xxx"
+export LINEAR_API_KEY="REPLACE_WITH_LINEAR_API_KEY"
 
 配置 GitHub 权限
 Codex/Symphony 要能 push branch、开 PR。
 建议先本机跑：
 gh auth login
-gh repo view ilordhalo/zhangjiahao_agi
+gh repo view your-org/your-repo
 
 把模板放到目标 repo 根目录，命名为：
 WORKFLOW.md
@@ -23,7 +23,7 @@ mise trust
 mise install
 mise exec -- mix setup
 mise exec -- mix build
-mise exec -- ./bin/symphony /path/to/zhangjiahao_agi/WORKFLOW.md --port 4000
+mise exec -- ./bin/symphony /path/to/your-repo/WORKFLOW.md --port 4000
 
 Linear issue 使用方式
 issue 必须在配置的 Linear Project 里。
@@ -38,7 +38,7 @@ This repository now owns the `symphonz` installer/launcher for project-local Sym
 Install to your shell:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ilordhalo/zhangjiahao_agi/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/your-org/your-repo/main/install.sh | sh
 export PATH="$HOME/.symphonz/bin:$PATH"
 symphonz version
 ```
@@ -46,7 +46,7 @@ symphonz version
 Install to a custom prefix:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ilordhalo/zhangjiahao_agi/main/install.sh | sh -s -- --prefix "$HOME/.local"
+curl -fsSL https://raw.githubusercontent.com/your-org/your-repo/main/install.sh | sh -s -- --prefix "$HOME/.local"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 

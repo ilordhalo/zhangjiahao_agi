@@ -66,7 +66,7 @@ The `workspace` directory is intentionally under `.symphonz` so every Linear iss
    - Linear project slug or project ID.
    - Git provider, default `gitlab`.
    - Git remote URL.
-   - GitLab base URL, default `https://zhangjiahao.me:9011` for this environment.
+   - GitLab base URL, default `https://gitlab.example.com` for this environment.
    - Base branch and merge request target branch, default `main`.
    - Runtime mode, default `embedded`.
 4. Create `.symphonz` directories.
@@ -87,14 +87,14 @@ command = ".symphonz/bin/symphony"
 
 [linear]
 api_key_env = "LINEAR_API_KEY"
-project_slug = "zhangjiahao-agi-186a15c896ac"
+project_slug = "REPLACE_WITH_LINEAR_PROJECT_SLUG"
 
 [git]
 provider = "gitlab"
-remote = "https://github.com/ilordhalo/zhangjiahao_agi.git"
+remote = "https://example.com/your-org/your-repo.git"
 base_branch = "main"
 mr_target = "main"
-gitlab_base_url = "https://zhangjiahao.me:9011"
+gitlab_base_url = "https://gitlab.example.com"
 
 [workspace]
 root = ".symphonz/workspace"

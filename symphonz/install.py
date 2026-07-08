@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 
 
-DEFAULT_GITLAB_BASE_URL = "https://zhangjiahao.me:9011"
+DEFAULT_GITLAB_BASE_URL = "https://gitlab.example.com"
 
 
 @dataclass(frozen=True)
