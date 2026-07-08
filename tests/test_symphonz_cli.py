@@ -177,6 +177,20 @@ class RuntimeTests(unittest.TestCase):
 
 
 class CliSmokeTests(unittest.TestCase):
+    def test_bin_symphonz_help_runs_from_repo_root(self):
+        result = subprocess.run(
+            ["./bin/symphonz", "--help"],
+            cwd=Path.cwd(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("install", result.stdout)
+        self.assertIn("run", result.stdout)
+
     def test_main_rejects_missing_command(self):
         with self.assertRaises(SystemExit) as raised:
             main([])
