@@ -247,21 +247,54 @@ class CliSmokeTests(unittest.TestCase):
 
 
 class ShellInstallerTests(unittest.TestCase):
-    def test_install_sh_requires_repo_when_default_is_placeholder(self):
+    def test_install_sh_documents_direct_curl_cli_install(self):
+        script = Path("install.sh").read_text()
+
+        self.assertIn('DEFAULT_REPO_URL="https://github.com/ilordhalo/zhangjiahao_agi"', script)
+        self.assertIn(
+            "curl -fsSL https://raw.githubusercontent.com/ilordhalo/zhangjiahao_agi/main/install.sh | sh",
+            script,
+        )
+
+    def test_install_sh_installs_cli_into_writable_path_without_project_init(self):
         with tempfile.TemporaryDirectory() as tmp:
-            prefix = Path(tmp) / "prefix"
+            repo = Path.cwd()
+            home = Path(tmp) / "home"
+            path_bin = home / ".local" / "bin"
+            project = Path(tmp) / "project"
+            home.mkdir()
+            path_bin.mkdir(parents=True)
+            project.mkdir()
+            env = os.environ.copy()
+            env["HOME"] = str(home)
+            env["PATH"] = f"{path_bin}:/usr/bin:/bin"
 
             result = subprocess.run(
-                ["sh", "install.sh", "--prefix", str(prefix)],
+                ["sh", str(repo / "install.sh"), "--source", str(repo)],
+                cwd=project,
+                env=env,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
             )
 
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("--repo", result.stderr)
-            self.assertFalse((prefix / "bin" / "symphonz").exists())
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((path_bin / "symphonz").exists())
+            self.assertTrue((home / ".symphonz" / "lib" / "symphonz" / "cli.py").exists())
+            self.assertFalse((project / ".symphonz").exists())
+
+            version = subprocess.run(
+                ["symphonz", "version"],
+                cwd=project,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(version.returncode, 0, version.stderr)
+            self.assertIn("symphonz 0.1.0", version.stdout)
 
     def test_installed_symphonz_runs_from_prefix_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
