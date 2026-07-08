@@ -38,7 +38,7 @@ This repository now owns the `symphonz` installer/launcher for project-local Sym
 Install to your shell:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/your-org/your-repo/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/your-org/your-repo/main/install.sh | sh -s -- --repo https://github.com/your-org/your-repo
 export PATH="$HOME/.symphonz/bin:$PATH"
 symphonz version
 ```
@@ -46,7 +46,7 @@ symphonz version
 Install to a custom prefix:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/your-org/your-repo/main/install.sh | sh -s -- --prefix "$HOME/.local"
+curl -fsSL https://raw.githubusercontent.com/your-org/your-repo/main/install.sh | sh -s -- --prefix "$HOME/.local" --repo https://github.com/your-org/your-repo
 export PATH="$HOME/.local/bin:$PATH"
 ```
 

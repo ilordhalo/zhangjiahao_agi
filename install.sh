@@ -3,7 +3,8 @@ set -eu
 
 PREFIX="${HOME}/.symphonz"
 SOURCE_DIR=""
-REPO_URL="${SYMPHONZ_REPO_URL:-https://github.com/your-org/your-repo}"
+DEFAULT_REPO_URL="https://github.com/your-org/your-repo"
+REPO_URL="${SYMPHONZ_REPO_URL:-$DEFAULT_REPO_URL}"
 REF="${SYMPHONZ_REF:-main}"
 
 usage() {
@@ -15,7 +16,7 @@ Installs symphonz to:
   PATH/lib/symphonz
 
 Examples:
-  curl -fsSL https://raw.githubusercontent.com/your-org/your-repo/main/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/your-org/your-repo/main/install.sh | sh -s -- --repo https://github.com/your-org/your-repo
   sh install.sh --prefix "$HOME/.local" --source .
 EOF
 }
@@ -63,6 +64,11 @@ cleanup() {
 trap cleanup EXIT
 
 if [ -z "$SOURCE_DIR" ]; then
+  if [ "$REPO_URL" = "$DEFAULT_REPO_URL" ]; then
+    echo "Set --repo or SYMPHONZ_REPO_URL to the public symphonz repository URL." >&2
+    exit 2
+  fi
+
   TMP_DIR=$(mktemp -d)
 
   if command -v curl >/dev/null 2>&1; then

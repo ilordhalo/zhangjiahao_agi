@@ -247,6 +247,22 @@ class CliSmokeTests(unittest.TestCase):
 
 
 class ShellInstallerTests(unittest.TestCase):
+    def test_install_sh_requires_repo_when_default_is_placeholder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "prefix"
+
+            result = subprocess.run(
+                ["sh", "install.sh", "--prefix", str(prefix)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--repo", result.stderr)
+            self.assertFalse((prefix / "bin" / "symphonz").exists())
+
     def test_installed_symphonz_runs_from_prefix_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
             prefix = Path(tmp) / "prefix"
