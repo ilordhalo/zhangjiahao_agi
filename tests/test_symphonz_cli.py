@@ -1,8 +1,15 @@
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 
-from symphonz.install import InstallConfig, read_config, write_config
+from symphonz.install import (
+    InstallConfig,
+    collect_install_config,
+    detect_git_defaults,
+    read_config,
+    write_config,
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -37,3 +44,41 @@ class ConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InstallInputTests(unittest.TestCase):
+    def test_detect_git_defaults_reads_remote_and_branch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "remote", "add", "origin", "https://example.com/group/repo.git"],
+                cwd=root,
+                check=True,
+            )
+
+            defaults = detect_git_defaults(root)
+
+            self.assertEqual(defaults["repo_url"], "https://example.com/group/repo.git")
+            self.assertEqual(defaults["base_branch"], "main")
+
+    def test_collect_install_config_uses_answers_and_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "remote", "add", "origin", "https://example.com/group/repo.git"],
+                cwd=root,
+                check=True,
+            )
+            answers = iter(["LINEAR_API_KEY", "project-slug", "", "", "", "", ""])
+
+            config = collect_install_config(root, "global", False, input_func=lambda prompt: next(answers))
+
+            self.assertEqual(config.runtime_mode, "global")
+            self.assertEqual(config.runtime_command, "symphony")
+            self.assertEqual(config.linear_project_slug, "project-slug")
+            self.assertEqual(config.git_provider, "gitlab")
+            self.assertEqual(config.repo_url, "https://example.com/group/repo.git")
+            self.assertEqual(config.base_branch, "main")
+            self.assertEqual(config.mr_target, "main")
