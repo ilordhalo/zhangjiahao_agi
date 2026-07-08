@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 
+from symphonz import __version__
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="symphonz")
@@ -14,6 +16,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subcommands.add_parser("run", help="Run the installed Symphony workflow")
     run.add_argument("--print-command", action="store_true", help="Print the runtime command instead of executing it")
+
+    subcommands.add_parser("version", help="Print symphonz version")
 
     return parser
 
@@ -32,6 +36,10 @@ def main(argv: list[str] | None = None) -> int:
         from symphonz.runtime import run_installed
 
         return run_installed(print_command=args.print_command)
+
+    if args.command == "version":
+        print(f"symphonz {__version__}")
+        return 0
 
     parser.error(f"unsupported command: {args.command}")
     return 2

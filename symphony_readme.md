@@ -35,10 +35,26 @@ Symphony 会轮询后交给 Codex 执行。
 
 This repository now owns the `symphonz` installer/launcher for project-local Symphony orchestration.
 
+Install to your shell:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ilordhalo/zhangjiahao_agi/main/install.sh | sh
+export PATH="$HOME/.symphonz/bin:$PATH"
+symphonz version
+```
+
+Install to a custom prefix:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ilordhalo/zhangjiahao_agi/main/install.sh | sh -s -- --prefix "$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
 Local development:
 
 ```bash
 python3 -m unittest discover -v
+./install.sh --prefix /tmp/symphonz-dev --source .
 ./bin/symphonz install --runtime global
 ./bin/symphonz run --print-command
 ```

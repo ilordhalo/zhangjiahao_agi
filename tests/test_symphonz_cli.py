@@ -177,6 +177,18 @@ class RuntimeTests(unittest.TestCase):
 
 
 class CliSmokeTests(unittest.TestCase):
+    def test_main_version_prints_package_version(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        output = StringIO()
+
+        with redirect_stdout(output):
+            exit_code = main(["version"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("symphonz 0.1.0", output.getvalue())
+
     def test_bin_symphonz_help_runs_from_repo_root(self):
         result = subprocess.run(
             ["./bin/symphonz", "--help"],
@@ -216,6 +228,53 @@ class CliSmokeTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertTrue((root / ".symphonz" / "config.toml").exists())
             self.assertTrue((root / ".symphonz" / "WORKFLOW.md").exists())
+
+
+class ShellInstallerTests(unittest.TestCase):
+    def test_installed_symphonz_runs_from_prefix_layout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "prefix"
+            (prefix / "bin").mkdir(parents=True)
+            (prefix / "lib").mkdir(parents=True)
+            subprocess.run(["cp", "bin/symphonz", str(prefix / "bin" / "symphonz")], check=True)
+            subprocess.run(["cp", "-R", "symphonz", str(prefix / "lib" / "symphonz")], check=True)
+
+            result = subprocess.run(
+                [str(prefix / "bin" / "symphonz"), "version"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("symphonz 0.1.0", result.stdout)
+
+    def test_install_sh_installs_from_local_source_to_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "prefix"
+
+            result = subprocess.run(
+                ["sh", "install.sh", "--prefix", str(prefix), "--source", str(Path.cwd())],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((prefix / "bin" / "symphonz").exists())
+            self.assertTrue((prefix / "lib" / "symphonz" / "cli.py").exists())
+
+            version = subprocess.run(
+                [str(prefix / "bin" / "symphonz"), "version"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(version.returncode, 0, version.stderr)
+            self.assertIn("symphonz 0.1.0", version.stdout)
 
 
 if __name__ == "__main__":

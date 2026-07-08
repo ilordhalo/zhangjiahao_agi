@@ -2,7 +2,9 @@
 from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+install_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(install_root))
+sys.path.insert(0, str(install_root / "lib"))
 
 from symphonz.cli import main
 
