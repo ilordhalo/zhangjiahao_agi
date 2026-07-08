@@ -185,3 +185,44 @@ def collect_install_config(
         workspace_root=".symphonz/workspace",
         logs_root=".symphonz/logs",
     )
+
+
+def ensure_gitignore(project_root: Path) -> None:
+    gitignore = project_root / ".gitignore"
+    existing = gitignore.read_text().splitlines() if gitignore.exists() else []
+    additions = [".symphonz/workspace/", ".symphonz/logs/", ".symphonz/runtime/"]
+    updated = existing[:]
+    for item in additions:
+        if item not in updated:
+            updated.append(item)
+    gitignore.write_text("\n".join(updated).rstrip() + "\n")
+
+
+def create_base_layout(project_root: Path) -> None:
+    for relative in [".symphonz", ".symphonz/workspace", ".symphonz/logs"]:
+        (project_root / relative).mkdir(parents=True, exist_ok=True)
+
+
+def install_project(
+    project_root: Path | None = None,
+    runtime_mode: str = "embedded",
+    assume_yes: bool = False,
+    skip_runtime_download: bool = False,
+    input_func: Callable[[str], str] = input,
+) -> Path:
+    root = project_root or Path.cwd()
+    config = collect_install_config(root, runtime_mode, assume_yes, input_func=input_func)
+    create_base_layout(root)
+    write_config(root / ".symphonz" / "config.toml", config)
+
+    from symphonz.workflow import write_workflow
+
+    write_workflow(root, config)
+    ensure_gitignore(root)
+
+    if runtime_mode == "embedded":
+        from symphonz.runtime import install_embedded_runtime
+
+        install_embedded_runtime(root, skip_download=skip_runtime_download)
+
+    return root / ".symphonz"
