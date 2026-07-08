@@ -11,6 +11,7 @@ from symphonz.install import (
     read_config,
     write_config,
 )
+from symphonz.runtime import build_run_command, install_embedded_runtime
 from symphonz.workflow import render_workflow
 
 
@@ -135,3 +136,43 @@ class WorkflowInstallTests(unittest.TestCase):
             self.assertTrue((root / ".symphonz" / "logs").is_dir())
             self.assertFalse((root / ".symphonz" / "runtime").exists())
             self.assertIn(".symphonz/workspace/", (root / ".gitignore").read_text())
+
+
+class RuntimeTests(unittest.TestCase):
+    def test_install_embedded_runtime_skip_download_creates_shim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            install_embedded_runtime(root, skip_download=True)
+
+            shim = root / ".symphonz" / "bin" / "symphony"
+            self.assertTrue(shim.exists())
+            self.assertIn("runtime download was skipped", shim.read_text())
+            self.assertTrue(shim.stat().st_mode & 0o111)
+
+    def test_build_run_command_embedded_exports_expected_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = InstallConfig(
+                runtime_mode="embedded",
+                runtime_command=".symphonz/bin/symphony",
+                linear_api_key_env="LINEAR_API_KEY",
+                linear_project_slug="project-slug",
+                git_provider="gitlab",
+                repo_url="https://example.com/group/repo.git",
+                base_branch="main",
+                mr_target="main",
+                gitlab_base_url="https://gitlab.example.com",
+                workspace_root=".symphonz/workspace",
+                logs_root=".symphonz/logs",
+            )
+            write_config(root / ".symphonz" / "config.toml", config)
+
+            command, env = build_run_command(root)
+
+            self.assertEqual(command, [".symphonz/bin/symphony", ".symphonz/WORKFLOW.md", "--logs-root", ".symphonz/logs"])
+            self.assertEqual(env["SYMPHONZ_REPO_URL"], "https://example.com/group/repo.git")
+            self.assertEqual(env["SYMPHONZ_BASE_BRANCH"], "main")
+            self.assertEqual(env["SYMPHONZ_MR_TARGET"], "main")
+            self.assertEqual(env["SYMPHONZ_GIT_PROVIDER"], "gitlab")
+            self.assertEqual(env["GITLAB_BASE_URL"], "https://gitlab.example.com")
