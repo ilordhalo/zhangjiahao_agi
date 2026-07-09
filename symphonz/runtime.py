@@ -17,6 +17,25 @@ def make_executable(path: Path) -> None:
     path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
+def write_embedded_runtime_shim(project_root: Path) -> None:
+    shim = project_root / ".symphonz" / "bin" / "symphony"
+    elixir_dir = project_root / ".symphonz" / "runtime" / "symphony" / "elixir"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+
+    if (elixir_dir / "mise.toml").exists():
+        shim.write_text(
+            "#!/bin/sh\n"
+            'cd "$(dirname "$0")/../runtime/symphony/elixir"\n'
+            'exec mise exec -- ./bin/symphony "$@"\n'
+        )
+    else:
+        shim.write_text(
+            "#!/bin/sh\n"
+            'exec "$(dirname "$0")/../runtime/symphony/elixir/bin/symphony" "$@"\n'
+        )
+    make_executable(shim)
+
+
 def install_embedded_runtime(project_root: Path, skip_download: bool) -> None:
     bin_dir = project_root / ".symphonz" / "bin"
     runtime_dir = project_root / ".symphonz" / "runtime" / "symphony"
@@ -43,15 +62,20 @@ def install_embedded_runtime(project_root: Path, skip_download: bool) -> None:
         subprocess.run(["mise", "exec", "--", "mix", "setup"], cwd=elixir_dir, check=True)
         subprocess.run(["mise", "exec", "--", "mix", "build"], cwd=elixir_dir, check=True)
 
-    shim.write_text(
-        "#!/bin/sh\n"
-        'exec "$(dirname "$0")/../runtime/symphony/elixir/bin/symphony" "$@"\n'
-    )
-    make_executable(shim)
+    write_embedded_runtime_shim(project_root)
+
+
+def refresh_embedded_runtime_shim(project_root: Path, command: str) -> None:
+    if command != ".symphonz/bin/symphony":
+        return
+    runtime_dir = project_root / ".symphonz" / "runtime" / "symphony"
+    if runtime_dir.exists():
+        write_embedded_runtime_shim(project_root)
 
 
 def build_run_command(project_root: Path) -> tuple[list[str], dict[str, str]]:
     config = read_config(project_root / ".symphonz" / "config.toml")
+    refresh_embedded_runtime_shim(project_root, config["runtime"]["command"])
     command = [
         config["runtime"]["command"],
         ".symphonz/WORKFLOW.md",

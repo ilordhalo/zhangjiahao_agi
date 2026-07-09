@@ -3,6 +3,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from symphonz.cli import main
 from symphonz.install import (
@@ -181,6 +182,23 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("runtime download was skipped", shim.read_text())
             self.assertTrue(shim.stat().st_mode & 0o111)
 
+    def test_install_embedded_runtime_mise_shim_runs_inside_mise_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            elixir_dir = root / ".symphonz" / "runtime" / "symphony" / "elixir"
+            (elixir_dir / "bin").mkdir(parents=True)
+            (elixir_dir / "mise.toml").write_text("[tools]\n")
+            (elixir_dir / "bin" / "symphony").write_text("#!/bin/sh\n")
+
+            with patch("symphonz.runtime.subprocess.run") as run:
+                install_embedded_runtime(root, skip_download=False)
+
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertIn(["mise", "exec", "--", "mix", "build"], commands)
+            shim = (root / ".symphonz" / "bin" / "symphony").read_text()
+            self.assertIn("cd \"$(dirname \"$0\")/../runtime/symphony/elixir\"", shim)
+            self.assertIn("exec mise exec -- ./bin/symphony \"$@\"", shim)
+
     def test_build_run_command_embedded_exports_expected_environment(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -207,6 +225,36 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(env["SYMPHONZ_MR_TARGET"], "main")
             self.assertEqual(env["SYMPHONZ_GIT_PROVIDER"], "gitlab")
             self.assertEqual(env["GITLAB_BASE_URL"], "https://gitlab.example.com")
+
+    def test_build_run_command_refreshes_existing_embedded_mise_shim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = InstallConfig(
+                runtime_mode="embedded",
+                runtime_command=".symphonz/bin/symphony",
+                linear_api_key_env="LINEAR_API_KEY",
+                linear_project_slug="project-slug",
+                git_provider="github",
+                repo_url="https://github.com/example/project.git",
+                base_branch="main",
+                mr_target="main",
+                gitlab_base_url="",
+                workspace_root=".symphonz/workspace",
+                logs_root=".symphonz/logs",
+            )
+            write_config(root / ".symphonz" / "config.toml", config)
+            shim = root / ".symphonz" / "bin" / "symphony"
+            elixir_dir = root / ".symphonz" / "runtime" / "symphony" / "elixir"
+            shim.parent.mkdir(parents=True)
+            (elixir_dir / "bin").mkdir(parents=True)
+            (elixir_dir / "mise.toml").write_text("[tools]\n")
+            shim.write_text('#!/bin/sh\nexec "$(dirname "$0")/../runtime/symphony/elixir/bin/symphony" "$@"\n')
+
+            build_run_command(root)
+
+            refreshed = shim.read_text()
+            self.assertIn('cd "$(dirname "$0")/../runtime/symphony/elixir"', refreshed)
+            self.assertIn('exec mise exec -- ./bin/symphony "$@"', refreshed)
 
 
 class CliSmokeTests(unittest.TestCase):
