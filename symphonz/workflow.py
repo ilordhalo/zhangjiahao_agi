@@ -35,12 +35,6 @@ def render_workflow(template: str, config: InstallConfig) -> str:
         rendered,
         count=1,
     )
-    rendered = re.sub(
-        r"expected base URL is `[^`]+`",
-        f"expected base URL is `{config.gitlab_base_url}`",
-        rendered,
-        count=1,
-    )
     return rendered
 
 

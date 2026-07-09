@@ -84,6 +84,23 @@ class InstallInputTests(unittest.TestCase):
             self.assertEqual(config.base_branch, "main")
             self.assertEqual(config.mr_target, "main")
 
+    def test_collect_install_config_accepts_github_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "remote", "add", "origin", "https://github.com/example/project.git"],
+                cwd=root,
+                check=True,
+            )
+            answers = iter(["LINEAR_API_KEY", "project-slug", "", "", "", ""])
+
+            config = collect_install_config(root, "global", False, input_func=lambda prompt: next(answers))
+
+            self.assertEqual(config.git_provider, "github")
+            self.assertEqual(config.gitlab_base_url, "")
+            self.assertEqual(config.repo_url, "https://github.com/example/project.git")
+
 
 class WorkflowInstallTests(unittest.TestCase):
     personal_values = [
@@ -116,7 +133,7 @@ class WorkflowInstallTests(unittest.TestCase):
         self.assertIn('project_slug: "project-slug"', rendered)
         self.assertIn('workspace:\n  root: .symphonz/workspace', rendered)
         self.assertIn('SYMPHONZ_REPO_URL:-https://example.com/group/repo.git', rendered)
-        self.assertIn('https://gitlab.example.com', rendered)
+        self.assertIn("Review provider is configured by `SYMPHONZ_GIT_PROVIDER`", rendered)
         self.assertIn("- `Done` -> implementation is considered complete", rendered)
 
     def test_default_workflow_template_contains_no_personal_values(self):
@@ -340,6 +357,44 @@ class ShellInstallerTests(unittest.TestCase):
             )
             self.assertEqual(version.returncode, 0, version.stderr)
             self.assertIn("symphonz 0.1.0", version.stdout)
+            self.assertTrue((prefix / "lib" / "WORKFLOW.md").exists())
+
+    def test_installed_cli_can_install_project_from_packaged_workflow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "prefix"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=project, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "remote", "add", "origin", "https://github.com/example/project.git"],
+                cwd=project,
+                check=True,
+            )
+            install = subprocess.run(
+                ["sh", "install.sh", "--prefix", str(prefix), "--source", str(Path.cwd())],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+
+            answers = "\n".join(["LINEAR_API_KEY", "project-slug", "", "", "", ""]) + "\n"
+            result = subprocess.run(
+                [str(prefix / "bin" / "symphonz"), "install", "--runtime", "global"],
+                cwd=project,
+                input=answers,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((project / ".symphonz" / "WORKFLOW.md").exists())
+            config = read_config(project / ".symphonz" / "config.toml")
+            self.assertEqual(config["git"]["provider"], "github")
+            self.assertEqual(config["git"]["gitlab_base_url"], "")
 
 
 if __name__ == "__main__":

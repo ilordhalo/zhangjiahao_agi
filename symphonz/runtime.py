@@ -63,8 +63,9 @@ def build_run_command(project_root: Path) -> tuple[list[str], dict[str, str]]:
         "SYMPHONZ_BASE_BRANCH": config["git"]["base_branch"],
         "SYMPHONZ_MR_TARGET": config["git"]["mr_target"],
         "SYMPHONZ_GIT_PROVIDER": config["git"]["provider"],
-        "GITLAB_BASE_URL": config["git"]["gitlab_base_url"],
     }
+    if config["git"].get("gitlab_base_url"):
+        env["GITLAB_BASE_URL"] = config["git"]["gitlab_base_url"]
     return command, env
 
 

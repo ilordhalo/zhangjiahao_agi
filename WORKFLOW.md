@@ -67,7 +67,7 @@ Runtime context:
 - This workspace path is `.symphonz/workspace/<issue_identifier>` under the installed project root.
 - The workspace was populated by cloning `SYMPHONZ_REPO_URL`.
 - The default base branch is `SYMPHONZ_BASE_BRANCH` or `main`.
-- GitLab is the default review target. Use `GITLAB_BASE_URL` when present; for this project the expected base URL is `https://gitlab.example.com`.
+- Review provider is configured by `SYMPHONZ_GIT_PROVIDER`. Use GitHub pull requests when it is `github`, and GitLab merge requests when it is `gitlab`.
 
 ## Operating Rules
 
@@ -76,8 +76,8 @@ Runtime context:
 3. Keep a single persistent Linear workpad comment named `## Symphonz Workpad`.
 4. Treat ticket-provided `Validation`, `Test Plan`, or `Testing` sections as required acceptance criteria.
 5. Reproduce or inspect the current behavior before changing code whenever the ticket describes a bug or behavior change.
-6. Keep Linear status, workpad checklist, branch, commit, and merge request state synchronized.
-7. Do not mark the ticket ready for review until implementation, validation, push, and merge request creation are complete.
+6. Keep Linear status, workpad checklist, branch, commit, and review request state synchronized.
+7. Do not mark the ticket ready for review until implementation, validation, push, and review request creation are complete.
 8. Final response must report completed actions and blockers only. Do not include user next steps.
 
 ## Required Tools and Auth
@@ -86,7 +86,7 @@ The agent should have:
 
 - Linear access through a configured MCP server or the injected `linear_graphql` tool.
 - Git credentials that can push branches to the configured project remote.
-- GitLab access through `glab` or `GITLAB_TOKEN` plus the GitLab API.
+- Git provider access through `gh` or `GITHUB_TOKEN` for GitHub, and `glab` or `GITLAB_TOKEN` plus `GITLAB_BASE_URL` for GitLab.
 - Codex app-server support from the configured `codex.command`.
 
 If a required tool is missing, first try documented fallbacks. If all fallbacks fail, update the workpad with a concise blocker and move the issue to `Human Review`.
@@ -96,15 +96,15 @@ If a required tool is missing, first try documented fallbacks. If all fallbacks 
 - `Backlog` -> out of scope. Do not modify the issue or workspace.
 - `Todo` -> queued. Move immediately to `In Progress`, create/update the workpad, then execute.
 - `In Progress` -> implementation is underway. Continue from the existing workpad and workspace.
-- `Done` -> implementation is considered complete and must be published. Push the issue branch, create/update a GitLab merge request, attach it to Linear, then move to `Human Review`.
-- `Human Review` -> merge request is ready and waiting for human review. Do not change code unless review feedback arrives.
-- `Rework` -> review requested changes. Re-open execution from the current branch unless the existing merge request is closed or merged.
-- `Merging` -> approved for integration. Update from `origin/main`, ensure checks are green, merge the merge request, then move the Linear issue to `Closed`.
+- `Done` -> implementation is considered complete and must be published. Push the issue branch, create/update a GitHub pull request or GitLab merge request, attach it to Linear, then move to `Human Review`.
+- `Human Review` -> review request is ready and waiting for human review. Do not change code unless review feedback arrives.
+- `Rework` -> review requested changes. Re-open execution from the current branch unless the existing review request is closed or merged.
+- `Merging` -> approved for integration. Update from `origin/main`, ensure checks are green, merge the review request, then move the Linear issue to `Closed`.
 - `Closed`, `Cancelled`, `Canceled`, `Duplicate` -> terminal. Do no further work.
 
 Important: in `symphonz`, `Done` is a publish trigger, not a terminal state. Terminal cleanup begins only after `Closed`, `Cancelled`, `Canceled`, or `Duplicate`.
 
-## Branch and Merge Request Convention
+## Branch and Review Request Convention
 
 Use a deterministic branch per issue:
 
@@ -116,11 +116,11 @@ Rules:
 
 - Branch from `origin/${SYMPHONZ_BASE_BRANCH:-main}`.
 - Keep the branch name lowercase except the issue identifier if the remote accepts it.
-- If a merge request already exists and is open, reuse it.
-- If a merge request is closed or merged before the issue is complete, create a fresh branch from the latest base branch.
+- If a review request already exists and is open, reuse it.
+- If a review request is closed or merged before the issue is complete, create a fresh branch from the latest base branch.
 - Target branch is `SYMPHONZ_MR_TARGET` when set, otherwise `SYMPHONZ_BASE_BRANCH`, otherwise `main`.
-- Merge request title format: `{{ issue.identifier }}: {{ issue.title }}`.
-- Merge request description must include the Linear issue URL, implementation summary, and validation evidence.
+- Review request title format: `{{ issue.identifier }}: {{ issue.title }}`.
+- Review request description must include the Linear issue URL, implementation summary, and validation evidence.
 
 ## Step 0: Determine State and Prepare Workpad
 
@@ -161,10 +161,10 @@ Rules:
 
 - [ ] command: `<command>`
 
-### GitLab Merge Request
+### Review Request
 
 - Branch: `<branch>`
-- MR: `<url or pending>`
+- URL: `<url or pending>`
 
 ### Notes
 
@@ -185,7 +185,7 @@ git fetch origin "${SYMPHONZ_BASE_BRANCH:-main}"
 git checkout -B "<issue-branch>" "origin/${SYMPHONZ_BASE_BRANCH:-main}"
 ```
 
-3. If continuing existing work, inspect branch, status, commits, and any existing merge request before editing.
+3. If continuing existing work, inspect branch, status, commits, and any existing review request before editing.
 4. Update the workpad plan with concrete tasks, acceptance criteria, and required validation.
 5. Reproduce or inspect the problem signal and record evidence in `Notes`.
 6. Implement only the ticket scope. File a separate Linear backlog issue for meaningful out-of-scope work.
@@ -215,11 +215,13 @@ When the Linear issue state is `Done`, perform publication instead of shutting d
 git push -u origin "<issue-branch>"
 ```
 
-4. Create or update a GitLab merge request.
-   - Prefer `glab mr create` / `glab mr view` when available.
+4. Create or update a review request for the configured provider.
+   - For GitHub, prefer `gh pr create` / `gh pr view` when available.
+   - If `gh` is unavailable and `GITHUB_TOKEN` is present, use the GitHub API.
+   - For GitLab, prefer `glab mr create` / `glab mr view` when available.
    - If `glab` is unavailable and `GITLAB_TOKEN` is present, use the GitLab API.
    - If neither is available, document the blocker in the workpad and move to `Human Review`.
-5. Attach the merge request URL to the Linear issue when the tool allows it. If attachment is unavailable, record the MR URL in the workpad `GitLab Merge Request` section.
+5. Attach the review request URL to the Linear issue when the tool allows it. If attachment is unavailable, record the URL in the workpad `Review Request` section.
 6. Update the workpad so all plan, acceptance, and validation items reflect reality.
 7. Move the issue to `Human Review`.
 
@@ -228,17 +230,17 @@ git push -u origin "<issue-branch>"
 When the issue is `Human Review`:
 
 1. Do not edit code unless review feedback appears.
-2. Poll the merge request for comments, threads, approvals, and pipeline status.
+2. Poll the review request for comments, threads, approvals, and pipeline status.
 3. Treat every actionable review comment as blocking until it is addressed with code/docs/tests or answered with explicit rationale.
 4. If feedback requires changes, move the issue to `Rework`.
 
 When the issue is `Rework`:
 
-1. Re-read the issue body, workpad, merge request, and review comments.
+1. Re-read the issue body, workpad, review request, and review comments.
 2. Update the workpad with the rework plan.
 3. Implement changes on the existing branch if the MR is open.
-4. If the MR is closed or merged, create a fresh branch from the latest base branch.
-5. Re-run validation, push updates, refresh the MR, and move back to `Human Review`.
+4. If the review request is closed or merged, create a fresh branch from the latest base branch.
+5. Re-run validation, push updates, refresh the review request, and move back to `Human Review`.
 
 ## Step 5: Merge Handling
 
@@ -247,8 +249,8 @@ When the issue is `Merging`:
 1. Fetch latest base branch and merge or rebase according to project policy.
 2. Resolve conflicts if any.
 3. Re-run required validation.
-4. Confirm GitLab pipeline status is green.
-5. Merge the GitLab merge request using `glab` or the GitLab API.
+4. Confirm required provider checks or pipeline status are green.
+5. Merge the review request using `gh`, `glab`, or the provider API.
 6. Move the Linear issue to `Closed` after the merge is complete.
 
 Do not merge if validation or required pipeline checks are failing.
@@ -256,11 +258,11 @@ Do not merge if validation or required pipeline checks are failing.
 ## Guardrails
 
 - Never modify `Backlog` issues.
-- Never treat `Done` as terminal; it means publish the branch and create/update a merge request.
+- Never treat `Done` as terminal; it means publish the branch and create/update a review request.
 - Never use multiple workpad comments for one issue.
 - Never leave completed checklist items unchecked.
 - Never push unvalidated changes.
 - Never expand scope silently.
 - Never delete the workspace manually; terminal cleanup is owned by Symphony after terminal issue states.
-- If GitLab publishing is blocked, keep the implementation committed locally, record the blocker, and move to `Human Review`.
+- If provider publishing is blocked, keep the implementation committed locally, record the blocker, and move to `Human Review`.
 - If required Linear access is missing, record the blocker and stop.

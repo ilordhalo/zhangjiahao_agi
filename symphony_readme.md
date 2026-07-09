@@ -7,11 +7,12 @@ project_slug: "REPLACE_WITH_LINEAR_PROJECT_SLUG"
 在 shell 里设置新的 Linear key
 export LINEAR_API_KEY="REPLACE_WITH_LINEAR_API_KEY"
 
-配置 GitHub 权限
-Codex/Symphony 要能 push branch、开 PR。
+配置 GitHub/GitLab 权限
+Codex/Symphony 要能 push branch，并创建 GitHub PR 或 GitLab MR。
 建议先本机跑：
 gh auth login
 gh repo view your-org/your-repo
+glab auth login
 
 把模板放到目标 repo 根目录，命名为：
 WORKFLOW.md

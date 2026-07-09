@@ -7,6 +7,7 @@ import subprocess
 
 
 DEFAULT_GITLAB_BASE_URL = "https://gitlab.example.com"
+SUPPORTED_GIT_PROVIDERS = {"github", "gitlab"}
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,23 @@ def require_git_repo(project_root: Path) -> None:
         raise RuntimeError("symphonz install must be run inside a Git repository")
 
 
+def detect_git_provider(repo_url: str) -> str:
+    normalized = repo_url.lower()
+    if "github.com" in normalized:
+        return "github"
+    if "gitlab" in normalized:
+        return "gitlab"
+    return "gitlab"
+
+
+def normalize_git_provider(provider: str) -> str:
+    normalized = provider.strip().lower()
+    if normalized not in SUPPORTED_GIT_PROVIDERS:
+        allowed = ", ".join(sorted(SUPPORTED_GIT_PROVIDERS))
+        raise RuntimeError(f"Git provider must be one of: {allowed}")
+    return normalized
+
+
 def detect_git_defaults(project_root: Path) -> dict[str, str]:
     require_git_repo(project_root)
     repo_url = run_git(project_root, ["remote", "get-url", "origin"])
@@ -130,7 +148,7 @@ def detect_git_defaults(project_root: Path) -> dict[str, str]:
         "repo_url": repo_url,
         "base_branch": base_branch,
         "mr_target": base_branch,
-        "git_provider": "gitlab",
+        "git_provider": detect_git_provider(repo_url),
         "gitlab_base_url": DEFAULT_GITLAB_BASE_URL,
     }
 
@@ -153,19 +171,25 @@ def collect_install_config(
     if assume_yes:
         linear_api_key_env = "LINEAR_API_KEY"
         linear_project_slug = ""
-        git_provider = defaults["git_provider"]
+        git_provider = normalize_git_provider(defaults["git_provider"])
         repo_url = defaults["repo_url"]
         base_branch = defaults["base_branch"]
         mr_target = defaults["mr_target"]
-        gitlab_base_url = defaults["gitlab_base_url"]
+        gitlab_base_url = defaults["gitlab_base_url"] if git_provider == "gitlab" else ""
     else:
         linear_api_key_env = prompt_value(input_func, "Linear API key environment variable", "LINEAR_API_KEY")
         linear_project_slug = prompt_value(input_func, "Linear project slug or ID", "")
-        git_provider = prompt_value(input_func, "Git provider", defaults["git_provider"])
+        git_provider = normalize_git_provider(
+            prompt_value(input_func, "Git provider (github/gitlab)", defaults["git_provider"])
+        )
         repo_url = prompt_value(input_func, "Git remote URL", defaults["repo_url"])
         base_branch = prompt_value(input_func, "Base branch", defaults["base_branch"])
         mr_target = prompt_value(input_func, "Merge request target branch", defaults["mr_target"])
-        gitlab_base_url = prompt_value(input_func, "GitLab base URL", defaults["gitlab_base_url"])
+        gitlab_base_url = (
+            prompt_value(input_func, "GitLab base URL", defaults["gitlab_base_url"])
+            if git_provider == "gitlab"
+            else ""
+        )
 
     if not linear_project_slug:
         raise RuntimeError("Linear project slug or ID is required")

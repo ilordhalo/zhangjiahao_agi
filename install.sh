@@ -24,14 +24,18 @@ EOF
 }
 
 path_has_dir() {
-  wanted="$1"
+  if [ ! -d "$1" ]; then
+    return 1
+  fi
+
+  wanted=$(cd "$1" && pwd -P)
   old_ifs=$IFS
   IFS=:
   set -- $PATH
   IFS=$old_ifs
 
   for dir do
-    if [ "$dir" = "$wanted" ]; then
+    if [ -d "$dir" ] && [ "$(cd "$dir" && pwd -P)" = "$wanted" ]; then
       return 0
     fi
   done
@@ -138,7 +142,7 @@ if [ -z "$SOURCE_DIR" ]; then
   SOURCE_DIR=$(find "$TMP_DIR" -mindepth 1 -maxdepth 1 -type d | head -n 1)
 fi
 
-if [ ! -f "${SOURCE_DIR}/bin/symphonz" ] || [ ! -d "${SOURCE_DIR}/symphonz" ]; then
+if [ ! -f "${SOURCE_DIR}/bin/symphonz" ] || [ ! -d "${SOURCE_DIR}/symphonz" ] || [ ! -f "${SOURCE_DIR}/WORKFLOW.md" ]; then
   echo "Invalid symphonz source directory: ${SOURCE_DIR}" >&2
   exit 1
 fi
@@ -147,6 +151,7 @@ mkdir -p "$BIN_DIR" "$LIB_DIR"
 BIN_DIR=$(cd "$BIN_DIR" && pwd -P)
 rm -rf "${LIB_DIR}/symphonz"
 cp -R "${SOURCE_DIR}/symphonz" "${LIB_DIR}/symphonz"
+cp "${SOURCE_DIR}/WORKFLOW.md" "${LIB_DIR}/WORKFLOW.md"
 
 LIB_DIR_ESCAPED=$(escape_double_quoted "$LIB_DIR")
 cat > "${BIN_DIR}/symphonz" <<EOF
