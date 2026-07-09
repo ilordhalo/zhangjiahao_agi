@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import re
+from urllib.parse import urlparse
 import urllib.request
 
 from symphonz.service.models import Issue
@@ -73,6 +76,9 @@ class LinearClient:
         return normalize_issue_nodes(body)
 
     def graphql(self, query: str, variables: dict | None = None) -> dict:
+        if self.endpoint.startswith("file://"):
+            return self.graphql_fixture(query, variables or {})
+
         payload = json.dumps({"query": query, "variables": variables or {}}).encode()
         request = urllib.request.Request(
             self.endpoint,
@@ -85,6 +91,36 @@ class LinearClient:
         )
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read().decode())
+
+    def graphql_fixture(self, query: str, variables: dict) -> dict:
+        fixture_root = Path(urlparse(self.endpoint).path)
+        fixture_root.mkdir(parents=True, exist_ok=True)
+        operation = graphql_operation_name(query)
+        request_record = {
+            "authorization": self.api_key,
+            "operation": operation,
+            "variables": variables,
+        }
+        requests_path = fixture_root / "requests.jsonl"
+        with requests_path.open("a") as requests_file:
+            requests_file.write(json.dumps(request_record, sort_keys=True) + "\n")
+
+        responses_path = fixture_root / "responses.json"
+        if not responses_path.exists():
+            raise RuntimeError(f"Linear fixture responses file is missing: {responses_path}")
+        responses = json.loads(responses_path.read_text())
+        if operation in responses:
+            return responses[operation]
+        if "default" in responses:
+            return responses["default"]
+        raise RuntimeError(f"Linear fixture has no response for operation {operation}.")
+
+
+def graphql_operation_name(query: str) -> str:
+    match = re.search(r"\b(?:query|mutation)\s+([A-Za-z_][A-Za-z0-9_]*)", query)
+    if match:
+        return match.group(1)
+    return "anonymous"
 
 
 def normalize_issue_nodes(body: dict) -> list[Issue]:
@@ -116,4 +152,3 @@ def normalize_issue(node: dict) -> Issue | None:
         created_at=node.get("createdAt"),
         updated_at=node.get("updatedAt"),
     )
-

@@ -57,10 +57,13 @@ def build_linear_client(config: dict) -> LinearClient:
     api_key_ref = str(tracker.get("api_key") or "$LINEAR_API_KEY")
     api_key = resolve_env_value(api_key_ref)
     project_slug = tracker.get("project_slug")
+    endpoint = os.environ.get("SYMPHONZ_LINEAR_ENDPOINT") or tracker.get("endpoint")
     if not api_key:
         raise RuntimeError(f"Linear API key is missing. Export {api_key_ref.lstrip('$')}.")
     if not project_slug:
         raise RuntimeError("Linear project_slug is missing in WORKFLOW.md.")
+    if endpoint:
+        return LinearClient(api_key=api_key, project_slug=str(project_slug), endpoint=str(endpoint))
     return LinearClient(api_key=api_key, project_slug=str(project_slug))
 
 
@@ -68,4 +71,3 @@ def resolve_env_value(value: str) -> str:
     if value.startswith("$"):
         return os.environ.get(value[1:], "")
     return value
-

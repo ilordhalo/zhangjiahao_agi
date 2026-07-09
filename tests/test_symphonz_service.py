@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import os
 import tempfile
 import unittest
 
@@ -81,6 +82,64 @@ class LinearAndWorkspaceTests(unittest.TestCase):
         self.assertEqual(issue.state, "Todo")
         self.assertEqual(issue.labels, ["codex ready", "backend"])
         self.assertEqual(issue.branch_name, "feature/runtime")
+
+    def test_linear_file_fixture_records_graphql_request_and_returns_response(self):
+        from symphonz.service.linear import LinearClient
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp)
+            (fixture / "responses.json").write_text(
+                json.dumps(
+                    {
+                        "SymphonzPoll": {
+                            "data": {
+                                "issues": {
+                                    "nodes": [
+                                        {
+                                            "id": "id-1",
+                                            "identifier": "SYM-1",
+                                            "title": "Fixture issue",
+                                            "state": {"name": "Todo"},
+                                            "labels": {"nodes": []},
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                )
+            )
+            client = LinearClient(api_key="test-key", project_slug="quality-project", endpoint=fixture.as_uri())
+
+            issues = client.fetch_candidate_issues(["Todo"])
+
+            requests = [json.loads(line) for line in (fixture / "requests.jsonl").read_text().splitlines()]
+            self.assertEqual(issues[0].identifier, "SYM-1")
+            self.assertEqual(requests[0]["authorization"], "test-key")
+            self.assertEqual(requests[0]["operation"], "SymphonzPoll")
+            self.assertEqual(requests[0]["variables"]["projectSlug"], "quality-project")
+
+    def test_build_linear_client_uses_endpoint_override_from_environment(self):
+        from symphonz.service.runner import build_linear_client
+
+        original_endpoint = os.environ.get("SYMPHONZ_LINEAR_ENDPOINT")
+        original_key = os.environ.get("LINEAR_API_KEY")
+        os.environ["SYMPHONZ_LINEAR_ENDPOINT"] = "file:///tmp/symphonz-linear-fixture"
+        os.environ["LINEAR_API_KEY"] = "env-key"
+        try:
+            client = build_linear_client({"tracker": {"api_key": "$LINEAR_API_KEY", "project_slug": "quality-project"}})
+        finally:
+            if original_endpoint is None:
+                os.environ.pop("SYMPHONZ_LINEAR_ENDPOINT", None)
+            else:
+                os.environ["SYMPHONZ_LINEAR_ENDPOINT"] = original_endpoint
+            if original_key is None:
+                os.environ.pop("LINEAR_API_KEY", None)
+            else:
+                os.environ["LINEAR_API_KEY"] = original_key
+
+        self.assertEqual(client.endpoint, "file:///tmp/symphonz-linear-fixture")
+        self.assertEqual(client.api_key, "env-key")
 
     def test_prepare_workspace_creates_safe_issue_dir_and_runs_after_create_hook(self):
         from symphonz.service.models import Issue, WorkflowDefinition
