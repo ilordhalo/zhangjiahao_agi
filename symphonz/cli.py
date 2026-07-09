@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 
 from symphonz import __version__
 
@@ -16,13 +17,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subcommands.add_parser("run", help="Run the installed Symphony workflow")
     run.add_argument("--print-command", action="store_true", help="Print the runtime command instead of executing it")
+    run.add_argument("--port", type=int, help="Serve the built-in dashboard on this port")
 
     subcommands.add_parser("version", help="Print symphonz version")
 
     return parser
 
 
+def build_service_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="symphonz service")
+    parser.add_argument("workflow")
+    parser.add_argument("--logs-root", default=".symphonz/logs")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--once", action="store_true")
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "service":
+        args = build_service_parser().parse_args(argv[1:])
+        from pathlib import Path
+        from symphonz.service.runner import run_service
+
+        return run_service(
+            project_root=Path.cwd(),
+            workflow_path=Path(args.workflow),
+            logs_root=Path(args.logs_root),
+            port=args.port,
+            once=args.once,
+        )
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -35,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         from symphonz.runtime import run_installed
 
-        return run_installed(print_command=args.print_command)
+        return run_installed(print_command=args.print_command, port=args.port)
 
     if args.command == "version":
         print(f"symphonz {__version__}")

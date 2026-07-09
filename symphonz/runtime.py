@@ -3,85 +3,41 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import shlex
-import stat
-import subprocess
 
 from symphonz.install import read_config
 
 
-SYMPHONY_REPO_URL = "https://github.com/openai/symphony.git"
-
-
-def make_executable(path: Path) -> None:
-    mode = path.stat().st_mode
-    path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-
-
-def write_embedded_runtime_shim(project_root: Path) -> None:
-    shim = project_root / ".symphonz" / "bin" / "symphony"
-    elixir_dir = project_root / ".symphonz" / "runtime" / "symphony" / "elixir"
-    shim.parent.mkdir(parents=True, exist_ok=True)
-
-    if (elixir_dir / "mise.toml").exists():
-        shim.write_text(
-            "#!/bin/sh\n"
-            'cd "$(dirname "$0")/../runtime/symphony/elixir"\n'
-            'exec mise exec -- ./bin/symphony "$@"\n'
-        )
-    else:
-        shim.write_text(
-            "#!/bin/sh\n"
-            'exec "$(dirname "$0")/../runtime/symphony/elixir/bin/symphony" "$@"\n'
-        )
-    make_executable(shim)
+INTERNAL_RUNTIME_COMMAND = "symphonz-internal"
 
 
 def install_embedded_runtime(project_root: Path, skip_download: bool) -> None:
-    bin_dir = project_root / ".symphonz" / "bin"
-    runtime_dir = project_root / ".symphonz" / "runtime" / "symphony"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    runtime_dir.parent.mkdir(parents=True, exist_ok=True)
-    shim = bin_dir / "symphony"
+    """Compatibility no-op for older callers.
 
-    if skip_download:
-        shim.write_text(
-            "#!/bin/sh\n"
-            "echo 'symphonz embedded runtime download was skipped; reinstall without --skip-runtime-download' >&2\n"
-            "exit 2\n"
-        )
-        make_executable(shim)
-        return
+    The runtime is now part of the installed `symphonz` package. Project installs
+    only write config, workflow, workspace, and logs directories.
+    """
 
-    if not runtime_dir.exists():
-        subprocess.run(["git", "clone", SYMPHONY_REPO_URL, str(runtime_dir)], check=True)
-
-    elixir_dir = runtime_dir / "elixir"
-    if (elixir_dir / "mise.toml").exists():
-        subprocess.run(["mise", "trust"], cwd=elixir_dir, check=True)
-        subprocess.run(["mise", "install"], cwd=elixir_dir, check=True)
-        subprocess.run(["mise", "exec", "--", "mix", "setup"], cwd=elixir_dir, check=True)
-        subprocess.run(["mise", "exec", "--", "mix", "build"], cwd=elixir_dir, check=True)
-
-    write_embedded_runtime_shim(project_root)
+    return None
 
 
-def refresh_embedded_runtime_shim(project_root: Path, command: str) -> None:
-    if command != ".symphonz/bin/symphony":
-        return
-    runtime_dir = project_root / ".symphonz" / "runtime" / "symphony"
-    if runtime_dir.exists():
-        write_embedded_runtime_shim(project_root)
-
-
-def build_run_command(project_root: Path) -> tuple[list[str], dict[str, str]]:
+def build_run_command(project_root: Path, port: int | None = None) -> tuple[list[str], dict[str, str]]:
     config = read_config(project_root / ".symphonz" / "config.toml")
-    refresh_embedded_runtime_shim(project_root, config["runtime"]["command"])
-    command = [
-        config["runtime"]["command"],
-        ".symphonz/WORKFLOW.md",
-        "--logs-root",
-        config["logs"]["root"],
-    ]
+    runtime_command = config["runtime"]["command"]
+
+    if runtime_command == INTERNAL_RUNTIME_COMMAND:
+        command = ["symphonz", "service", ".symphonz/WORKFLOW.md", "--logs-root", config["logs"]["root"]]
+        if port is not None:
+            command.extend(["--port", str(port)])
+    else:
+        command = [
+            runtime_command,
+            ".symphonz/WORKFLOW.md",
+            "--logs-root",
+            config["logs"]["root"],
+        ]
+        if port is not None:
+            command.extend(["--port", str(port)])
+
     env = {
         "SYMPHONZ_REPO_URL": config["git"]["remote"],
         "SYMPHONZ_BASE_BRANCH": config["git"]["base_branch"],
@@ -93,12 +49,35 @@ def build_run_command(project_root: Path) -> tuple[list[str], dict[str, str]]:
     return command, env
 
 
-def run_installed(print_command: bool = False, project_root: Path | None = None) -> int:
+def run_installed(print_command: bool = False, port: int | None = None, project_root: Path | None = None) -> int:
     root = project_root or Path.cwd()
-    command, env_updates = build_run_command(root)
+    command, env_updates = build_run_command(root, port=port)
     if print_command:
         print(" ".join(shlex.quote(part) for part in command))
         return 0
+
+    config = read_config(root / ".symphonz" / "config.toml")
+    if config["runtime"]["command"] != INTERNAL_RUNTIME_COMMAND:
+        import subprocess
+
+        env = os.environ.copy()
+        env.update(env_updates)
+        return subprocess.call(command, cwd=root, env=env)
+
+    from symphonz.service.runner import run_service
+
     env = os.environ.copy()
     env.update(env_updates)
-    return subprocess.call(command, cwd=root, env=env)
+    old_env = os.environ.copy()
+    try:
+        os.environ.update(env)
+        return run_service(
+            project_root=root,
+            workflow_path=root / ".symphonz" / "WORKFLOW.md",
+            logs_root=root / config["logs"]["root"],
+            port=port,
+            once=False,
+        )
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)

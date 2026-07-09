@@ -196,7 +196,7 @@ def collect_install_config(
     if not repo_url:
         raise RuntimeError("Git remote URL is required")
 
-    runtime_command = ".symphonz/bin/symphony" if runtime_mode == "embedded" else "symphony"
+    runtime_command = "symphonz-internal" if runtime_mode == "embedded" else "symphony"
     return InstallConfig(
         runtime_mode=runtime_mode,
         runtime_command=runtime_command,
@@ -215,7 +215,7 @@ def collect_install_config(
 def ensure_gitignore(project_root: Path) -> None:
     gitignore = project_root / ".gitignore"
     existing = gitignore.read_text().splitlines() if gitignore.exists() else []
-    additions = [".symphonz/workspace/", ".symphonz/logs/", ".symphonz/runtime/"]
+    additions = [".symphonz/workspace/", ".symphonz/logs/"]
     updated = existing[:]
     for item in additions:
         if item not in updated:
@@ -244,10 +244,5 @@ def install_project(
 
     write_workflow(root, config)
     ensure_gitignore(root)
-
-    if runtime_mode == "embedded":
-        from symphonz.runtime import install_embedded_runtime
-
-        install_embedded_runtime(root, skip_download=skip_runtime_download)
 
     return root / ".symphonz"

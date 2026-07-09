@@ -3,7 +3,6 @@ import os
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
 
 from symphonz.cli import main
 from symphonz.install import (
@@ -169,42 +168,44 @@ class WorkflowInstallTests(unittest.TestCase):
             for value in self.personal_values:
                 self.assertNotIn(value, rendered)
 
+    def test_install_project_embedded_uses_internal_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "remote", "add", "origin", "https://github.com/example/project.git"], cwd=root, check=True)
+            answers = iter(["LINEAR_API_KEY", "project-slug", "", "", "", ""])
+
+            install_project(
+                project_root=root,
+                runtime_mode="embedded",
+                assume_yes=False,
+                skip_runtime_download=False,
+                input_func=lambda prompt: next(answers),
+            )
+
+            config = read_config(root / ".symphonz" / "config.toml")
+            self.assertEqual(config["runtime"]["mode"], "embedded")
+            self.assertEqual(config["runtime"]["command"], "symphonz-internal")
+            self.assertFalse((root / ".symphonz" / "runtime").exists())
+            self.assertFalse((root / ".symphonz" / "bin" / "symphony").exists())
+
 
 class RuntimeTests(unittest.TestCase):
-    def test_install_embedded_runtime_skip_download_creates_shim(self):
+    def test_install_embedded_runtime_is_noop_because_runtime_is_builtin(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
 
             install_embedded_runtime(root, skip_download=True)
 
-            shim = root / ".symphonz" / "bin" / "symphony"
-            self.assertTrue(shim.exists())
-            self.assertIn("runtime download was skipped", shim.read_text())
-            self.assertTrue(shim.stat().st_mode & 0o111)
-
-    def test_install_embedded_runtime_mise_shim_runs_inside_mise_environment(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            elixir_dir = root / ".symphonz" / "runtime" / "symphony" / "elixir"
-            (elixir_dir / "bin").mkdir(parents=True)
-            (elixir_dir / "mise.toml").write_text("[tools]\n")
-            (elixir_dir / "bin" / "symphony").write_text("#!/bin/sh\n")
-
-            with patch("symphonz.runtime.subprocess.run") as run:
-                install_embedded_runtime(root, skip_download=False)
-
-            commands = [call.args[0] for call in run.call_args_list]
-            self.assertIn(["mise", "exec", "--", "mix", "build"], commands)
-            shim = (root / ".symphonz" / "bin" / "symphony").read_text()
-            self.assertIn("cd \"$(dirname \"$0\")/../runtime/symphony/elixir\"", shim)
-            self.assertIn("exec mise exec -- ./bin/symphony \"$@\"", shim)
+            self.assertFalse((root / ".symphonz" / "runtime").exists())
+            self.assertFalse((root / ".symphonz" / "bin" / "symphony").exists())
 
     def test_build_run_command_embedded_exports_expected_environment(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = InstallConfig(
                 runtime_mode="embedded",
-                runtime_command=".symphonz/bin/symphony",
+                runtime_command="symphonz-internal",
                 linear_api_key_env="LINEAR_API_KEY",
                 linear_project_slug="project-slug",
                 git_provider="gitlab",
@@ -219,19 +220,19 @@ class RuntimeTests(unittest.TestCase):
 
             command, env = build_run_command(root)
 
-            self.assertEqual(command, [".symphonz/bin/symphony", ".symphonz/WORKFLOW.md", "--logs-root", ".symphonz/logs"])
+            self.assertEqual(command, ["symphonz", "service", ".symphonz/WORKFLOW.md", "--logs-root", ".symphonz/logs"])
             self.assertEqual(env["SYMPHONZ_REPO_URL"], "https://example.com/group/repo.git")
             self.assertEqual(env["SYMPHONZ_BASE_BRANCH"], "main")
             self.assertEqual(env["SYMPHONZ_MR_TARGET"], "main")
             self.assertEqual(env["SYMPHONZ_GIT_PROVIDER"], "gitlab")
             self.assertEqual(env["GITLAB_BASE_URL"], "https://gitlab.example.com")
 
-    def test_build_run_command_refreshes_existing_embedded_mise_shim(self):
+    def test_build_run_command_with_port_includes_dashboard_port(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = InstallConfig(
                 runtime_mode="embedded",
-                runtime_command=".symphonz/bin/symphony",
+                runtime_command="symphonz-internal",
                 linear_api_key_env="LINEAR_API_KEY",
                 linear_project_slug="project-slug",
                 git_provider="github",
@@ -243,18 +244,13 @@ class RuntimeTests(unittest.TestCase):
                 logs_root=".symphonz/logs",
             )
             write_config(root / ".symphonz" / "config.toml", config)
-            shim = root / ".symphonz" / "bin" / "symphony"
-            elixir_dir = root / ".symphonz" / "runtime" / "symphony" / "elixir"
-            shim.parent.mkdir(parents=True)
-            (elixir_dir / "bin").mkdir(parents=True)
-            (elixir_dir / "mise.toml").write_text("[tools]\n")
-            shim.write_text('#!/bin/sh\nexec "$(dirname "$0")/../runtime/symphony/elixir/bin/symphony" "$@"\n')
 
-            build_run_command(root)
+            command, _env = build_run_command(root, port=4100)
 
-            refreshed = shim.read_text()
-            self.assertIn('cd "$(dirname "$0")/../runtime/symphony/elixir"', refreshed)
-            self.assertIn('exec mise exec -- ./bin/symphony "$@"', refreshed)
+            self.assertEqual(
+                command,
+                ["symphonz", "service", ".symphonz/WORKFLOW.md", "--logs-root", ".symphonz/logs", "--port", "4100"],
+            )
 
 
 class CliSmokeTests(unittest.TestCase):
@@ -283,6 +279,7 @@ class CliSmokeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("install", result.stdout)
         self.assertIn("run", result.stdout)
+        self.assertNotIn("service", result.stdout)
 
     def test_main_rejects_missing_command(self):
         with self.assertRaises(SystemExit) as raised:
@@ -406,6 +403,7 @@ class ShellInstallerTests(unittest.TestCase):
             self.assertEqual(version.returncode, 0, version.stderr)
             self.assertIn("symphonz 0.1.0", version.stdout)
             self.assertTrue((prefix / "lib" / "WORKFLOW.md").exists())
+            self.assertTrue((prefix / "lib" / "symphonz" / "service" / "runner.py").exists())
 
     def test_installed_cli_can_install_project_from_packaged_workflow(self):
         with tempfile.TemporaryDirectory() as tmp:
