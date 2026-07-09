@@ -256,3 +256,8 @@ class OrchestratorAndDashboardTests(unittest.TestCase):
         self.assertEqual(payload["events"][0]["message"], "runtime started")
         self.assertEqual(find_issue(payload, "SYM-1")["status"], "completed")
         self.assertIn("Symphonz Runtime", html)
+        self.assertIn("Issue Queue", html)
+        self.assertIn("Activity Feed", html)
+        self.assertIn("class=\"app-shell\"", html)
+        self.assertIn("class=\"sidebar\"", html)
+        self.assertIn("status-chip", html)
