@@ -5,6 +5,8 @@ from collections.abc import Callable
 import json
 import subprocess
 
+from symphonz import __version__
+
 
 class CodexAppServer:
     def __init__(self, command: str):
@@ -33,7 +35,14 @@ class CodexAppServer:
             bufsize=1,
         )
         try:
-            self._request(process, "initialize", {"capabilities": {"experimentalApi": True}})
+            self._request(
+                process,
+                "initialize",
+                {
+                    "clientInfo": {"name": "symphonz", "version": __version__},
+                    "capabilities": {"experimentalApi": True},
+                },
+            )
             self._notify(process, "initialized", {})
             thread_response = self._request(
                 process,
