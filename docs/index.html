@@ -1,0 +1,1351 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="面向开发者的 Symphonz 服务机制说明：Linear 监听、Codex 触发、Issue Workspace 与代码发布链路。">
+  <title>Symphonz 服务机制</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --page: #f7f8fa;
+      --surface: #ffffff;
+      --surface-subtle: #fafbfc;
+      --ink: #181a1f;
+      --ink-soft: #3f4652;
+      --muted: #697180;
+      --faint: #626c7b;
+      --line: #e1e4e9;
+      --line-strong: #cfd4dc;
+      --accent: #5e6ad2;
+      --accent-strong: #4b56bd;
+      --accent-soft: #eef0ff;
+      --green: #16825d;
+      --green-soft: #eaf7f1;
+      --amber: #9b6015;
+      --amber-soft: #fff4df;
+      --red: #bd3c34;
+      --red-soft: #fff0ef;
+      --blue: #2765d7;
+      --blue-soft: #edf4ff;
+      --code: #1f232b;
+      --code-line: #363c47;
+      --shadow: 0 1px 2px rgba(16, 24, 40, .04);
+      --max-width: 1180px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 76px; }
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 15px;
+      line-height: 1.65;
+    }
+    button, a { font: inherit; }
+    button { color: inherit; }
+    a { color: inherit; text-decoration: none; }
+    h1, h2, h3, p, pre { margin: 0; }
+    code, pre, .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+    code {
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: var(--surface-subtle);
+      padding: 1px 5px;
+      color: var(--ink-soft);
+      font-size: .9em;
+    }
+
+    .topbar {
+      position: sticky;
+      z-index: 50;
+      top: 0;
+      border-bottom: 1px solid rgba(207, 212, 220, .85);
+      background: rgba(255, 255, 255, .92);
+      backdrop-filter: blur(14px);
+    }
+    .topbar-inner {
+      display: flex;
+      align-items: center;
+      gap: 28px;
+      min-height: 58px;
+      width: min(calc(100% - 40px), var(--max-width));
+      margin: 0 auto;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      flex: 0 0 auto;
+      font-weight: 700;
+    }
+    .brand-mark {
+      display: inline-grid;
+      place-items: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 7px;
+      background: var(--ink);
+      color: #fff;
+      font-size: 13px;
+    }
+    .version {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 7px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      min-width: 0;
+      margin-left: auto;
+    }
+    .nav-links a {
+      border-radius: 5px;
+      padding: 6px 9px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 550;
+      white-space: nowrap;
+    }
+    .nav-links a:hover, .nav-links a:focus-visible {
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+      outline: none;
+    }
+
+    main { overflow: hidden; }
+    .section {
+      border-bottom: 1px solid var(--line);
+      padding: 76px 0;
+    }
+    .section:last-child { border-bottom: 0; }
+    .section-inner {
+      width: min(calc(100% - 40px), var(--max-width));
+      margin: 0 auto;
+    }
+    .section-kicker {
+      margin-bottom: 8px;
+      color: var(--accent-strong);
+      font-size: 11px;
+      font-weight: 750;
+      letter-spacing: 0;
+      text-transform: uppercase;
+    }
+    .section-heading {
+      max-width: 760px;
+      font-size: 31px;
+      font-weight: 720;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }
+    .section-lead {
+      max-width: 780px;
+      margin-top: 14px;
+      color: var(--muted);
+      font-size: 16px;
+    }
+    .section-rule {
+      width: 42px;
+      height: 2px;
+      margin: 18px 0 0;
+      border: 0;
+      background: var(--accent);
+    }
+
+    .overview {
+      min-height: 600px;
+      padding: 80px 0 56px;
+      background: var(--surface);
+    }
+    .overview-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(360px, .85fr);
+      align-items: center;
+      gap: 70px;
+    }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 18px;
+      color: var(--accent-strong);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .eyebrow-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 0 4px var(--accent-soft);
+    }
+    h1 {
+      max-width: 680px;
+      font-size: 46px;
+      font-weight: 760;
+      line-height: 1.12;
+      letter-spacing: 0;
+    }
+    .overview-copy {
+      max-width: 650px;
+      margin-top: 22px;
+      color: var(--ink-soft);
+      font-size: 18px;
+      line-height: 1.7;
+    }
+    .fact-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 28px;
+    }
+    .fact {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 31px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface-subtle);
+      padding: 5px 9px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .fact::before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+    }
+    .overview-flow {
+      position: relative;
+      display: grid;
+      gap: 13px;
+      padding-left: 34px;
+    }
+    .overview-flow::before {
+      content: "";
+      position: absolute;
+      top: 25px;
+      bottom: 25px;
+      left: 12px;
+      width: 1px;
+      background: var(--line-strong);
+    }
+    .flow-stop {
+      position: relative;
+      display: grid;
+      grid-template-columns: 40px 1fr;
+      align-items: center;
+      gap: 13px;
+      min-height: 72px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+      padding: 13px 15px;
+      box-shadow: var(--shadow);
+    }
+    .flow-stop::before {
+      content: "";
+      position: absolute;
+      left: -26px;
+      width: 9px;
+      height: 9px;
+      border: 2px solid var(--surface);
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent);
+    }
+    .flow-index {
+      display: grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border-radius: 7px;
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+      font-size: 11px;
+      font-weight: 750;
+    }
+    .flow-stop strong { display: block; font-size: 13px; }
+    .flow-stop span { color: var(--muted); font-size: 11px; }
+
+    .map-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.5fr) minmax(290px, .5fr);
+      gap: 22px;
+      margin-top: 34px;
+    }
+    .diagram-shell {
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .diagram-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      min-height: 46px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-subtle);
+      padding: 0 14px;
+    }
+    .diagram-title { font-size: 12px; font-weight: 700; }
+    .legend { display: flex; flex-wrap: wrap; gap: 14px; color: var(--muted); font-size: 10px; }
+    .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+    .legend-line { width: 24px; border-top: 2px solid var(--accent); }
+    .legend-line.dashed { border-top-style: dashed; border-color: var(--amber); }
+
+    .system-map {
+      position: relative;
+      display: grid;
+      grid-template-columns: minmax(145px, 1fr) minmax(190px, 1.15fr) minmax(145px, 1fr);
+      grid-template-rows: repeat(3, minmax(118px, auto));
+      gap: 22px 38px;
+      min-height: 480px;
+      padding: 30px;
+      isolation: isolate;
+    }
+    .map-connections {
+      position: absolute;
+      z-index: 0;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+    .map-connections > path { fill: none; stroke-width: 2; }
+    .map-connections .edge-direct { stroke: var(--accent); marker-end: url(#arrow-direct); }
+    .map-connections .edge-delegated { stroke: var(--amber); stroke-dasharray: 6 5; marker-end: url(#arrow-delegated); }
+    .map-connections text { fill: var(--faint); font-size: 11px; font-weight: 650; }
+    .map-node {
+      position: relative;
+      z-index: 2;
+      display: grid;
+      align-content: center;
+      gap: 5px;
+      min-width: 0;
+      border: 1px solid var(--line-strong);
+      border-radius: 7px;
+      background: var(--surface);
+      padding: 14px;
+      text-align: left;
+      cursor: pointer;
+      transition: border-color 140ms ease, background 140ms ease, transform 140ms ease;
+    }
+    .map-node:hover { border-color: var(--accent); transform: translateY(-1px); }
+    .map-node:focus-visible { outline: 3px solid rgba(94, 106, 210, .24); outline-offset: 2px; }
+    .map-node[aria-pressed="true"] {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .map-node .node-type {
+      color: var(--faint);
+      font-size: 9px;
+      font-weight: 750;
+      text-transform: uppercase;
+    }
+    .map-node strong { font-size: 13px; line-height: 1.3; }
+    .map-node small { color: var(--muted); font-size: 10px; line-height: 1.4; }
+    .map-node.linear { grid-column: 1; grid-row: 1; }
+    .map-node.workflow { grid-column: 2; grid-row: 1; }
+    .map-node.codex { grid-column: 3; grid-row: 1; }
+    .map-node.workspace { grid-column: 1; grid-row: 3; }
+    .map-node.state { grid-column: 2; grid-row: 3; }
+    .map-node.provider { grid-column: 3; grid-row: 3; }
+    .map-node.runtime {
+      grid-column: 2;
+      grid-row: 2;
+      border-color: var(--ink);
+      background: var(--ink);
+      color: #fff;
+      text-align: center;
+    }
+    .map-node.runtime .node-type, .map-node.runtime small { color: #b9c0cc; }
+    .map-node.runtime[aria-pressed="true"] { border-color: var(--accent); background: #252a36; }
+
+    .component-detail {
+      display: grid;
+      align-content: start;
+      gap: 16px;
+      min-height: 100%;
+      border-left: 3px solid var(--accent);
+      background: var(--surface);
+      padding: 22px;
+    }
+    .detail-label { color: var(--accent-strong); font-size: 10px; font-weight: 750; text-transform: uppercase; }
+    .component-detail h3 { font-size: 20px; line-height: 1.3; }
+    .component-detail > p { color: var(--muted); font-size: 13px; }
+    .io-list { display: grid; gap: 10px; }
+    .io-item { border-top: 1px solid var(--line); padding-top: 10px; }
+    .io-item span { display: block; color: var(--faint); font-size: 9px; font-weight: 750; text-transform: uppercase; }
+    .io-item strong { display: block; margin-top: 3px; color: var(--ink-soft); font-size: 12px; font-weight: 600; }
+
+    .poll-grid {
+      display: grid;
+      grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr);
+      gap: 42px;
+      align-items: start;
+      margin-top: 34px;
+    }
+    .poll-loop { display: grid; gap: 0; }
+    .poll-stage {
+      position: relative;
+      display: grid;
+      grid-template-columns: 34px 1fr;
+      gap: 13px;
+      padding: 0 0 26px;
+    }
+    .poll-stage:not(:last-child)::after {
+      content: "";
+      position: absolute;
+      top: 30px;
+      bottom: 0;
+      left: 16px;
+      width: 1px;
+      background: var(--line-strong);
+    }
+    .poll-stage:last-child { padding-bottom: 0; }
+    .poll-number {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      place-items: center;
+      width: 33px;
+      height: 33px;
+      border: 1px solid var(--line-strong);
+      border-radius: 50%;
+      background: var(--surface);
+      color: var(--accent-strong);
+      font-size: 11px;
+      font-weight: 750;
+    }
+    .poll-stage h3 { font-size: 14px; }
+    .poll-stage p { margin-top: 4px; color: var(--muted); font-size: 12px; }
+    .code-panel {
+      border-radius: 8px;
+      background: var(--code);
+      color: #f2f4f8;
+      overflow: hidden;
+    }
+    .code-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      border-bottom: 1px solid var(--code-line);
+      padding: 10px 14px;
+      color: #aab2c0;
+      font-size: 10px;
+    }
+    .code-panel pre {
+      overflow-x: auto;
+      padding: 18px;
+      font-size: 11px;
+      line-height: 1.7;
+      white-space: pre;
+    }
+    .code-key { color: #aeb6ff; }
+    .code-string { color: #99d6ba; }
+    .code-comment { color: #7f8998; }
+    .poll-note {
+      margin-top: 14px;
+      border: 1px solid #efd5aa;
+      border-radius: 7px;
+      background: var(--amber-soft);
+      padding: 13px 15px;
+      color: #71460f;
+      font-size: 12px;
+    }
+
+    .sequence-wrap { margin-top: 34px; }
+    .sequence-controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 12px;
+    }
+    .sequence-help { color: var(--muted); font-size: 11px; }
+    .play-button {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 34px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      background: var(--surface);
+      padding: 0 11px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .play-button:hover { border-color: var(--accent); color: var(--accent-strong); }
+    .play-button:focus-visible { outline: 3px solid rgba(94, 106, 210, .2); }
+    .play-button:disabled { cursor: not-allowed; opacity: .58; }
+    .play-icon { color: var(--accent); font-size: 10px; }
+    .sequence-diagram {
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: var(--surface);
+      overflow: hidden;
+    }
+    .sequence-actors {
+      display: grid;
+      grid-template-columns: 58px repeat(6, minmax(105px, 1fr));
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-subtle);
+    }
+    .actor {
+      min-width: 0;
+      border-left: 1px solid var(--line);
+      padding: 12px 8px;
+      text-align: center;
+      font-size: 10px;
+      font-weight: 700;
+    }
+    .actor:first-child { border-left: 0; }
+    .sequence-steps {
+      position: relative;
+      display: grid;
+      gap: 1px;
+      background: var(--line);
+    }
+    .sequence-step {
+      display: grid;
+      grid-template-columns: 58px repeat(6, minmax(105px, 1fr));
+      min-height: 55px;
+      border: 0;
+      background: var(--surface);
+      padding: 0;
+      text-align: left;
+      cursor: pointer;
+    }
+    .sequence-step:hover { background: #fbfcff; }
+    .sequence-step:focus-visible { position: relative; z-index: 2; outline: 3px solid rgba(94, 106, 210, .22); outline-offset: -3px; }
+    .sequence-step[aria-pressed="true"] { background: var(--accent-soft); }
+    .step-index {
+      display: grid;
+      place-items: center;
+      border-right: 1px solid var(--line);
+      color: var(--faint);
+      font-size: 10px;
+      font-weight: 700;
+    }
+    .step-message {
+      position: relative;
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      padding: 9px 12px;
+      color: var(--ink-soft);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 10px;
+      line-height: 1.35;
+    }
+    .step-message::before {
+      content: "";
+      position: absolute;
+      top: 50%;
+      right: 10px;
+      left: 10px;
+      border-top: 1px solid var(--line-strong);
+    }
+    .step-message::after {
+      content: "";
+      position: absolute;
+      top: calc(50% - 3px);
+      right: 8px;
+      width: 6px;
+      height: 6px;
+      border-top: 1px solid var(--line-strong);
+      border-right: 1px solid var(--line-strong);
+      transform: rotate(45deg);
+    }
+    .step-message.reverse::after {
+      right: auto;
+      left: 8px;
+      border: 0;
+      border-bottom: 1px solid var(--line-strong);
+      border-left: 1px solid var(--line-strong);
+    }
+    .step-label {
+      position: relative;
+      z-index: 1;
+      max-width: 100%;
+      margin: 0 auto;
+      background: inherit;
+      padding: 0 6px;
+      overflow-wrap: anywhere;
+    }
+    .step-route { display: none; }
+    .step-message.runner-orchestrator { grid-column: 2 / 4; }
+    .step-message.orchestrator-linear { grid-column: 3 / 5; }
+    .step-message.orchestrator-workspace { grid-column: 3 / 6; }
+    .step-message.orchestrator-local { grid-column: 3 / 4; }
+    .step-message.orchestrator-local::before, .step-message.orchestrator-local::after { display: none; }
+    .step-message.orchestrator-codex { grid-column: 3 / 7; }
+    .step-message.orchestrator-state { grid-column: 3 / 8; }
+    .sequence-explain {
+      display: grid;
+      grid-template-columns: 160px 1fr;
+      gap: 20px;
+      border-top: 1px solid var(--line);
+      background: var(--surface-subtle);
+      padding: 17px 18px;
+    }
+    .sequence-explain span { color: var(--accent-strong); font-size: 10px; font-weight: 750; text-transform: uppercase; }
+    .sequence-explain p { color: var(--muted); font-size: 12px; }
+
+    .protocol-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 18px;
+    }
+    .protocol-step {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: var(--surface);
+      padding: 14px;
+    }
+    .protocol-step strong { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .protocol-step p { margin-top: 6px; color: var(--muted); font-size: 11px; }
+
+    .lifecycle-track {
+      margin-top: 34px;
+      overflow-x: auto;
+      padding: 4px 0 16px;
+    }
+    .lifecycle-main {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(130px, 1fr));
+      min-width: 820px;
+    }
+    .life-state {
+      position: relative;
+      padding-right: 22px;
+    }
+    .life-state:not(:last-child)::after {
+      content: "";
+      position: absolute;
+      top: 17px;
+      right: 4px;
+      width: 14px;
+      border-top: 1px solid var(--line-strong);
+    }
+    .life-state:not(:last-child)::before {
+      content: "";
+      position: absolute;
+      z-index: 1;
+      top: 14px;
+      right: 4px;
+      width: 6px;
+      height: 6px;
+      border-top: 1px solid var(--line-strong);
+      border-right: 1px solid var(--line-strong);
+      transform: rotate(45deg);
+    }
+    .state-pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 34px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      background: var(--surface);
+      padding: 0 10px;
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .state-pill.active { border-color: #c7d9ff; background: var(--blue-soft); color: var(--blue); }
+    .state-pill.publish { border-color: #efd5aa; background: var(--amber-soft); color: var(--amber); }
+    .state-pill.review { border-color: #d5d9ff; background: var(--accent-soft); color: var(--accent-strong); }
+    .state-pill.terminal { border-color: #bee3d2; background: var(--green-soft); color: var(--green); }
+    .life-state p { margin-top: 9px; padding-right: 5px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+    .review-loop {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      align-items: center;
+      gap: 10px;
+      width: min(100%, 620px);
+      margin: 22px auto 0;
+      border: 1px solid #d5d9ff;
+      border-radius: 7px;
+      background: var(--accent-soft);
+      padding: 13px;
+      color: var(--accent-strong);
+      font-size: 11px;
+      font-weight: 650;
+      text-align: center;
+    }
+    .review-loop .state-pill { justify-self: center; }
+    .terminal-rail {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      margin-top: 12px;
+      border-top: 1px solid var(--line);
+      padding-top: 12px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .review-boundary {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 16px;
+      margin-top: 24px;
+    }
+    .responsibility {
+      border-top: 2px solid var(--accent);
+      background: var(--surface);
+      padding: 16px 0 0;
+    }
+    .responsibility.codex-owned { border-color: var(--amber); }
+    .responsibility h3 { font-size: 14px; }
+    .responsibility p { margin-top: 6px; color: var(--muted); font-size: 12px; }
+    .responsibility ul { margin: 12px 0 0; padding-left: 18px; color: var(--ink-soft); font-size: 12px; }
+
+    .layout-grid {
+      display: grid;
+      grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr);
+      gap: 34px;
+      margin-top: 34px;
+    }
+    .tree-panel {
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: var(--surface);
+      padding: 20px;
+    }
+    .tree-panel pre {
+      overflow-x: auto;
+      color: var(--ink-soft);
+      font-size: 12px;
+      line-height: 1.8;
+    }
+    .command-list { display: grid; gap: 10px; }
+    .command {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(170px, .8fr);
+      align-items: center;
+      gap: 16px;
+      min-height: 62px;
+      border-bottom: 1px solid var(--line);
+    }
+    .command:first-child { border-top: 1px solid var(--line); }
+    .command code {
+      width: fit-content;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+      border-color: #d6d9ff;
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+    }
+    .command span { color: var(--muted); font-size: 12px; }
+
+    .boundaries {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 1px;
+      margin-top: 34px;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: var(--line);
+      overflow: hidden;
+    }
+    .boundary {
+      min-height: 142px;
+      background: var(--surface);
+      padding: 20px;
+    }
+    .boundary-index { color: var(--red); font-size: 10px; font-weight: 750; }
+    .boundary h3 { margin-top: 6px; font-size: 14px; }
+    .boundary p { margin-top: 7px; color: var(--muted); font-size: 12px; }
+    .closing-note {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      margin-top: 22px;
+      border-left: 3px solid var(--red);
+      background: var(--red-soft);
+      padding: 14px 16px;
+      color: #74302a;
+      font-size: 12px;
+    }
+
+    footer {
+      background: var(--ink);
+      color: #fff;
+    }
+    .footer-inner {
+      display: flex;
+      justify-content: space-between;
+      gap: 24px;
+      width: min(calc(100% - 40px), var(--max-width));
+      margin: 0 auto;
+      padding: 30px 0;
+    }
+    .footer-inner strong { font-size: 13px; }
+    .footer-inner span { color: #abb2bf; font-size: 11px; }
+
+    @media (max-width: 980px) {
+      .nav-links { overflow-x: auto; }
+      .overview-grid, .map-layout, .poll-grid, .layout-grid { grid-template-columns: 1fr; }
+      .overview { min-height: auto; }
+      .overview-flow { max-width: 620px; }
+      .map-layout { gap: 14px; }
+      .component-detail { min-height: 250px; border-top: 3px solid var(--accent); border-left: 0; }
+      .protocol-grid { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 760px) {
+      .topbar-inner { width: min(calc(100% - 24px), var(--max-width)); gap: 14px; }
+      .version { display: none; }
+      .nav-links { gap: 0; }
+      .section-inner, .footer-inner { width: min(calc(100% - 28px), var(--max-width)); }
+      .section { padding: 58px 0; }
+      .overview { padding: 58px 0 46px; }
+      h1 { font-size: 37px; }
+      .section-heading { font-size: 27px; }
+      .system-map {
+        grid-template-columns: 1fr 1fr;
+        grid-template-rows: auto;
+        gap: 10px;
+        min-height: 0;
+        padding: 16px;
+      }
+      .map-node.linear, .map-node.workflow, .map-node.codex, .map-node.workspace, .map-node.state, .map-node.provider, .map-node.runtime {
+        grid-column: auto;
+        grid-row: auto;
+      }
+      .map-node.runtime { grid-column: 1 / 3; grid-row: 1; }
+      .map-connections { display: none; }
+      .sequence-diagram { overflow: hidden; }
+      .sequence-actors { display: none; }
+      .sequence-step {
+        grid-template-columns: 42px minmax(0, 1fr);
+        min-height: 74px;
+      }
+      .step-index { grid-column: 1; grid-row: 1; }
+      .step-message,
+      .step-message.runner-orchestrator,
+      .step-message.orchestrator-linear,
+      .step-message.orchestrator-workspace,
+      .step-message.orchestrator-local,
+      .step-message.orchestrator-codex,
+      .step-message.orchestrator-state {
+        grid-column: 2 !important;
+        align-items: flex-start;
+        flex-direction: column;
+        justify-content: center;
+        gap: 4px;
+        padding: 10px 12px;
+      }
+      .step-message::before, .step-message::after { display: none; }
+      .step-route {
+        display: block;
+        color: var(--faint);
+        font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+        font-size: 9px;
+        font-weight: 700;
+        text-transform: uppercase;
+      }
+      .step-label { margin: 0; background: transparent; padding: 0; }
+      .sequence-explain { grid-template-columns: 1fr; gap: 5px; min-width: 0; }
+      .review-boundary, .boundaries { grid-template-columns: 1fr; }
+      .command { grid-template-columns: 1fr; gap: 4px; padding: 12px 0; }
+    }
+
+    @media (max-width: 520px) {
+      .topbar-inner { align-items: flex-start; flex-direction: column; gap: 5px; padding: 9px 0 7px; }
+      .nav-links { width: 100%; margin-left: 0; }
+      .nav-links a { padding: 5px 8px; }
+      html { scroll-padding-top: 106px; }
+      .overview-grid { gap: 42px; }
+      h1 { font-size: 32px; }
+      .overview-copy { font-size: 16px; }
+      .fact-row { display: grid; grid-template-columns: 1fr; }
+      .system-map { grid-template-columns: 1fr; }
+      .map-node.runtime { grid-column: 1; }
+      .diagram-toolbar { align-items: flex-start; flex-direction: column; padding: 10px 12px; }
+      .sequence-controls { align-items: flex-start; flex-direction: column; }
+      .play-button { width: 100%; justify-content: center; }
+      .footer-inner { flex-direction: column; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#overview" aria-label="返回 Symphonz 服务机制顶部">
+        <span class="brand-mark">S</span>
+        <span>Symphonz</span>
+        <span class="version">v0.2.0</span>
+      </a>
+      <nav class="nav-links" aria-label="页面章节">
+        <a href="#system-map">系统地图</a>
+        <a href="#linear-polling">Linear 监听</a>
+        <a href="#codex-trigger">Codex 触发</a>
+        <a href="#issue-lifecycle">状态链路</a>
+        <a href="#implementation-boundaries">实现边界</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="overview" id="overview">
+      <div class="section-inner overview-grid">
+        <div>
+          <div class="eyebrow"><span class="eyebrow-dot"></span>Developer Guide · Current Implementation</div>
+          <h1>一条 Linear Issue，如何变成一次 Codex 工程任务</h1>
+          <p class="overview-copy">Symphonz 是连接任务系统和编码代理的轻量调度层。它持续监听 Linear，将符合条件的 Issue 放进独立工作目录，再通过 Codex app-server 启动一轮带完整项目规则的开发会话。</p>
+          <div class="fact-row" aria-label="核心事实">
+            <span class="fact">默认每 5 秒轮询</span>
+            <span class="fact">每个 Issue 独立 Workspace</span>
+            <span class="fact">JSON-RPC 触发 Codex</span>
+          </div>
+        </div>
+        <div class="overview-flow" aria-label="服务流程概览">
+          <div class="flow-stop"><span class="flow-index">01</span><div><strong>监听 Linear</strong><span>按项目、状态和标签查询候选 Issue</span></div></div>
+          <div class="flow-stop"><span class="flow-index">02</span><div><strong>准备 Workspace</strong><span>创建目录，首次进入时克隆目标仓库</span></div></div>
+          <div class="flow-stop"><span class="flow-index">03</span><div><strong>触发 Codex</strong><span>渲染 WORKFLOW Prompt，启动 thread 和 turn</span></div></div>
+          <div class="flow-stop"><span class="flow-index">04</span><div><strong>发布与审核</strong><span>Codex 根据 Issue 状态推送分支并创建 PR / MR</span></div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="system-map">
+      <div class="section-inner">
+        <div class="section-kicker">01 · Architecture</div>
+        <h2 class="section-heading">先看边界：谁调用谁，谁负责改变外部状态</h2>
+        <p class="section-lead">Symphonz Runtime 负责发现和分发任务；Codex 根据 <code>WORKFLOW.md</code> 执行代码修改以及 Linear、GitHub、GitLab 上的操作。点击组件可查看它的输入与输出。</p>
+        <hr class="section-rule">
+
+        <div class="map-layout">
+          <div class="diagram-shell">
+            <div class="diagram-toolbar">
+              <span class="diagram-title">组件与数据流</span>
+              <div class="legend" aria-label="连线说明">
+                <span class="legend-item"><span class="legend-line"></span>Runtime 直接调用</span>
+                <span class="legend-item"><span class="legend-line dashed"></span>Codex 按工作流执行</span>
+              </div>
+            </div>
+            <div class="system-map">
+              <svg class="map-connections" viewBox="0 0 900 480" role="img" aria-label="组件之间的定向调用关系" preserveAspectRatio="none">
+                <defs>
+                  <marker id="arrow-direct" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L8,4 L0,8 Z" fill="#5e6ad2"></path></marker>
+                  <marker id="arrow-delegated" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L8,4 L0,8 Z" fill="#9b6015"></path></marker>
+                </defs>
+                <path class="edge-direct" data-edge="runtime-linear" d="M400 218 L218 126"></path>
+                <text x="275" y="162">query issues</text>
+                <path class="edge-direct" data-edge="runtime-workflow" d="M450 185 L450 126"></path>
+                <text x="458" y="158">read</text>
+                <path class="edge-direct" data-edge="runtime-workspace" d="M395 282 L215 358"></path>
+                <text x="272" y="326">create / reuse</text>
+                <path class="edge-direct" data-edge="runtime-codex" d="M505 210 L688 126"></path>
+                <text x="572" y="162">JSON-RPC</text>
+                <path class="edge-direct" data-edge="runtime-state" d="M450 292 L450 356"></path>
+                <text x="458" y="330">record</text>
+                <path class="edge-delegated" data-edge="codex-linear" d="M744 62 C650 10 250 10 156 62"></path>
+                <text x="365" y="24">status / workpad</text>
+                <path class="edge-delegated" data-edge="codex-provider" d="M760 126 L760 355"></path>
+                <text x="770" y="248">push / PR / MR</text>
+              </svg>
+
+              <button class="map-node linear" type="button" data-component="linear" aria-pressed="false">
+                <span class="node-type">Tracker</span><strong>Linear GraphQL</strong><small>Issue、状态、标签、描述</small>
+              </button>
+              <button class="map-node workflow" type="button" data-component="workflow" aria-pressed="false">
+                <span class="node-type">Definition</span><strong>WORKFLOW.md</strong><small>运行配置 + Prompt 模板</small>
+              </button>
+              <button class="map-node codex" type="button" data-component="codex" aria-pressed="false">
+                <span class="node-type">Agent Protocol</span><strong>Codex app-server</strong><small>thread、turn、事件流</small>
+              </button>
+              <button class="map-node runtime" type="button" data-component="runtime" aria-pressed="true">
+                <span class="node-type">Orchestration</span><strong>Symphonz Runtime</strong><small>Runner · Orchestrator · Clients</small>
+              </button>
+              <button class="map-node workspace" type="button" data-component="workspace" aria-pressed="false">
+                <span class="node-type">Filesystem</span><strong>Issue Workspace</strong><small>.symphonz/workspace/ZHA-8</small>
+              </button>
+              <button class="map-node state" type="button" data-component="state" aria-pressed="false">
+                <span class="node-type">Observability</span><strong>Runtime State / Dashboard</strong><small>running、completed、blocked</small>
+              </button>
+              <button class="map-node provider" type="button" data-component="provider" aria-pressed="false">
+                <span class="node-type">Publishing</span><strong>GitHub / GitLab</strong><small>branch、PR / MR、merge</small>
+              </button>
+            </div>
+          </div>
+
+          <aside class="component-detail" id="component-detail" aria-live="polite">
+            <span class="detail-label">Selected component</span>
+            <h3 id="detail-title">Symphonz Runtime</h3>
+            <p id="detail-description">Python 内置服务。读取工作流、构造客户端、驱动轮询，并把每个候选 Issue 转换为一次 Codex turn。</p>
+            <div class="io-list">
+              <div class="io-item"><span>输入</span><strong id="detail-input">WORKFLOW.md、环境变量、Linear Issue</strong></div>
+              <div class="io-item"><span>输出</span><strong id="detail-output">Workspace、Codex session、Runtime event</strong></div>
+              <div class="io-item"><span>代码位置</span><strong class="mono" id="detail-code">runner.py · orchestrator.py</strong></div>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="linear-polling">
+      <div class="section-inner">
+        <div class="section-kicker">02 · Linear Polling</div>
+        <h2 class="section-heading">Linear 不是发 Webhook，而是由服务周期性拉取</h2>
+        <p class="section-lead"><code>run_service()</code> 按 <code>polling.interval_ms</code> 进入循环。每轮查询指定项目中处于活动状态的 Issue，再由 Orchestrator 做标签和运行中去重。</p>
+        <hr class="section-rule">
+
+        <div class="poll-grid">
+          <div class="poll-loop" aria-label="Linear 轮询步骤">
+            <div class="poll-stage"><span class="poll-number">1</span><div><h3>加载工作流配置</h3><p>读取项目 slug、API key 引用、活动状态、必需标签与轮询间隔。</p></div></div>
+            <div class="poll-stage"><span class="poll-number">2</span><div><h3>执行 SymphonzPoll</h3><p>向 Linear GraphQL 发送查询，一次最多获取 50 条候选 Issue。</p></div></div>
+            <div class="poll-stage"><span class="poll-number">3</span><div><h3>筛选候选 Issue</h3><p>GraphQL 已按项目和状态过滤；本地再确认 <code>required_labels</code>。</p></div></div>
+            <div class="poll-stage"><span class="poll-number">4</span><div><h3>跳过正在运行的 Issue</h3><p>若 identifier 已存在于 <code>state.running</code>，本轮不重复启动。</p></div></div>
+            <div class="poll-stage"><span class="poll-number">5</span><div><h3>同步执行并等待</h3><p>当前实现逐条调用 <code>run_issue()</code>，一个 Codex turn 完成后才处理下一条。</p></div></div>
+            <div class="poll-stage"><span class="poll-number">6</span><div><h3>等待下一轮</h3><p>默认休眠 5000ms，最小强制为 1000ms，然后重新查询 Linear。</p></div></div>
+          </div>
+
+          <div>
+            <div class="code-panel" aria-label="Linear GraphQL 查询示例">
+              <div class="code-head"><span>SymphonzPoll.graphql</span><span>linear.py</span></div>
+              <pre><span class="code-key">query</span> SymphonzPoll(
+  <span class="code-string">$projectSlug</span>: String!,
+  <span class="code-string">$stateNames</span>: [String!]!,
+  <span class="code-string">$first</span>: Int!
+) {
+  issues(filter: {
+    project: { slugId: { eq: <span class="code-string">$projectSlug</span> } },
+    state: { name: { in: <span class="code-string">$stateNames</span> } }
+  }, first: <span class="code-string">$first</span>) {
+    nodes {
+      id identifier title description priority
+      state { name }
+      branchName url
+      labels { nodes { name } }
+    }
+  }
+}</pre>
+            </div>
+            <div class="poll-note"><strong>当前调度模型：</strong>配置里虽然存在 <code>agent.max_concurrent_agents</code>，但 Python Orchestrator 尚未读取它；当前行为是同步逐个执行，而不是并发 worker 池。</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="codex-trigger">
+      <div class="section-inner">
+        <div class="section-kicker">03 · Codex Trigger</div>
+        <h2 class="section-heading">每个 Issue 如何触发一次 Codex app-server turn</h2>
+        <p class="section-lead">Symphonz 不调用一次性的 <code>codex exec</code>。它启动配置中的 app-server 命令，通过逐行 JSON-RPC 建立客户端、创建 thread、启动 turn，并持续消费事件直到结束。</p>
+        <hr class="section-rule">
+
+        <div class="sequence-wrap">
+          <div class="sequence-controls">
+            <span class="sequence-help">点击任一步查看说明；完整标签在无 JavaScript 时仍可阅读。</span>
+            <button class="play-button" id="play-sequence" type="button" aria-label="播放 Codex 触发链路"><span class="play-icon">▶</span><span id="play-label">播放链路</span></button>
+          </div>
+
+          <div class="sequence-diagram">
+            <div class="sequence-actors" aria-hidden="true">
+              <div class="actor">#</div><div class="actor">Runner</div><div class="actor">Orchestrator</div><div class="actor" data-actor="linear">Linear</div><div class="actor">Workspace</div><div class="actor">Codex</div><div class="actor">Runtime State</div>
+            </div>
+            <div class="sequence-steps">
+              <button class="sequence-step" type="button" data-sequence-step="poll" aria-pressed="false"><span class="step-index">01</span><span class="step-message runner-orchestrator"><span class="step-route">Runner → Orchestrator</span><span class="step-label">poll_once()</span></span></button>
+              <button class="sequence-step" type="button" data-sequence-step="linear-query" aria-pressed="false"><span class="step-index">02</span><span class="step-message orchestrator-linear"><span class="step-route">Orchestrator → Linear</span><span class="step-label">fetch_candidate_issues(active_states)</span></span></button>
+              <button class="sequence-step" type="button" data-sequence-step="candidate" aria-pressed="false"><span class="step-index">03</span><span class="step-message orchestrator-linear reverse"><span class="step-route">Linear → Orchestrator</span><span class="step-label">issues[]</span></span></button>
+              <button class="sequence-step" type="button" data-sequence-step="workspace" aria-pressed="false"><span class="step-index">04</span><span class="step-message orchestrator-workspace"><span class="step-route">Orchestrator → Workspace</span><span class="step-label">prepare_workspace(issue)</span></span></button>
+              <button class="sequence-step" type="button" data-sequence-step="hook" aria-pressed="false"><span class="step-index">05</span><span class="step-message orchestrator-workspace reverse"><span class="step-route">Workspace → Orchestrator</span><span class="step-label">path · after_create when new</span></span></button>
+              <button class="sequence-step" type="button" data-sequence-step="prompt" aria-pressed="false"><span class="step-index">06</span><span class="step-message orchestrator-local"><span class="step-route">Orchestrator · local</span><span class="step-label">render_prompt(WORKFLOW, issue)</span></span></button>
+              <button class="sequence-step" type="button" data-sequence-step="spawn" aria-pressed="false"><span class="step-index">07</span><span class="step-message orchestrator-codex"><span class="step-route">Orchestrator → Codex</span><span class="step-label">spawn codex app-server</span></span></button>
+              <button class="sequence-step" type="button" data-sequence-step="initialize" aria-pressed="false"><span class="step-index">08</span><span class="step-message orchestrator-codex"><span class="step-route">Orchestrator → Codex</span><span class="step-label">initialize { clientInfo, capabilities }</span></span></button>
+              <button class="sequence-step" type="button" data-sequence-step="initialize-result" aria-pressed="false"><span class="step-index">09</span><span class="step-message orchestrator-codex reverse"><span class="step-route">Codex → Orchestrator</span><span class="step-label">initialize result</span></span></button>
+              <button class="sequence-step" type="button" data-sequence-step="initialized" aria-pressed="false"><span class="step-index">10</span><span class="step-message orchestrator-codex"><span class="step-route">Orchestrator → Codex</span><span class="step-label">initialized notification</span></span></button>
+              <button class="sequence-step" type="button" data-sequence-step="thread" aria-pressed="false"><span class="step-index">11</span><span class="step-message orchestrator-codex"><span class="step-route">Orchestrator → Codex</span><span class="step-label">thread/start { cwd, sandbox }</span></span></button>
+              <button class="sequence-step" type="button" data-sequence-step="thread-result" aria-pressed="false"><span class="step-index">12</span><span class="step-message orchestrator-codex reverse"><span class="step-route">Codex → Orchestrator</span><span class="step-label">thread.id</span></span></button>
+              <button class="sequence-step" type="button" data-sequence-step="turn" aria-pressed="false"><span class="step-index">13</span><span class="step-message orchestrator-codex"><span class="step-route">Orchestrator → Codex</span><span class="step-label">turn/start { threadId, input }</span></span></button>
+              <button class="sequence-step" type="button" data-sequence-step="events" aria-pressed="false"><span class="step-index">14</span><span class="step-message orchestrator-codex reverse"><span class="step-route">Codex → Orchestrator</span><span class="step-label">turn/* events · completion</span></span></button>
+              <button class="sequence-step" type="button" data-sequence-step="state" aria-pressed="false"><span class="step-index">15</span><span class="step-message orchestrator-state"><span class="step-route">Orchestrator → Runtime State</span><span class="step-label">completed / blocked + RuntimeEvent</span></span></button>
+            </div>
+            <div class="sequence-explain" aria-live="polite">
+              <span id="sequence-title">完整链路</span>
+              <p id="sequence-description">从一次 Linear 轮询开始，依次准备 workspace、渲染 Prompt、创建 Codex thread 和 turn，最后把结果写入内存状态。</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="protocol-grid" aria-label="Codex JSON-RPC 四个关键消息">
+          <div class="protocol-step"><strong>initialize</strong><p>携带 <code>clientInfo.name=symphonz</code>、当前版本和 experimental API capability。</p></div>
+          <div class="protocol-step"><strong>initialized</strong><p>收到 initialize result 后发送通知，完成客户端握手；该通知没有请求 id。</p></div>
+          <div class="protocol-step"><strong>thread/start</strong><p>设置 Issue workspace 为 cwd，并传入 approval policy 与 thread sandbox。</p></div>
+          <div class="protocol-step"><strong>turn/start</strong><p>把渲染后的 Issue Prompt 放入 text input，同时设置 title 与 turn sandbox policy。</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="issue-lifecycle">
+      <div class="section-inner">
+        <div class="section-kicker">04 · Issue Lifecycle</div>
+        <h2 class="section-heading">Linear 状态既是队列，也是 Codex 的执行路由</h2>
+        <p class="section-lead">Runtime 负责把活动状态 Issue 交给 Codex；具体应该实现、发布、返工还是合并，由 <code>WORKFLOW.md</code> 中的状态规则决定。特别注意：<code>Done</code> 是发布触发器，不是终态。</p>
+        <hr class="section-rule">
+
+        <div class="lifecycle-track" aria-label="Linear Issue 状态轨道">
+          <div class="lifecycle-main">
+            <div class="life-state"><span class="state-pill active">Todo</span><p>进入队列；Codex 先转到 In Progress。</p></div>
+            <div class="life-state"><span class="state-pill active">In Progress</span><p>在既有 workspace 内实现并验证。</p></div>
+            <div class="life-state"><span class="state-pill publish">Done</span><p>推送 issue 分支并创建 PR / MR。</p></div>
+            <div class="life-state"><span class="state-pill review">Human Review</span><p>暂停自动调度，等待人工决定下一状态。</p></div>
+            <div class="life-state"><span class="state-pill publish">Merging</span><p>审核通过后，同步 main、确认 CI、执行 merge。</p></div>
+            <div class="life-state"><span class="state-pill terminal">Closed</span><p>合并完成后的正常终态。</p></div>
+          </div>
+          <div class="review-loop" data-transition="rework-return">
+            <span class="state-pill review">Human Review</span><span>反馈需要修改 →</span><span class="state-pill active">Rework</span><span>完成后返回 →</span><span class="state-pill review">Human Review</span>
+          </div>
+          <div class="terminal-rail"><span>任意阶段终止 →</span><span class="state-pill terminal">Cancelled / Canceled / Duplicate</span></div>
+        </div>
+        <div class="poll-note"><strong>默认暂停点：</strong>Human Review 默认不在 active_states，Runtime 不会主动轮询 PR / MR 评论。需要人工或外部自动化把 Issue 改为 <code>Rework</code> 或 <code>Merging</code>，才会再次触发 Codex。</div>
+
+        <div class="review-boundary">
+          <div class="responsibility">
+            <h3>Symphonz Runtime 直接负责</h3>
+            <p>运行循环与 Codex 会话的基础设施职责。</p>
+            <ul><li>Linear GraphQL 查询</li><li>Issue 标签筛选</li><li>Workspace 创建与 after_create hook</li><li>Prompt 渲染与 Codex JSON-RPC</li><li>运行事件和 Dashboard 状态</li></ul>
+          </div>
+          <div class="responsibility codex-owned">
+            <h3>Codex 按 WORKFLOW.md 负责</h3>
+            <p>需要项目凭据、工具和业务判断的外部操作。</p>
+            <ul><li>更新 Linear 状态和 Workpad</li><li>修改代码、运行测试、创建 commit</li><li>推送 issue 分支</li><li>创建 GitHub PR 或 GitLab MR</li><li>在 Rework 处理已提供的反馈</li><li>在 Merging 检查 CI 并执行 merge</li></ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="project-layout">
+      <div class="section-inner">
+        <div class="section-kicker">05 · Project Layout</div>
+        <h2 class="section-heading">安装后的项目结构与启动方式</h2>
+        <p class="section-lead"><code>symphonz install</code> 把工作流配置写入当前项目。运行时本身来自全局安装的 Symphonz CLI，不再要求项目 clone 外部 Symphony 或安装 mise / Elixir。</p>
+        <hr class="section-rule">
+
+        <div class="layout-grid">
+          <div class="tree-panel" aria-label="安装后的目录树"><pre>project/
+├── .symphonz/
+│   ├── WORKFLOW.md       # 配置与 Codex Prompt
+│   ├── config.toml       # 安装信息、环境变量引用
+│   ├── logs/             # 服务日志目录
+│   └── workspace/
+│       ├── ZHA-8/        # 一个 Issue 一个工作目录
+│       └── ZHA-9/
+└── ...                   # 原项目文件</pre></div>
+          <div class="command-list" aria-label="常用命令">
+            <div class="command"><code>symphonz install</code><span>交互式收集 Linear 与 Git provider 配置，并创建 .symphonz。</span></div>
+            <div class="command"><code>symphonz run</code><span>仅启动 Linear 监听和 Codex 调度，不启动 Web Dashboard。</span></div>
+            <div class="command"><code>symphonz run --port 4100</code><span>同时在 127.0.0.1:4100 提供 Runtime Dashboard。</span></div>
+            <div class="command"><code>symphonz version</code><span>查看当前 CLI 版本；本介绍页对应 v0.2.0。</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="implementation-boundaries">
+      <div class="section-inner">
+        <div class="section-kicker">06 · Implementation Boundaries</div>
+        <h2 class="section-heading">阅读运行结果时，需要知道的八个当前边界</h2>
+        <p class="section-lead">这些不是工作流愿景，而是 v0.2.0 内置 Runtime 的真实行为。明确它们，才能正确理解 Dashboard 和 Linear 中看到的状态。</p>
+        <hr class="section-rule">
+
+        <div class="boundaries">
+          <article class="boundary"><span class="boundary-index">01</span><h3>状态保存在进程内存</h3><p><code>RuntimeState</code> 没有持久化存储；服务重启后，running、completed、blocked 和事件历史会从空状态重新开始。</p></article>
+          <article class="boundary"><span class="boundary-index">02</span><h3>当前同步逐个执行</h3><p>Orchestrator 在一次 poll 内逐条调用 <code>run_issue()</code>。前一个 Codex turn 返回后，才会处理下一条 Issue。</p></article>
+          <article class="boundary"><span class="boundary-index">03</span><h3>completed 不等于 Linear Closed</h3><p>Dashboard 的 completed 表示当前 Codex turn 正常结束；Linear Issue 可能仍是 Todo、Done、Rework 或 Merging。</p></article>
+          <article class="boundary"><span class="boundary-index">04</span><h3>活动 Issue 可能再次触发</h3><p>Runtime 只在 Issue 正处于 running 时去重。若它下一轮仍属于 <code>active_states</code>，就可能再次进入 Codex。</p></article>
+          <article class="boundary"><span class="boundary-index">05</span><h3>发布依赖 Codex 环境</h3><p>Git push、GitHub PR、GitLab MR 与 Linear 状态更新依赖 Codex 会话中可用的 token、CLI 或 MCP 工具。</p></article>
+          <article class="boundary"><span class="boundary-index">06</span><h3>终态配置不负责自动清理</h3><p>当前 Python Runtime 通过只查询 active states 避开终态，但没有读取 <code>terminal_states</code> 来自动删除 workspace。</p></article>
+          <article class="boundary"><span class="boundary-index">07</span><h3>不具备自动重试</h3><p><code>retrying</code>、<code>attempt</code> 和 <code>max_turns</code> 是预留字段，当前 Orchestrator 不会按它们恢复或重试失败 turn。</p></article>
+          <article class="boundary"><span class="boundary-index">08</span><h3>日志目录尚未接入写入</h3><p><code>logs_root</code> 当前只会创建目录，Runtime 不会写入日志文件；运行信息来自标准输出与内存事件。</p></article>
+        </div>
+        <div class="closing-note"><strong>工程结论</strong><span>Symphonz 当前是一个轻量、可观察的轮询与会话调度器；项目级开发流程的智能部分由 Codex 在 WORKFLOW Prompt 约束下完成。</span></div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="footer-inner"><strong>Symphonz Developer Guide</strong><span>对应内置 Runtime v0.2.0 · 离线静态页面</span></div>
+  </footer>
+
+  <script>
+    const componentData = {
+      runtime: {
+        title: "Symphonz Runtime",
+        description: "Python 内置服务。读取工作流、构造客户端、驱动轮询，并把每个候选 Issue 转换为一次 Codex turn。",
+        input: "WORKFLOW.md、环境变量、Linear Issue",
+        output: "Workspace、Codex session、Runtime event",
+        code: "runner.py · orchestrator.py"
+      },
+      linear: {
+        title: "Linear GraphQL",
+        description: "通过 SymphonzPoll 查询指定 project_slug 中处于 active_states 的 Issue，返回描述、标签、状态和分支信息。",
+        input: "LINEAR_API_KEY、project_slug、active_states",
+        output: "最多 50 条标准化 Issue",
+        code: "linear.py"
+      },
+      workflow: {
+        title: "WORKFLOW.md",
+        description: "Front matter 是 Runtime 配置；正文是传给 Codex 的 Prompt 模板。安装时会写入项目、API key 环境变量名和 workspace 路径。",
+        input: "安装交互信息、Issue 模型",
+        output: "WorkflowDefinition、渲染后的 Prompt",
+        code: "workflow.py · WORKFLOW.md"
+      },
+      workspace: {
+        title: "Issue Workspace",
+        description: "每个 identifier 对应一个可复用目录。只有首次创建目录时才运行 after_create hook，默认在其中 clone 目标仓库。",
+        input: "project_root、workspace.root、Issue",
+        output: ".symphonz/workspace/<identifier>",
+        code: "workspace.py"
+      },
+      codex: {
+        title: "Codex app-server",
+        description: "Symphonz 启动一个子进程，通过 stdin/stdout 发送逐行 JSON-RPC。每次 Issue 执行会创建新的 thread 和 turn。",
+        input: "cwd、Prompt、sandbox、approval policy",
+        output: "thread id、turn id、事件流",
+        code: "codex_app_server.py"
+      },
+      state: {
+        title: "Runtime State / Dashboard",
+        description: "在进程内记录 running、completed、blocked 和最近 200 个事件；retrying 目前是预留集合。Dashboard 每 3 秒读取 /api/state。",
+        input: "Issue lifecycle 与 Codex stream events",
+        output: "Dashboard JSON 和活动列表",
+        code: "models.py · dashboard.py"
+      },
+      provider: {
+        title: "GitHub / GitLab",
+        description: "不是 Orchestrator 的直接 provider client。Codex 根据 WORKFLOW.md 使用 gh、glab 或 provider API 推送分支并创建 review request。",
+        input: "代码改动、凭据、provider 配置",
+        output: "远程分支、Pull Request / Merge Request",
+        code: "WORKFLOW.md"
+      }
+    };
+
+    const sequenceData = {
+      poll: ["01 · poll_once()", "Runner 按 interval_ms 调用 Orchestrator.poll_once()，开始一轮候选 Issue 调度。"],
+      "linear-query": ["02 · fetch candidates", "Orchestrator 调用 LinearClient.fetch_candidate_issues(active_states)，由客户端发送 SymphonzPoll GraphQL 查询。"],
+      candidate: ["03 · issues[]", "Linear 返回标准化 Issue；Orchestrator 再检查 required_labels 和 state.running。"],
+      workspace: ["04 · prepare_workspace", "使用安全化后的 identifier 创建或复用 .symphonz/workspace/<issue_identifier>。"],
+      hook: ["05 · workspace ready", "仅在目录首次创建时运行 after_create hook；默认 clone 目标仓库并 fetch 基础分支。"],
+      prompt: ["06 · render_prompt", "Orchestrator 在本地把 identifier、title、description、state、labels 和 URL 注入 WORKFLOW.md 正文模板。"],
+      spawn: ["07 · spawn app-server", "在 Issue workspace 中启动 codex.command，并把 stdin/stdout 作为 JSON-RPC 通道。"],
+      initialize: ["08 · initialize", "发送 clientInfo{name:symphonz, version} 与 experimentalApi capability。"],
+      "initialize-result": ["09 · initialize result", "Codex app-server 返回 initialize 请求的 JSON-RPC result；错误会立即阻塞本次 Issue。"],
+      initialized: ["10 · initialized", "Symphonz 发送无 id 的 initialized 通知，完成 app-server 客户端握手。"],
+      thread: ["11 · thread/start", "创建 thread，cwd 指向 workspace，同时传入 approvalPolicy、sandbox 和空 dynamicTools。"],
+      "thread-result": ["12 · thread.id", "Codex 返回 thread.id；缺失 id 会被视为无效响应并阻塞本次 Issue。"],
+      turn: ["13 · turn/start", "把渲染后的 Prompt 作为 text input，并关联 threadId、title 和 sandboxPolicy。"],
+      events: ["14 · event stream", "持续读取 turn/* 通知；completed 结束本次 turn，failed 或异常进入 blocked。"],
+      state: ["15 · Runtime State", "从 running 移出 Issue，补充 session_id 和时间，再写入 completed 或 blocked。"]
+    };
+
+    const componentNodes = Array.from(document.querySelectorAll("[data-component]"));
+    const detailTitle = document.getElementById("detail-title");
+    const detailDescription = document.getElementById("detail-description");
+    const detailInput = document.getElementById("detail-input");
+    const detailOutput = document.getElementById("detail-output");
+    const detailCode = document.getElementById("detail-code");
+
+    function selectComponent(name) {
+      const detail = componentData[name];
+      if (!detail) return;
+      componentNodes.forEach(node => node.setAttribute("aria-pressed", String(node.dataset.component === name)));
+      detailTitle.textContent = detail.title;
+      detailDescription.textContent = detail.description;
+      detailInput.textContent = detail.input;
+      detailOutput.textContent = detail.output;
+      detailCode.textContent = detail.code;
+    }
+
+    componentNodes.forEach(node => node.addEventListener("click", () => selectComponent(node.dataset.component)));
+
+    const sequenceSteps = Array.from(document.querySelectorAll("[data-sequence-step]"));
+    const sequenceTitle = document.getElementById("sequence-title");
+    const sequenceDescription = document.getElementById("sequence-description");
+    const playButton = document.getElementById("play-sequence");
+    const playLabel = document.getElementById("play-label");
+    const reducedMotionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+    let playTimer = null;
+    let playIndex = 0;
+
+    function selectSequence(name) {
+      const detail = sequenceData[name];
+      if (!detail) return;
+      sequenceSteps.forEach(step => step.setAttribute("aria-pressed", String(step.dataset.sequenceStep === name)));
+      sequenceTitle.textContent = detail[0];
+      sequenceDescription.textContent = detail[1];
+    }
+
+    function stopPlayback() {
+      if (playTimer !== null) window.clearInterval(playTimer);
+      playTimer = null;
+      playLabel.textContent = "播放链路";
+      playButton.setAttribute("aria-label", "播放 Codex 触发链路");
+    }
+
+    function startPlayback() {
+      if (reducedMotionQuery.matches) return;
+      stopPlayback();
+      playIndex = 0;
+      selectSequence(sequenceSteps[playIndex].dataset.sequenceStep);
+      playLabel.textContent = "停止播放";
+      playButton.setAttribute("aria-label", "停止播放 Codex 触发链路");
+      playTimer = window.setInterval(() => {
+        playIndex += 1;
+        if (playIndex >= sequenceSteps.length) {
+          stopPlayback();
+          return;
+        }
+        selectSequence(sequenceSteps[playIndex].dataset.sequenceStep);
+      }, 850);
+    }
+
+    sequenceSteps.forEach(step => step.addEventListener("click", () => {
+      stopPlayback();
+      selectSequence(step.dataset.sequenceStep);
+    }));
+    playButton.addEventListener("click", () => playTimer === null ? startPlayback() : stopPlayback());
+
+    function configureMotionPreference() {
+      stopPlayback();
+      playButton.disabled = reducedMotionQuery.matches;
+      if (reducedMotionQuery.matches) {
+        playLabel.textContent = "请逐步点击";
+        playButton.setAttribute("aria-label", "自动播放已因减少动态效果设置而停用");
+      }
+    }
+
+    if (typeof reducedMotionQuery.addEventListener === "function") {
+      reducedMotionQuery.addEventListener("change", configureMotionPreference);
+    }
+    configureMotionPreference();
+  </script>
+</body>
+</html>
