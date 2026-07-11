@@ -1,6 +1,9 @@
 from pathlib import Path
+from typing import Optional
 import json
 import os
+import shlex
+import subprocess
 import tempfile
 import unittest
 
@@ -374,6 +377,103 @@ class LinearAndWorkspaceTests(unittest.TestCase):
 
             self.assertEqual(workspace, root / ".symphonz" / "workspace" / "SYM_1")
             self.assertEqual((workspace / "issue.txt").read_text(), "SYM/1")
+
+
+class WorkspaceLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        from symphonz.service.models import Issue
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.workspace_root = self.root / ".symphonz" / "workspace"
+        self.log_path = self.root / "workspace-hooks.log"
+        self.issue = Issue(id="id-1", identifier="SYM/1", title="Workspace", state="Todo")
+
+    def workflow(self, hooks: Optional[dict] = None):
+        from symphonz.service.models import WorkflowDefinition
+
+        return WorkflowDefinition(
+            path=self.root / ".symphonz" / "WORKFLOW.md",
+            config={
+                "workspace": {"root": ".symphonz/workspace"},
+                "hooks": hooks or {},
+            },
+            prompt_template="",
+        )
+
+    def append_hook(self, label: str, suffix: str = "") -> str:
+        return f"printf '%s\\n' {shlex.quote(label)} >> {shlex.quote(str(self.log_path))}\n{suffix}".rstrip()
+
+    def test_workspace_lifecycle_runs_hooks_in_order_and_ignores_cleanup_failures(self):
+        from symphonz.service.workspace import (
+            prepare_workspace,
+            remove_workspace,
+            run_after_run_hook,
+            run_before_run_hook,
+            workspace_path,
+        )
+
+        workflow = self.workflow(
+            {
+                "after_create": self.append_hook("after_create"),
+                "before_run": self.append_hook("before_run"),
+                "after_run": self.append_hook("after_run", "exit 7"),
+                "before_remove": self.append_hook("before_remove", "exit 9"),
+            }
+        )
+
+        workspace = prepare_workspace(self.root, workflow, self.issue)
+        self.assertEqual(workspace, workspace_path(self.root, workflow, self.issue))
+
+        run_before_run_hook(workspace, workflow, self.issue)
+        run_after_run_hook(workspace, workflow, self.issue)
+        remove_workspace(workspace, workflow, self.issue)
+
+        self.assertFalse(workspace.exists())
+        self.assertEqual(
+            self.log_path.read_text().splitlines(),
+            ["after_create", "before_run", "after_run", "before_remove"],
+        )
+
+    def test_fatal_hook_timeout_raises(self):
+        from symphonz.service.workspace import prepare_workspace, run_before_run_hook
+
+        workflow = self.workflow(
+            {
+                "timeout_ms": 10,
+                "before_run": "python3 -c 'import time; time.sleep(0.1)'",
+            }
+        )
+
+        workspace = prepare_workspace(self.root, workflow, self.issue)
+
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run_before_run_hook(workspace, workflow, self.issue)
+
+    def test_prepare_workspace_removes_partial_directory_when_after_create_fails(self):
+        from symphonz.service.workspace import prepare_workspace, workspace_path
+
+        workflow = self.workflow({"after_create": self.append_hook("after_create", "mkdir partial\nexit 3")})
+        workspace = workspace_path(self.root, workflow, self.issue)
+
+        with self.assertRaises(Exception):
+            prepare_workspace(self.root, workflow, self.issue)
+
+        self.assertFalse(workspace.exists())
+
+    def test_prepare_workspace_rejects_preexisting_symlink_escaping_root(self):
+        from symphonz.service.workspace import prepare_workspace, workspace_path
+
+        workflow = self.workflow()
+        outside = self.root / "outside"
+        outside.mkdir()
+        workspace = workspace_path(self.root, workflow, self.issue)
+        workspace.parent.mkdir(parents=True, exist_ok=True)
+        workspace.symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaisesRegex(RuntimeError, "Workspace path escapes root"):
+            prepare_workspace(self.root, workflow, self.issue)
 
 
 class CodexAppServerTests(unittest.TestCase):
