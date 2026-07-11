@@ -474,6 +474,24 @@ class WorkspaceLifecycleTests(unittest.TestCase):
         with self.assertRaises(subprocess.TimeoutExpired):
             run_before_run_hook(workspace, workflow, self.issue)
 
+    @unittest.skipUnless(os.name == "posix", "process-group timeout is POSIX-specific")
+    def test_hook_timeout_terminates_descendant_processes(self):
+        from symphonz.service.workspace import prepare_workspace, run_before_run_hook
+
+        sentinel = self.root / "hook-child-survived.txt"
+        child_code = (
+            "import time, pathlib; time.sleep(0.3); "
+            f"pathlib.Path({str(sentinel)!r}).write_text('survived')"
+        )
+        hook = f"python3 -c {shlex.quote(child_code)} & wait"
+        workflow = self.workflow({"timeout_ms": 20, "before_run": hook})
+        workspace = prepare_workspace(self.root, workflow, self.issue)
+
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run_before_run_hook(workspace, workflow, self.issue)
+        time.sleep(0.4)
+        self.assertFalse(sentinel.exists())
+
     def test_prepare_workspace_removes_partial_directory_when_after_create_fails(self):
         from symphonz.service.workspace import prepare_workspace, workspace_path
 
@@ -495,8 +513,32 @@ class WorkspaceLifecycleTests(unittest.TestCase):
         workspace.parent.mkdir(parents=True, exist_ok=True)
         workspace.symlink_to(outside, target_is_directory=True)
 
-        with self.assertRaisesRegex(RuntimeError, "Workspace path escapes root"):
+        with self.assertRaisesRegex(RuntimeError, "must not be a symlink"):
             prepare_workspace(self.root, workflow, self.issue)
+
+    def test_prepare_workspace_rejects_symlink_to_sibling_workspace(self):
+        from symphonz.service.workspace import prepare_workspace, workspace_path
+
+        workflow = self.workflow()
+        sibling = self.workspace_root / "SYM-2"
+        sibling.mkdir(parents=True)
+        (sibling / "keep.txt").write_text("keep")
+        workspace = workspace_path(self.root, workflow, self.issue)
+        workspace.symlink_to(sibling, target_is_directory=True)
+
+        with self.assertRaisesRegex(RuntimeError, "must not be a symlink"):
+            prepare_workspace(self.root, workflow, self.issue)
+        self.assertEqual((sibling / "keep.txt").read_text(), "keep")
+
+    def test_remove_missing_workspace_is_idempotent_and_skips_hook(self):
+        from symphonz.service.workspace import remove_workspace, workspace_path
+
+        workflow = self.workflow({"before_remove": self.append_hook("before_remove")})
+        workspace = workspace_path(self.root, workflow, self.issue)
+
+        remove_workspace(workspace, workflow, self.issue)
+
+        self.assertFalse(self.log_path.exists())
 
 
 class CodexAppServerTests(unittest.TestCase):
@@ -562,6 +604,60 @@ class CodexAppServerTests(unittest.TestCase):
             self.assertEqual(result["turn_id"], "turn-1")
             self.assertEqual(result["session_id"], "thread-1-turn-1")
             self.assertTrue(any(event["type"] == "turn_completed" for event in events))
+
+    def test_codex_app_server_preserves_completion_arriving_before_turn_response(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server, _ = self.write_server(
+                root,
+                "import json, sys\n"
+                "turn_request = None\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        turn_request = msg['id']\n"
+                "        print(json.dumps({'id': 777, 'method': 'item/tool/call', 'params': {'tool': 'linear_graphql', 'arguments': {'query': 'query Early { viewer { id } }'}}}), flush=True)\n"
+                "    elif msg.get('id') == 777:\n"
+                "        print(json.dumps({'method': 'turn/completed', 'params': {'usage': {'totalTokens': 3}}}), flush=True)\n"
+                "        print(json.dumps({'id': turn_request, 'result': {'turn': {'id': 'turn-early'}}}), flush=True)\n",
+            )
+            calls = []
+
+            result = self.client(
+                server,
+                read_timeout_ms=200,
+                dynamic_tool_executor=lambda name, arguments: calls.append((name, arguments))
+                or {"success": True, "output": "ok", "contentItems": []},
+            ).run_turn(**self.run_kwargs(root))
+
+            self.assertEqual(result["turn_id"], "turn-early")
+            self.assertEqual(result["result"]["usage"]["totalTokens"], 3)
+            self.assertEqual(calls[0][0], "linear_graphql")
+
+    def test_never_approval_policy_rejects_unexpected_approval_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = root / "records.jsonl"
+            server, _ = self.write_server(
+                root,
+                "import json, sys\n"
+                f"records = open({str(records)!r}, 'a')\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); records.write(json.dumps(msg) + '\\n'); records.flush(); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        print(json.dumps({'id': 950, 'method': 'item/commandExecution/requestApproval', 'params': {}}), flush=True)\n",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "approval_required"):
+                self.client(server).run_turn(**self.run_kwargs(root))
+
+            replies = [json.loads(line) for line in records.read_text().splitlines() if json.loads(line).get("id") == 950]
+            self.assertEqual(replies[-1]["result"]["decision"], "decline")
 
     def test_codex_app_server_reuses_thread_and_executes_dynamic_tool(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -666,6 +762,40 @@ class CodexAppServerTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "turn_cancelled"):
                 client.run_turn(**self.run_kwargs(root), cancel_event=cancel)
+
+    @unittest.skipUnless(os.name == "posix", "process-group cancellation is POSIX-specific")
+    def test_codex_app_server_cancellation_terminates_child_process_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sentinel = root / "child-survived.txt"
+            child_code = (
+                "import time, pathlib; time.sleep(0.4); "
+                f"pathlib.Path({str(sentinel)!r}).write_text('survived')"
+            )
+            server, _ = self.write_server(
+                root,
+                "import json, subprocess, sys, time\n"
+                f"child = {child_code!r}\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        subprocess.Popen([sys.executable, '-c', child])\n"
+                "        time.sleep(5)\n",
+            )
+            cancel = threading.Event()
+            timer = threading.Timer(0.05, cancel.set)
+            timer.start()
+            self.addCleanup(timer.cancel)
+
+            with self.assertRaisesRegex(RuntimeError, "turn_cancelled"):
+                self.client(server, turn_timeout_ms=2000).run_turn(
+                    **self.run_kwargs(root), cancel_event=cancel
+                )
+            time.sleep(0.5)
+            self.assertFalse(sentinel.exists())
 
     def test_codex_app_server_replies_to_unsupported_tool_then_completes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -871,6 +1001,7 @@ class OrchestratorHardeningTests(unittest.TestCase):
         retry = orchestrator.state.snapshot()["retrying"][0]
         self.assertEqual(retry["attempt"], 1)
         self.assertEqual(retry["due_at"], 110.0)
+        self.assertGreater(retry["due_at_epoch"], 1_000_000_000)
 
         now[0] = 109.0
         orchestrator.tick()
@@ -908,6 +1039,32 @@ class OrchestratorHardeningTests(unittest.TestCase):
 
         self.assertFalse(workspace.exists())
         self.assertEqual(orchestrator.state.snapshot()["counts"]["claimed"], 0)
+
+    def test_worker_completion_in_terminal_state_removes_workspace_immediately(self):
+        from dataclasses import replace
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.workspace import workspace_path
+
+        issue = self.issue(1, state="Merging")
+        terminal = replace(issue, state="Done")
+
+        class LinearAtCompletion(self.FakeLinear):
+            def fetch_candidate_issues(inner_self, active_states):
+                return [issue]
+
+            def fetch_issues_by_ids(inner_self, ids):
+                return [terminal]
+
+        codex = self.RecordingCodex(sleep_seconds=0)
+        orchestrator = Orchestrator(self.root, self.workflow, LinearAtCompletion([issue]), codex)
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.poll_once()
+
+        self.assertFalse(workspace_path(self.root, self.workflow, issue).exists())
+        snapshot = orchestrator.state.snapshot()
+        self.assertEqual(snapshot["completed"][0]["state"], "Done")
+        self.assertTrue(any(event["type"] == "workspace_removed" for event in snapshot["events"]))
 
     def test_runtime_events_are_written_as_json_lines(self):
         from symphonz.service.event_log import JsonlEventLog
@@ -972,7 +1129,7 @@ class OrchestratorAndDashboardTests(unittest.TestCase):
             workflow_path = root / "WORKFLOW.md"
             workflow_path.write_text(Path("WORKFLOW.md").read_text())
             workflow = load_workflow(workflow_path)
-            workflow.config["hooks"]["after_create"] = "printf ready > ready.txt\n"
+            workflow.config["hooks"] = {"after_create": "printf ready > ready.txt\n"}
             codex = FakeCodex()
             orchestrator = Orchestrator(root, workflow, FakeLinear(), codex)
 
@@ -989,11 +1146,13 @@ class OrchestratorAndDashboardTests(unittest.TestCase):
 
         state = RuntimeState()
         state.add_event("started", "runtime started")
+        state.claimed.add("id-1")
         state.completed["SYM-1"] = {"issue_identifier": "SYM-1", "status": "completed"}
         payload = state.snapshot()
         html = render_dashboard_html()
 
         self.assertEqual(payload["counts"]["running"], 0)
+        self.assertEqual(payload["counts"]["claimed"], 1)
         self.assertEqual(payload["events"][0]["message"], "runtime started")
         self.assertEqual(find_issue(payload, "SYM-1")["status"], "completed")
         self.assertIn("Symphonz Runtime", html)
@@ -1002,3 +1161,7 @@ class OrchestratorAndDashboardTests(unittest.TestCase):
         self.assertIn("class=\"app-shell\"", html)
         self.assertIn("class=\"sidebar\"", html)
         self.assertIn("status-chip", html)
+        self.assertIn("Claimed", html)
+        self.assertIn("Turn / Attempt", html)
+        self.assertIn("due_at", html)
+        self.assertIn("cancellation_reason", html)

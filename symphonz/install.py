@@ -265,15 +265,37 @@ def create_base_layout(project_root: Path) -> None:
         (project_root / relative).mkdir(parents=True, exist_ok=True)
 
 
+def linear_preflight(config: InstallConfig, environ: dict[str, str] | None = None) -> str:
+    environ = os.environ if environ is None else environ
+    api_key = environ.get(config.linear_api_key_env, "").strip()
+    if not api_key:
+        return (
+            "Linear preflight skipped because the API key is not set. Before running the service:\n"
+            f'  export {config.linear_api_key_env}="<linear-api-key>"'
+        )
+
+    from symphonz.service.linear import LINEAR_GRAPHQL_URL, LinearClient
+
+    endpoint = environ.get("SYMPHONZ_LINEAR_ENDPOINT", LINEAR_GRAPHQL_URL)
+    client = LinearClient(api_key=api_key, project_slug=config.linear_project_slug, endpoint=endpoint)
+    body = client.graphql("query SymphonzInstallPreflight { viewer { id } }")
+    if body.get("errors") or not body.get("data", {}).get("viewer", {}).get("id"):
+        raise RuntimeError(f"Linear preflight failed: {body.get('errors') or 'viewer was not returned'}")
+    return "Linear connection verified."
+
+
 def install_project(
     project_root: Path | None = None,
     runtime_mode: str = "embedded",
     assume_yes: bool = False,
     skip_runtime_download: bool = False,
+    skip_linear_preflight: bool = False,
     input_func: Callable[[str], str] | None = None,
-    **config_values: str | None,
+    output_func: Callable[[str], None] | None = None,
+    **config_values: object,
 ) -> Path:
     root = project_root or Path.cwd()
+    environ = config_values.get("environ")
     config = collect_install_config(
         root,
         runtime_mode,
@@ -281,6 +303,8 @@ def install_project(
         input_func=input_func,
         **config_values,
     )
+    if not skip_linear_preflight:
+        (output_func or print)(linear_preflight(config, environ=environ))
     create_base_layout(root)
     write_config(root / ".symphonz" / "config.toml", config)
 

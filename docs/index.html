@@ -1446,9 +1446,9 @@ Description:
             </div>
             <div class="workflow-rationale">
               <span class="rationale-title">设计目的</span>
-              <p>每一轮都会创建新的 Codex thread 和 turn，因此不能依赖上一轮会话记忆。Issue 字段、workspace 位置、基础分支和 Git provider 每次重新注入，使新会话可以从文件系统和 Linear Workpad 恢复上下文。</p>
+              <p>每次 worker invocation 创建一个 Codex thread，并在 Issue 仍处于活动状态时复用该 thread 运行最多 <code>max_turns</code> 个 turn。后续重试会创建新 thread，因此 Issue 字段、workspace 位置、基础分支和 Git provider 仍会重新注入，使会话可从文件系统和 Linear Workpad 恢复上下文。</p>
               <div class="workflow-meta"><span class="owner-tag runtime">Runtime 渲染变量</span><span class="owner-tag codex">Codex 读取上下文</span></div>
-              <p class="workflow-limit"><code>attempt</code> 条件块当前不会出现，因为 Orchestrator 尚未传入自动重试次数。</p>
+              <p class="workflow-limit">失败或活动状态续跑会进入指数退避队列；新 invocation 会把递增的 <code>attempt</code> 注入 Prompt，提醒 Codex 复用现有 workspace。</p>
             </div>
           </article>
 
@@ -1982,7 +1982,7 @@ Effective route from `Merging -> integrate`:
       },
       codex: {
         title: "Codex app-server",
-        description: "Symphonz 启动一个子进程，通过 stdin/stdout 发送逐行 JSON-RPC。每次 Issue 执行会创建新的 thread 和 turn。",
+        description: "Symphonz 启动一个子进程，通过 stdin/stdout 发送逐行 JSON-RPC。每次 worker invocation 创建 thread，并在连续 turn 间复用。",
         input: "cwd、Prompt、sandbox、approval policy",
         output: "thread id、turn id、事件流",
         code: "codex_app_server.py"

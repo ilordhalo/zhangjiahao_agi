@@ -53,7 +53,8 @@ def run_installed(print_command: bool = False, port: int | None = None, project_
     root = project_root or Path.cwd()
     command, env_updates = build_run_command(root, port=port)
     if print_command:
-        print(" ".join(shlex.quote(part) for part in command))
+        assignments = [f"{key}={shlex.quote(value)}" for key, value in env_updates.items()]
+        print(" ".join([*assignments, *(shlex.quote(part) for part in command)]))
         return 0
 
     config = read_config(root / ".symphonz" / "config.toml")

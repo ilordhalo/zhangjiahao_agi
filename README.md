@@ -20,6 +20,8 @@ symphonz run --port 4000
 
 The interactive installer asks for the Linear project, API-key environment variable name, GitHub or GitLab provider, repository URL, and branch settings. It writes `.symphonz/WORKFLOW.md`, `.symphonz/config.toml`, and the workspace/log directories. It never writes the API-key value to disk.
 
+If the referenced API-key environment variable is already set, installation performs a read-only Linear connection check. Otherwise it prints the exact `export` command needed before `symphonz run`. Use `--skip-linear-preflight` only for an intentionally offline setup.
+
 For CI or scripted setup, provide every project-specific value with flags or `SYMPHONZ_*` environment variables:
 
 ```bash

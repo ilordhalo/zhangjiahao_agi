@@ -172,7 +172,7 @@ class DeveloperGuideTests(unittest.TestCase):
             "## Symphonz Workpad",
             "Todo → In Progress → Ready to Publish → Human Review → Rework → Human Review → Merging → Done",
             "离线真实结构模拟，不访问 Linear 或 GitHub，不产生外部写操作",
-            "每一轮都会创建新的 Codex thread 和 turn",
+            "复用该 thread 运行最多",
             "Human Review 不触发 Codex",
         ]:
             self.assertIn(phrase, html)

@@ -217,6 +217,8 @@ class Orchestrator:
                 self._schedule_retry(completed_issue, max(int(entry.get("attempt", 0)), 1), None, delay=1.0)
                 self.state.add_event("issue_continuing", f"Continuing {completed_issue.identifier}", completed_issue.identifier)
             else:
+                if self._terminal(completed_issue):
+                    self._cleanup_terminal_workspace(completed_issue)
                 self._complete(completed_issue, entry, outcome.get("result") or {})
 
     def _handle_worker_error(self, issue: Issue, entry: dict, error: Exception, cancel_reason: str | None) -> None:
@@ -250,7 +252,7 @@ class Orchestrator:
             max_delay = max(1, int(self.workflow.config.get("agent", {}).get("max_retry_backoff_ms", 300000))) / 1000
             delay = min(10 * (2 ** max(attempt - 1, 0)), max_delay)
         entry = self._entry(issue, status="retrying", attempt=attempt)
-        entry.update({"due_at": self.clock() + delay, "error": error})
+        entry.update({"due_at": self.clock() + delay, "due_at_epoch": time.time() + delay, "error": error})
         with self.state.lock:
             self.state.retrying[issue.id] = entry
             self._retry_issues[issue.id] = issue
@@ -330,6 +332,7 @@ class Orchestrator:
                 "session_id": result.get("session_id"),
                 "turn_count": result.get("turn_count", 1),
                 "status": "completed",
+                "state": issue.state,
             }
         )
         with self.state.lock:

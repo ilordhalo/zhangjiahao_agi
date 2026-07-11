@@ -104,7 +104,9 @@ done
 
 mkdir -p "$(dirname "$PREFIX")"
 PREFIX=$(cd "$(dirname "$PREFIX")" && pwd -P)/$(basename "$PREFIX")
-LIB_DIR="${PREFIX}/lib"
+RELEASES_DIR="${PREFIX}/releases"
+CURRENT_LINK="${PREFIX}/current"
+LIB_DIR="${CURRENT_LINK}/lib"
 
 if [ -z "$BIN_DIR" ]; then
   if [ "$PREFIX_SET" -eq 1 ]; then
@@ -119,6 +121,7 @@ fi
 
 TMP_DIR=""
 STAGING_DIR=""
+POINTER_TMP=""
 
 cleanup() {
   if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
@@ -126,6 +129,9 @@ cleanup() {
   fi
   if [ -n "$STAGING_DIR" ] && [ -d "$STAGING_DIR" ]; then
     rm -rf "$STAGING_DIR"
+  fi
+  if [ -n "$POINTER_TMP" ] && [ -L "$POINTER_TMP" ]; then
+    rm -f "$POINTER_TMP"
   fi
 }
 trap cleanup EXIT
@@ -151,12 +157,12 @@ if [ ! -f "${SOURCE_DIR}/bin/symphonz" ] || [ ! -d "${SOURCE_DIR}/symphonz" ] ||
   exit 1
 fi
 
-mkdir -p "$BIN_DIR" "$LIB_DIR"
+mkdir -p "$BIN_DIR" "$RELEASES_DIR"
 BIN_DIR=$(cd "$BIN_DIR" && pwd -P)
 STAGING_DIR=$(mktemp -d "${PREFIX}/.symphonz-install.XXXXXX")
-mkdir -p "${STAGING_DIR}/lib" "${STAGING_DIR}/bin"
-cp -R "${SOURCE_DIR}/symphonz" "${STAGING_DIR}/lib/symphonz"
-cp "${SOURCE_DIR}/WORKFLOW.md" "${STAGING_DIR}/lib/WORKFLOW.md"
+mkdir -p "${STAGING_DIR}/release/lib" "${STAGING_DIR}/bin"
+cp -R "${SOURCE_DIR}/symphonz" "${STAGING_DIR}/release/lib/symphonz"
+cp "${SOURCE_DIR}/WORKFLOW.md" "${STAGING_DIR}/release/lib/WORKFLOW.md"
 
 LIB_DIR_ESCAPED=$(escape_double_quoted "$LIB_DIR")
 cat > "${STAGING_DIR}/bin/symphonz" <<EOF
@@ -168,12 +174,13 @@ exec python3 -c 'from symphonz.cli import main; raise SystemExit(main())' "\$@"
 EOF
 chmod +x "${STAGING_DIR}/bin/symphonz"
 
-rm -rf "${LIB_DIR}/symphonz.new"
-mv "${STAGING_DIR}/lib/symphonz" "${LIB_DIR}/symphonz.new"
-cp "${STAGING_DIR}/lib/WORKFLOW.md" "${LIB_DIR}/WORKFLOW.md.new"
-rm -rf "${LIB_DIR}/symphonz"
-mv "${LIB_DIR}/symphonz.new" "${LIB_DIR}/symphonz"
-mv "${LIB_DIR}/WORKFLOW.md.new" "${LIB_DIR}/WORKFLOW.md"
+RELEASE_DIR="${RELEASES_DIR}/$(date +%Y%m%d%H%M%S)-$$"
+mv "${STAGING_DIR}/release" "$RELEASE_DIR"
+ln -s "$RELEASE_DIR" "${STAGING_DIR}/current"
+POINTER_TMP="${PREFIX}/current.$$"
+mv "${STAGING_DIR}/current" "$POINTER_TMP"
+python3 -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' "$POINTER_TMP" "$CURRENT_LINK"
+POINTER_TMP=""
 mv "${STAGING_DIR}/bin/symphonz" "${BIN_DIR}/symphonz"
 
 cat <<EOF

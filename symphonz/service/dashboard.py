@@ -231,7 +231,7 @@ def render_dashboard_html() -> str:
     .metrics {
       display: grid;
       gap: 10px;
-      grid-template-columns: repeat(4, minmax(130px, 1fr));
+      grid-template-columns: repeat(5, minmax(110px, 1fr));
     }
     .metric {
       background: var(--surface);
@@ -314,6 +314,15 @@ def render_dashboard_html() -> str:
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
       font-size: 12px;
       white-space: nowrap;
+    }
+    .detail {
+      color: var(--muted);
+      display: block;
+      font-size: 11px;
+      line-height: 1.45;
+      margin-top: 4px;
+      max-width: 260px;
+      overflow-wrap: anywhere;
     }
     .status-chip {
       align-items: center;
@@ -448,12 +457,13 @@ def render_dashboard_html() -> str:
       const state = await fetch('/api/state').then(r => r.json());
       const counts = state.counts;
       const metricLabels = {
+        claimed: 'Claimed',
         running: 'Running',
         completed: 'Completed',
         blocked: 'Blocked',
         retrying: 'Retrying'
       };
-      document.getElementById('metrics').innerHTML = ['running','completed','blocked','retrying'].map(k => `
+      document.getElementById('metrics').innerHTML = ['claimed','running','completed','blocked','retrying'].map(k => `
         <div class="metric">
           <div class="metric-label">${metricLabels[k]}</div>
           <div class="metric-value">${counts[k] || 0}</div>
@@ -463,13 +473,15 @@ def render_dashboard_html() -> str:
       document.getElementById('issue-count').textContent = `${issues.length} ${issues.length === 1 ? 'issue' : 'issues'}`;
       document.getElementById('issues').innerHTML = issues.length ? `
         <table>
-          <thead><tr><th>Issue</th><th>Status</th><th>Workspace</th><th>Session</th></tr></thead>
+          <thead><tr><th>Issue</th><th>Status</th><th>Turn / Attempt</th><th>Retry / Error</th><th>Workspace</th><th>Session</th></tr></thead>
           <tbody>
             ${issues.map(i => {
               const status = statusClass(i.status || i.state);
               return `<tr>
                 <td><span class="issue-key">${escapeHtml(i.issue_identifier)}</span><span class="issue-title">${escapeHtml(i.title)}</span></td>
                 <td><span class="status-chip status-${status}">${escapeHtml(i.status || i.state || 'running')}</span></td>
+                <td><span class="session">turn ${escapeHtml(i.turn_count || 0)}</span><span class="detail">attempt ${escapeHtml(i.attempt || 0)}</span></td>
+                <td><span class="session">${escapeHtml(i.due_at_epoch ? eventTime(i.due_at_epoch) : '')}</span><span class="detail">${escapeHtml(i.error || i.cancellation_reason || '')}</span></td>
                 <td><span class="path">${escapeHtml(i.workspace)}</span></td>
                 <td><span class="session">${escapeHtml(i.session_id)}</span></td>
               </tr>`;

@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 import json
+import os
 import queue
+import signal
 import subprocess
 import threading
 import time
@@ -82,6 +84,7 @@ class CodexAppServer:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=1,
+            start_new_session=(os.name == "posix"),
         )
         stream = _JsonLineStream(process.stdout)
         stderr_lines: queue.Queue[object] = queue.Queue()
@@ -132,6 +135,9 @@ class CodexAppServer:
                         "sandboxPolicy": turn_sandbox_policy,
                     },
                     cancel_event,
+                    on_message=lambda message: self._handle_pre_response_message(
+                        process, message, on_event, approval_policy
+                    ),
                 )
                 last_turn_id = turn_response.get("turn", {}).get("id") or turn_response.get("turnId") or "turn"
                 turn_count += 1
@@ -169,21 +175,48 @@ class CodexAppServer:
         method: str,
         params: dict,
         cancel_event: threading.Event,
+        on_message: Callable[[dict], bool] | None = None,
     ) -> dict:
         request_id = self._next_id
         self._next_id += 1
         self._send(process, {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
         deadline = time.monotonic() + max(self.read_timeout_ms, 1) / 1000
         while True:
-            message = stream.get(deadline=deadline, cancel_event=cancel_event, timeout_error="response_timeout")
-            if message.get("id") != request_id:
-                continue
+            message = stream.get_response(
+                request_id,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                timeout_error="response_timeout",
+                on_message=on_message,
+            )
             if "error" in message:
                 raise RuntimeError(f"response_error: {message['error']!r}")
             return message.get("result") or {}
 
     def _notify(self, process: subprocess.Popen, method: str, params: dict) -> None:
         self._send(process, {"jsonrpc": "2.0", "method": method, "params": params})
+
+    def _handle_pre_response_message(
+        self,
+        process: subprocess.Popen,
+        message: dict,
+        on_event: Callable[[dict], None],
+        approval_policy: str | dict,
+    ) -> bool:
+        method = message.get("method", "")
+        params = message.get("params") or {}
+        if method == "item/tool/call" and "id" in message:
+            on_event(self._handle_tool_call(process, message))
+            return True
+        if method in {"item/tool/requestUserInput", "mcpServer/elicitation/request"} or _needs_input(method, message):
+            on_event({"type": "turn_input_required", "method": method, "params": params})
+            raise RuntimeError("turn_input_required")
+        if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"} and "id" in message:
+            if approval_policy == "never":
+                self._send(process, {"jsonrpc": "2.0", "id": message["id"], "result": {"decision": "decline"}})
+                on_event({"type": "approval_rejected", "method": method, "params": params})
+            raise RuntimeError("approval_required")
+        return False
 
     def _await_completion(
         self,
@@ -224,9 +257,8 @@ class CodexAppServer:
                 raise RuntimeError("turn_input_required")
             if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"} and "id" in message:
                 if approval_policy == "never":
-                    self._send(process, {"jsonrpc": "2.0", "id": message["id"], "result": {"decision": "acceptForSession"}})
-                    on_event({"type": "approval_auto_approved", "method": method, "params": params})
-                    continue
+                    self._send(process, {"jsonrpc": "2.0", "id": message["id"], "result": {"decision": "decline"}})
+                    on_event({"type": "approval_rejected", "method": method, "params": params})
                 raise RuntimeError("approval_required")
             if method:
                 event = {"type": normalize_event_type(method), "method": method, "params": params}
@@ -266,9 +298,32 @@ class CodexAppServer:
 class _JsonLineStream:
     def __init__(self, stdout):
         self.messages: queue.Queue[object] = queue.Queue()
+        self.pending: list[dict] = []
         _start_line_reader(stdout, self.messages, decode_json=True)
 
     def get(self, *, deadline: float, cancel_event: threading.Event, timeout_error: str) -> dict:
+        if self.pending:
+            return self.pending.pop(0)
+        return self._get_queued(deadline=deadline, cancel_event=cancel_event, timeout_error=timeout_error)
+
+    def get_response(
+        self,
+        request_id: int,
+        *,
+        deadline: float,
+        cancel_event: threading.Event,
+        timeout_error: str,
+        on_message: Callable[[dict], bool] | None = None,
+    ) -> dict:
+        while True:
+            message = self._get_queued(deadline=deadline, cancel_event=cancel_event, timeout_error=timeout_error)
+            if message.get("id") == request_id and ("result" in message or "error" in message):
+                return message
+            if on_message is not None and on_message(message):
+                continue
+            self.pending.append(message)
+
+    def _get_queued(self, *, deadline: float, cancel_event: threading.Event, timeout_error: str) -> dict:
         while True:
             if cancel_event.is_set():
                 raise RuntimeError("turn_cancelled")
@@ -347,11 +402,23 @@ def _drain_text_queue(lines: queue.Queue[object]) -> list[str]:
 
 def _stop_process(process: subprocess.Popen) -> None:
     if process.poll() is None:
-        process.terminate()
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            process.terminate()
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            process.kill()
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
             process.wait(timeout=2)
     for stream in (process.stdin, process.stdout, process.stderr):
         if stream is not None:

@@ -188,21 +188,21 @@ Expected: all scheduler tests pass deterministically.
 - Produces: non-interactive install flags/environment fallback, safe branch continuation instructions, terminal `Done`, and CLI version `0.3.0`.
 - Consumes: existing `InstallConfig`, generated `.symphonz/config.toml`, and packaged WORKFLOW template.
 
-- [ ] **Step 1: Write failing CLI/workflow contract tests**
+- [x] **Step 1: Write failing CLI/workflow contract tests**
 
 Require `install --yes --linear-project quality-project`, `SYMPHONZ_LINEAR_PROJECT` fallback, missing-field error, generated `Ready to Publish`, terminal `Done`, absence of `git checkout -B` continuation reset, README discovery, and version `0.3.0`.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `python3 -m unittest tests.test_symphonz_cli tests.test_developer_guide -v`
 
 Expected: flags are rejected and old workflow/version assertions fail.
 
-- [ ] **Step 3: Implement CLI and workflow changes**
+- [x] **Step 3: Implement CLI and workflow changes**
 
 Pass optional CLI fields into `collect_install_config`. Resolve each value in order: explicit flag, `SYMPHONZ_*` environment, detected default. Keep secret input as an environment-variable name. Update the shell installer through a staging directory before replacing the installed library.
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run: `python3 -m unittest tests.test_symphonz_cli tests.test_developer_guide -v`
 
@@ -220,21 +220,21 @@ Expected: all CLI, installer, workflow, page, and version tests pass.
 - Produces: dashboard/API visibility for claims/retries/turns and a fake full lifecycle through terminal cleanup.
 - Consumes: hardened RuntimeState snapshot and fake Linear GraphQL mutation records.
 
-- [ ] **Step 1: Write failing stateful E2E and dashboard tests**
+- [x] **Step 1: Write failing stateful E2E and dashboard tests**
 
 The fake app-server must call `linear_graphql` to mutate Todo to In Progress and then Human Review. Subsequent fixture states exercise Ready to Publish, Rework, Merging, and Done. Assert one Workpad identity, one branch/review identity, state history, retry visibility, and terminal workspace deletion.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `python3 -m unittest tests.test_symphonz_e2e tests.test_symphonz_service.OrchestratorAndDashboardTests -v`
 
 Expected: current fake is read-only and current dashboard lacks hardened fields.
 
-- [ ] **Step 3: Implement fixtures, dashboard, and documentation**
+- [x] **Step 3: Implement fixtures, dashboard, and documentation**
 
 Update the Dashboard to render `claimed`, `turn_count`, retry `attempt/due_at`, and cancellation/error details. Update the developer guide and README to accurately describe guaranteed Linear tooling, trusted-environment policy, new state path, CLI automation, and upgrade behavior.
 
-- [ ] **Step 4: Verify GREEN and full regression**
+- [x] **Step 4: Verify GREEN and full regression**
 
 Run:
 
@@ -256,15 +256,15 @@ Expected: all tests pass, syntax and whitespace checks pass, and output is `symp
 **Interfaces:**
 - Produces: reviewed commits pushed to `origin/codex/runtime-hardening`.
 
-- [ ] **Step 1: Request independent code review**
+- [x] **Step 1: Request independent code review**
 
 Review runtime correctness, deadlocks, cancellation races, subprocess cleanup, path containment, secrets, lifecycle semantics, and test realism.
 
-- [ ] **Step 2: Address findings with focused RED/GREEN tests**
+- [x] **Step 2: Address findings with focused RED/GREEN tests**
 
 Run the smallest affected test class after each finding, then the full suite.
 
-- [ ] **Step 3: Commit and push**
+- [x] **Step 3: Commit and push**
 
 Commit coherent changes with conventional messages, verify a clean worktree, and push:
 

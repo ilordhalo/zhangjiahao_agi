@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,8 @@ def workspace_path(project_root: Path, workflow: WorkflowDefinition, issue: Issu
 
 def prepare_workspace(project_root: Path, workflow: WorkflowDefinition, issue: Issue) -> Path:
     workspace = workspace_path(project_root, workflow, issue)
+    if workspace.is_symlink():
+        raise RuntimeError(f"Workspace path must not be a symlink: {workspace}")
     _validate_workspace_containment(workspace)
     created = not os.path.lexists(workspace)
     if created:
@@ -51,20 +54,17 @@ def run_after_run_hook(workspace: Path, workflow: WorkflowDefinition, issue: Iss
 
 
 def remove_workspace(workspace: Path, workflow: WorkflowDefinition, issue: Issue) -> None:
-    _run_hook("before_remove", workspace, workflow, issue, fatal=False)
     if not os.path.lexists(workspace):
         return
+    if workspace.is_symlink():
+        workspace.unlink()
+        return
+    _run_hook("before_remove", workspace, workflow, issue, fatal=False)
     canonical_workspace = _validate_workspace_containment(workspace)
-    workspace_is_symlink = workspace.is_symlink()
     try:
         shutil.rmtree(canonical_workspace)
     except FileNotFoundError:
         pass
-    if workspace_is_symlink:
-        try:
-            workspace.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def _cleanup_partial_workspace(workspace: Path) -> None:
@@ -81,11 +81,9 @@ def _run_hook(name: str, workspace: Path, workflow: WorkflowDefinition, issue: I
         return
     _validate_workspace_containment(workspace)
     try:
-        subprocess.run(
+        _run_hook_process(
             hook,
             cwd=workspace,
-            shell=True,
-            check=True,
             env=_hook_env(issue, workspace),
             timeout=_hook_timeout_seconds(workflow),
         )
@@ -93,6 +91,30 @@ def _run_hook(name: str, workspace: Path, workflow: WorkflowDefinition, issue: I
         if fatal:
             raise
         print(f"Ignoring {name} hook failure for {workspace}: {error}", file=sys.stderr)
+
+
+def _run_hook_process(command: str, *, cwd: Path, env: dict[str, str], timeout: float) -> None:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        shell=True,
+        env=env,
+        start_new_session=(os.name == "posix"),
+    )
+    try:
+        return_code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            process.kill()
+        process.wait()
+        raise
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, command)
 
 
 def _hook_timeout_seconds(workflow: WorkflowDefinition) -> float:

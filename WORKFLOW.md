@@ -24,7 +24,7 @@ hooks:
   timeout_ms: 120000
   after_create: |
     set -eu
-    git clone --depth 1 "${SYMPHONZ_REPO_URL:-https://example.com/your-org/your-repo.git}" .
+    git clone --depth 1 "${SYMPHONZ_REPO_URL:?SYMPHONZ_REPO_URL is required}" .
     git fetch origin "${SYMPHONZ_BASE_BRANCH:-main}" --depth 1 || true
   before_run: |
     set -eu

@@ -29,12 +29,6 @@ def render_workflow(template: str, config: InstallConfig) -> str:
         rendered,
         count=1,
     )
-    rendered = re.sub(
-        r'\$\{SYMPHONZ_REPO_URL:-[^}]+\}',
-        "${SYMPHONZ_REPO_URL:-" + config.repo_url + "}",
-        rendered,
-        count=1,
-    )
     return rendered
 
 
