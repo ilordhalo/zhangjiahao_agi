@@ -58,6 +58,171 @@ class WorkflowServiceTests(unittest.TestCase):
 
 
 class LinearAndWorkspaceTests(unittest.TestCase):
+    def test_linear_client_paginates_candidates_and_normalizes_blockers(self):
+        from symphonz.service.linear import LinearClient
+
+        pages = {
+            None: {
+                "data": {
+                    "issues": {
+                        "nodes": [
+                            {
+                                "id": "pay-1",
+                                "identifier": "PAY-1",
+                                "title": "First payment task",
+                                "state": {"name": "Todo"},
+                                "labels": {"nodes": []},
+                                "inverseRelations": {"nodes": []},
+                            }
+                        ],
+                        "pageInfo": {"hasNextPage": True, "endCursor": "next-page"},
+                    }
+                }
+            },
+            "next-page": {
+                "data": {
+                    "issues": {
+                        "nodes": [
+                            {
+                                "id": "pay-2",
+                                "identifier": "PAY-2",
+                                "title": "Second payment task",
+                                "state": {"name": "Todo"},
+                                "labels": {"nodes": []},
+                                "inverseRelations": {
+                                    "nodes": [
+                                        {
+                                            "type": "blocks",
+                                            "issue": {
+                                                "id": "pay-1",
+                                                "identifier": "PAY-1",
+                                                "state": {"name": "In Progress"},
+                                            },
+                                        }
+                                    ]
+                                },
+                            }
+                        ],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            },
+        }
+        client = LinearClient(api_key="test-key", project_slug="payments")
+        requests = []
+
+        def graphql(query, variables):
+            requests.append((query, variables))
+            return pages[variables["after"]]
+
+        client.graphql = graphql
+
+        issues = client.fetch_candidate_issues(["Todo"])
+
+        self.assertEqual([issue.identifier for issue in issues], ["PAY-1", "PAY-2"])
+        self.assertEqual(issues[1].blocked_by[0].identifier, "PAY-1")
+        self.assertEqual(issues[1].blocked_by[0].state, "In Progress")
+        self.assertEqual([request[1]["after"] for request in requests], [None, "next-page"])
+        self.assertTrue(all("pageInfo" in request[0] for request in requests))
+
+    def test_linear_client_fetches_issues_by_states_across_pages(self):
+        from symphonz.service.linear import LinearClient
+
+        client = LinearClient(api_key="test-key", project_slug="payments")
+        cursors = []
+
+        def graphql(query, variables):
+            cursors.append(variables["after"])
+            identifier = "PAY-1" if variables["after"] is None else "PAY-2"
+            return {
+                "data": {
+                    "issues": {
+                        "nodes": [
+                            {
+                                "id": identifier.lower(),
+                                "identifier": identifier,
+                                "title": identifier,
+                                "state": {"name": "In Progress"},
+                                "labels": {"nodes": []},
+                                "inverseRelations": {"nodes": []},
+                            }
+                        ],
+                        "pageInfo": {
+                            "hasNextPage": variables["after"] is None,
+                            "endCursor": "page-2" if variables["after"] is None else None,
+                        },
+                    }
+                }
+            }
+
+        client.graphql = graphql
+
+        issues = client.fetch_issues_by_states(["In Progress"])
+
+        self.assertEqual([issue.identifier for issue in issues], ["PAY-1", "PAY-2"])
+        self.assertEqual(cursors, [None, "page-2"])
+
+    def test_linear_client_rejects_page_without_end_cursor(self):
+        from symphonz.service.linear import LinearClient
+
+        client = LinearClient(api_key="test-key", project_slug="payments")
+        client.graphql = lambda query, variables: {
+            "data": {"issues": {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": None}}}
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "end cursor"):
+            client.fetch_candidate_issues(["Todo"])
+
+    def test_linear_graphql_tool_rejects_multiple_operations(self):
+        from symphonz.service.dynamic_tools import execute_linear_graphql
+        from symphonz.service.linear import LinearClient
+
+        client = LinearClient(api_key="test-key", project_slug="payments")
+
+        result = execute_linear_graphql(client, {"query": "query A {x} query B {y}"})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["contentItems"], [])
+
+    def test_linear_graphql_tool_returns_structured_mutation_response(self):
+        from symphonz.service.dynamic_tools import execute_linear_graphql, linear_graphql_tool_spec
+        from symphonz.service.linear import LinearClient
+
+        client = LinearClient(api_key="test-key", project_slug="payments")
+        client.graphql = lambda query, variables: {"data": {"issueUpdate": {"success": True}}}
+
+        result = execute_linear_graphql(
+            client,
+            {
+                "query": "mutation Move($id: ID!) { issueUpdate(id: $id) { success } }",
+                "variables": {"id": "1"},
+            },
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(json.loads(result["output"]), {"data": {"issueUpdate": {"success": True}}})
+        self.assertEqual(result["contentItems"], [{"type": "inputText", "text": result["output"]}])
+        self.assertEqual(linear_graphql_tool_spec()["name"], "linear_graphql")
+
+    def test_linear_graphql_tool_allows_keywords_inside_string_literals(self):
+        from symphonz.service.dynamic_tools import execute_linear_graphql
+        from symphonz.service.linear import LinearClient
+
+        client = LinearClient(api_key="test-key", project_slug="payments")
+        client.graphql = lambda query, variables: {"data": {"issueSearch": {"nodes": []}}}
+
+        result = execute_linear_graphql(
+            client,
+            {
+                "query": (
+                    'query SearchIssues { issueSearch(query: "mutation blocked issue") { nodes { id } } }'
+                )
+            },
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(json.loads(result["output"]), {"data": {"issueSearch": {"nodes": []}}})
+
     def test_normalize_linear_issue_response(self):
         from symphonz.service.linear import normalize_issue
 

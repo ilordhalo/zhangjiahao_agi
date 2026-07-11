@@ -6,6 +6,13 @@ import time
 
 
 @dataclass(frozen=True)
+class BlockerRef:
+    id: str
+    identifier: str
+    state: str | None = None
+
+
+@dataclass(frozen=True)
 class Issue:
     id: str
     identifier: str
@@ -18,6 +25,7 @@ class Issue:
     branch_name: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    blocked_by: list[BlockerRef] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -73,4 +81,3 @@ class RuntimeState:
                 for event in self.events
             ],
         }
-

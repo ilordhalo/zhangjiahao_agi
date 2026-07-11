@@ -6,14 +6,14 @@ import re
 from urllib.parse import urlparse
 import urllib.request
 
-from symphonz.service.models import Issue
+from symphonz.service.models import BlockerRef, Issue
 
 
 LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql"
 
 POLL_QUERY = """
-query SymphonzPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!) {
-  issues(filter: {project: {slugId: {eq: $projectSlug}}, state: {name: {in: $stateNames}}}, first: $first) {
+query SymphonzPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $after: String) {
+  issues(filter: {project: {slugId: {eq: $projectSlug}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
     nodes {
       id
       identifier
@@ -24,16 +24,18 @@ query SymphonzPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!)
       branchName
       url
       labels { nodes { name } }
+      inverseRelations { nodes { type issue { id identifier state { name } } } }
       createdAt
       updatedAt
     }
+    pageInfo { hasNextPage endCursor }
   }
 }
 """
 
 ISSUES_BY_ID_QUERY = """
-query SymphonzIssuesById($ids: [ID!]!, $first: Int!) {
-  issues(filter: {id: {in: $ids}}, first: $first) {
+query SymphonzIssuesById($ids: [ID!]!, $first: Int!, $after: String) {
+  issues(filter: {id: {in: $ids}}, first: $first, after: $after) {
     nodes {
       id
       identifier
@@ -44,9 +46,33 @@ query SymphonzIssuesById($ids: [ID!]!, $first: Int!) {
       branchName
       url
       labels { nodes { name } }
+      inverseRelations { nodes { type issue { id identifier state { name } } } }
       createdAt
       updatedAt
     }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+ISSUES_BY_STATE_QUERY = """
+query SymphonzIssuesByState($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $after: String) {
+  issues(filter: {project: {slugId: {eq: $projectSlug}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
+    nodes {
+      id
+      identifier
+      title
+      description
+      priority
+      state { name }
+      branchName
+      url
+      labels { nodes { name } }
+      inverseRelations { nodes { type issue { id identifier state { name } } } }
+      createdAt
+      updatedAt
+    }
+    pageInfo { hasNextPage endCursor }
   }
 }
 """
@@ -59,21 +85,31 @@ class LinearClient:
         self.endpoint = endpoint
 
     def fetch_candidate_issues(self, active_states: list[str]) -> list[Issue]:
-        body = self.graphql(
-            POLL_QUERY,
-            {
-                "projectSlug": self.project_slug,
-                "stateNames": active_states,
-                "first": 50,
-            },
+        return self.fetch_issues_by_states(active_states, query=POLL_QUERY)
+
+    def fetch_issues_by_states(self, states: list[str], query: str = ISSUES_BY_STATE_QUERY) -> list[Issue]:
+        return self._fetch_paginated_issues(
+            query,
+            {"projectSlug": self.project_slug, "stateNames": states},
         )
-        return normalize_issue_nodes(body)
 
     def fetch_issues_by_ids(self, ids: list[str]) -> list[Issue]:
         if not ids:
             return []
-        body = self.graphql(ISSUES_BY_ID_QUERY, {"ids": ids, "first": len(ids)})
-        return normalize_issue_nodes(body)
+        return self._fetch_paginated_issues(ISSUES_BY_ID_QUERY, {"ids": ids})
+
+    def _fetch_paginated_issues(self, query: str, variables: dict) -> list[Issue]:
+        issues: list[Issue] = []
+        after: str | None = None
+        while True:
+            body = self.graphql(query, {**variables, "first": 50, "after": after})
+            issues.extend(normalize_issue_nodes(body))
+            page_info = body.get("data", {}).get("issues", {}).get("pageInfo") or {}
+            if not page_info.get("hasNextPage", False):
+                return issues
+            after = page_info.get("endCursor")
+            if not after:
+                raise RuntimeError("Linear GraphQL page hasNextPage=true without an end cursor.")
 
     def graphql(self, query: str, variables: dict | None = None) -> dict:
         if self.endpoint.startswith("file://"):
@@ -138,6 +174,11 @@ def normalize_issue(node: dict) -> Issue | None:
         for label in node.get("labels", {}).get("nodes", [])
         if str(label.get("name", "")).strip()
     ]
+    blocked_by = [
+        blocker
+        for relation in node.get("inverseRelations", {}).get("nodes", [])
+        if (blocker := normalize_blocker_relation(relation)) is not None
+    ]
     state = node.get("state") or {}
     return Issue(
         id=str(node.get("id") or ""),
@@ -151,4 +192,19 @@ def normalize_issue(node: dict) -> Issue | None:
         labels=labels,
         created_at=node.get("createdAt"),
         updated_at=node.get("updatedAt"),
+        blocked_by=blocked_by,
+    )
+
+
+def normalize_blocker_relation(relation: object) -> BlockerRef | None:
+    if not isinstance(relation, dict) or relation.get("type") != "blocks":
+        return None
+    issue = relation.get("issue")
+    if not isinstance(issue, dict):
+        return None
+    state = issue.get("state") or {}
+    return BlockerRef(
+        id=str(issue.get("id") or ""),
+        identifier=str(issue.get("identifier") or ""),
+        state=state.get("name"),
     )
