@@ -184,6 +184,42 @@ class LinearAndWorkspaceTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["contentItems"], [])
 
+    def test_linear_graphql_tool_rejects_subscription_operations(self):
+        from symphonz.service.dynamic_tools import execute_linear_graphql
+        from symphonz.service.linear import LinearClient
+
+        client = LinearClient(api_key="test-key", project_slug="payments")
+        client.graphql = lambda query, variables: {"data": {"issueUpdated": {"id": "1"}}}
+
+        result = execute_linear_graphql(client, {"query": "subscription WatchIssue { issueUpdated { id } }"})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["contentItems"], [])
+
+    def test_linear_graphql_tool_rejects_empty_selection_set(self):
+        from symphonz.service.dynamic_tools import execute_linear_graphql
+        from symphonz.service.linear import LinearClient
+
+        client = LinearClient(api_key="test-key", project_slug="payments")
+        client.graphql = lambda query, variables: {"data": {}}
+
+        result = execute_linear_graphql(client, {"query": "query Empty {}"})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["contentItems"], [])
+
+    def test_linear_graphql_tool_rejects_unbalanced_operation_block(self):
+        from symphonz.service.dynamic_tools import execute_linear_graphql
+        from symphonz.service.linear import LinearClient
+
+        client = LinearClient(api_key="test-key", project_slug="payments")
+        client.graphql = lambda query, variables: {"data": {"issue": {"id": "1"}}}
+
+        result = execute_linear_graphql(client, {"query": "query Broken { issue"})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["contentItems"], [])
+
     def test_linear_graphql_tool_returns_structured_mutation_response(self):
         from symphonz.service.dynamic_tools import execute_linear_graphql, linear_graphql_tool_spec
         from symphonz.service.linear import LinearClient

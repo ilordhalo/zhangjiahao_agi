@@ -56,24 +56,36 @@ def _has_one_operation(query: str) -> bool:
             break
         if source[position] == "{":
             operations += 1
+            if not _selection_set_has_content(source, position):
+                return False
             position = _consume_balanced_block(source, position, "{", "}")
+            if position is None:
+                return False
             continue
         name = _read_name(source, position)
         if name is None:
             return False
         token, next_position = name
-        if token in {"query", "mutation", "subscription"}:
+        if token in {"query", "mutation"}:
             operations += 1
             selection_start = _find_selection_set_start(source, next_position)
             if selection_start is None:
                 return False
+            if not _selection_set_has_content(source, selection_start):
+                return False
             position = _consume_balanced_block(source, selection_start, "{", "}")
+            if position is None:
+                return False
             continue
         if token == "fragment":
             selection_start = _find_selection_set_start(source, next_position)
             if selection_start is None:
                 return False
+            if not _selection_set_has_content(source, selection_start):
+                return False
             position = _consume_balanced_block(source, selection_start, "{", "}")
+            if position is None:
+                return False
             continue
         return False
     return operations == 1
@@ -148,7 +160,12 @@ def _find_selection_set_start(source: str, position: int) -> int | None:
     return None
 
 
-def _consume_balanced_block(source: str, position: int, opening: str, closing: str) -> int:
+def _selection_set_has_content(source: str, opening_brace: int) -> bool:
+    position = _skip_whitespace(source, opening_brace + 1)
+    return position < len(source) and source[position] != "}"
+
+
+def _consume_balanced_block(source: str, position: int, opening: str, closing: str) -> int | None:
     depth = 0
     while position < len(source):
         char = source[position]
@@ -159,7 +176,7 @@ def _consume_balanced_block(source: str, position: int, opening: str, closing: s
             if depth == 0:
                 return position + 1
         position += 1
-    return position
+    return None
 
 
 def _failure(message: str) -> dict:
