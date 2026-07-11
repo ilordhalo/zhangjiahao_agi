@@ -264,7 +264,7 @@ class CliSmokeTests(unittest.TestCase):
             exit_code = main(["version"])
 
         self.assertEqual(exit_code, 0)
-        self.assertIn("symphonz 0.2.0", output.getvalue())
+        self.assertIn("symphonz 0.2.1", output.getvalue())
 
     def test_bin_symphonz_help_runs_from_repo_root(self):
         result = subprocess.run(
@@ -356,7 +356,7 @@ class ShellInstallerTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(version.returncode, 0, version.stderr)
-            self.assertIn("symphonz 0.2.0", version.stdout)
+            self.assertIn("symphonz 0.2.1", version.stdout)
 
     def test_installed_symphonz_runs_from_prefix_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -375,7 +375,7 @@ class ShellInstallerTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("symphonz 0.2.0", result.stdout)
+            self.assertIn("symphonz 0.2.1", result.stdout)
 
     def test_install_sh_installs_from_local_source_to_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -401,7 +401,7 @@ class ShellInstallerTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(version.returncode, 0, version.stderr)
-            self.assertIn("symphonz 0.2.0", version.stdout)
+            self.assertIn("symphonz 0.2.1", version.stdout)
             self.assertTrue((prefix / "lib" / "WORKFLOW.md").exists())
             self.assertTrue((prefix / "lib" / "symphonz" / "service" / "runner.py").exists())
 

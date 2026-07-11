@@ -95,6 +95,88 @@ class DeveloperGuideTests(unittest.TestCase):
         self.assertIn('id="play-sequence"', html)
         self.assertIn('matchMedia("(prefers-reduced-motion: reduce)")', html)
 
+    def test_guide_explains_current_workflow_design(self):
+        html = self.read_guide()
+
+        self.assertIn('id="workflow-anatomy"', html)
+        workflow_parts = re.findall(r'data-workflow-part="([^"]+)"', html)
+        self.assertEqual(
+            workflow_parts,
+            [
+                "tracker",
+                "workspace",
+                "codex",
+                "issue-context",
+                "operating-rules",
+                "workpad",
+                "status-map",
+                "review-convention",
+                "guardrails",
+            ],
+        )
+        for phrase in [
+            "为什么这样写",
+            "配置层",
+            "Prompt 层",
+            "Linear 是外部控制面",
+            "一个 Issue 只维护一个 Workpad",
+            "Done 是发布命令，不是终态",
+        ]:
+            self.assertIn(phrase, html)
+
+    def test_guide_contains_four_turn_pay_214_simulation(self):
+        html = self.read_guide()
+
+        self.assertIn('id="real-case-simulation"', html)
+        turns = re.findall(
+            r'<details[^>]+data-case-turn="([^"]+)"[^>]*>(.*?)</details>',
+            html,
+            re.DOTALL,
+        )
+        self.assertEqual([name for name, _ in turns], ["todo", "done", "rework", "merging"])
+        for _, body in turns:
+            self.assertIn('class="prompt-block"', body)
+            self.assertIn('class="linear-sync"', body)
+            self.assertIn('class="review-sync"', body)
+
+        todo_body = turns[0][1]
+        done_body = turns[1][1]
+        rework_body = turns[2][1]
+        self.assertIn("- [x] 3DS return path covered", todo_body)
+        self.assertIn("npm test -- payment-submit payment-3ds", todo_body)
+        self.assertIn("- [x] 3DS return path covered", done_body)
+        self.assertIn("Rapid retry after 3DS return uses shared guard", rework_body)
+        self.assertEqual(html.count('data-simulation-actor="human"'), 3)
+        self.assertIn("最简四轮路径", html)
+        self.assertIn("在下一次 poll 前改为 Done", html)
+        self.assertIn("实际运行可能出现额外的 In Progress turn", html)
+
+        prompt_blocks = re.findall(r'<pre class="prompt-block">(.*?)</pre>', html, re.DOTALL)
+        self.assertEqual(len(prompt_blocks), 4)
+        self.assertNotIn("Review context discovered", prompt_blocks[2])
+        self.assertNotIn("PR #482", prompt_blocks[2])
+        self.assertNotIn("Route the 3DS retry action", prompt_blocks[2])
+        self.assertNotIn("Add the missing 3DS rapid-retry", prompt_blocks[2])
+        self.assertIn("Apply the actionable review feedback discovered after launch", prompt_blocks[2])
+        self.assertNotIn("PR #482", prompt_blocks[3])
+        self.assertIn("Codex 启动后查询得到", rework_body)
+
+        self.assertGreaterEqual(html.count("symphonz/PAY-214-prevent-duplicate-payment"), 5)
+        self.assertGreaterEqual(html.count("PR #482"), 5)
+        self.assertIn("runner-01:/workspaces/PAY-214@91bd204", todo_body)
+        self.assertNotIn("runner-01:/workspaces/PAY-214@a13c9f2", todo_body)
+
+        for phrase in [
+            "PAY-214",
+            "symphonz/PAY-214-prevent-duplicate-payment",
+            "## Symphonz Workpad",
+            "Todo → In Progress → Done → Human Review → Rework → Human Review → Merging → Closed",
+            "离线真实结构模拟，不访问 Linear 或 GitHub，不产生外部写操作",
+            "每一轮都会创建新的 Codex thread 和 turn",
+            "Human Review 不触发 Codex",
+        ]:
+            self.assertIn(phrase, html)
+
     def test_guide_is_self_contained_and_offline(self):
         html = self.read_guide()
 

@@ -1,3 +1,3 @@
 """Project-local installer and launcher for Symphony workflows."""
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
