@@ -54,14 +54,6 @@ def _has_one_operation(query: str) -> bool:
         position = _skip_whitespace(source, position)
         if position >= len(source):
             break
-        if source[position] == "{":
-            operations += 1
-            if not _selection_set_has_content(source, position):
-                return False
-            position = _consume_balanced_block(source, position, "{", "}")
-            if position is None:
-                return False
-            continue
         name = _read_name(source, position)
         if name is None:
             return False

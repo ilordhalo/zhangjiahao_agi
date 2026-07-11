@@ -220,6 +220,18 @@ class LinearAndWorkspaceTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["contentItems"], [])
 
+    def test_linear_graphql_tool_rejects_anonymous_query_shorthand(self):
+        from symphonz.service.dynamic_tools import execute_linear_graphql
+        from symphonz.service.linear import LinearClient
+
+        client = LinearClient(api_key="test-key", project_slug="payments")
+        client.graphql = lambda query, variables: {"data": {"viewer": {"id": "1"}}}
+
+        result = execute_linear_graphql(client, {"query": "{ viewer { id } }"})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["contentItems"], [])
+
     def test_linear_graphql_tool_returns_structured_mutation_response(self):
         from symphonz.service.dynamic_tools import execute_linear_graphql, linear_graphql_tool_spec
         from symphonz.service.linear import LinearClient
