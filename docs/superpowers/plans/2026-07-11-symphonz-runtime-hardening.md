@@ -145,17 +145,17 @@ Expected: all protocol tests pass without hanging.
 - Produces: `Orchestrator.tick()`, `wait_for_idle(timeout)`, `startup_cleanup()`, and `shutdown()`.
 - Consumes: Linear state refresh, workspace lifecycle APIs, and `CodexAppServer.run_turns`.
 
-- [ ] **Step 1: Write failing scheduler tests**
+- [x] **Step 1: Write failing scheduler tests**
 
 Cover two workers overlapping under a concurrency limit, duplicate claim prevention, priority order, blocked issue suppression, exponential retry metadata, one-second clean continuation, state-change cancellation, terminal cleanup, and JSONL event output.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `python3 -m unittest tests.test_symphonz_service.OrchestratorHardeningTests -v`
 
 Expected: current synchronous Orchestrator fails concurrency/retry/reconciliation contracts.
 
-- [ ] **Step 3: Implement single-authority scheduling**
+- [x] **Step 3: Implement single-authority scheduling**
 
 Use `ThreadPoolExecutor`, `threading.RLock`, and per-run `threading.Event`. State keys use stable Linear issue IDs internally and preserve identifiers for display. Retry delay is:
 
@@ -165,7 +165,7 @@ min(10 * (2 ** (attempt - 1)), max_retry_backoff_ms / 1000)
 
 The service loop calls `tick()`, sleeps the effective poll interval, and always calls `shutdown()` in `finally`. `--once` dispatches candidates and waits until all first-attempt workers finish.
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run: `python3 -m unittest tests.test_symphonz_service.OrchestratorHardeningTests -v`
 

@@ -1,11 +1,14 @@
 from pathlib import Path
 from typing import Optional
+from contextlib import redirect_stderr
+import io
 import json
 import os
 import shlex
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 
 
@@ -443,14 +446,18 @@ class WorkspaceLifecycleTests(unittest.TestCase):
         self.assertEqual(workspace, workspace_path(self.root, workflow, self.issue))
 
         run_before_run_hook(workspace, workflow, self.issue)
-        run_after_run_hook(workspace, workflow, self.issue)
-        remove_workspace(workspace, workflow, self.issue)
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            run_after_run_hook(workspace, workflow, self.issue)
+            remove_workspace(workspace, workflow, self.issue)
 
         self.assertFalse(workspace.exists())
         self.assertEqual(
             self.log_path.read_text().splitlines(),
             ["after_create", "before_run", "after_run", "before_remove"],
         )
+        self.assertIn("Ignoring after_run hook failure", stderr.getvalue())
+        self.assertIn("Ignoring before_remove hook failure", stderr.getvalue())
 
     def test_fatal_hook_timeout_raises(self):
         from symphonz.service.workspace import prepare_workspace, run_before_run_hook
@@ -704,6 +711,234 @@ class CodexAppServerTests(unittest.TestCase):
                 self.client(server).run_turn(**self.run_kwargs(root))
 
 
+class OrchestratorHardeningTests(unittest.TestCase):
+    def setUp(self):
+        from symphonz.service.models import WorkflowDefinition
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.workflow = WorkflowDefinition(
+            path=self.root / "WORKFLOW.md",
+            config={
+                "tracker": {
+                    "active_states": ["Todo", "In Progress", "Ready to Publish", "Rework", "Merging"],
+                    "terminal_states": ["Done", "Closed", "Cancelled", "Canceled", "Duplicate"],
+                    "required_labels": [],
+                },
+                "workspace": {"root": ".symphonz/workspace"},
+                "hooks": {},
+                "agent": {"max_concurrent_agents": 2, "max_turns": 1, "max_retry_backoff_ms": 300000},
+                "codex": {},
+            },
+            prompt_template="Work on {{ issue.identifier }}{% if attempt %} attempt {{ attempt }}{% endif %}",
+        )
+
+    def issue(self, number: int, state: str = "Todo", priority: int = 1):
+        from symphonz.service.models import Issue
+
+        return Issue(
+            id=f"id-{number}",
+            identifier=f"SYM-{number}",
+            title=f"Issue {number}",
+            state=state,
+            priority=priority,
+            created_at=f"2026-01-{number:02d}T00:00:00Z",
+        )
+
+    class FakeLinear:
+        def __init__(self, issues):
+            self.issues = {issue.id: issue for issue in issues}
+
+        def fetch_candidate_issues(self, active_states):
+            return [issue for issue in self.issues.values() if issue.state in active_states]
+
+        def fetch_issues_by_ids(self, ids):
+            return [self.issues[issue_id] for issue_id in ids if issue_id in self.issues]
+
+        def fetch_issues_by_states(self, states):
+            return [issue for issue in self.issues.values() if issue.state in states]
+
+    class RecordingCodex:
+        def __init__(self, wait_for_cancel=False, fail_first=False, sleep_seconds=0.03):
+            self.wait_for_cancel = wait_for_cancel
+            self.fail_first = fail_first
+            self.sleep_seconds = sleep_seconds
+            self.calls = []
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+
+        def run_turns(self, **kwargs):
+            with self.lock:
+                self.calls.append(kwargs)
+                call_number = len(self.calls)
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                kwargs["on_event"]({"type": "session_started", "session_id": f"thread-{call_number}-turn-1", "turn_count": 1})
+                if self.wait_for_cancel:
+                    if not kwargs["cancel_event"].wait(timeout=2):
+                        raise RuntimeError("cancel was not requested")
+                    raise RuntimeError("turn_cancelled")
+                time.sleep(self.sleep_seconds)
+                if self.fail_first and call_number == 1:
+                    raise RuntimeError("temporary failure")
+                return {
+                    "session_id": f"thread-{call_number}-turn-1",
+                    "thread_id": f"thread-{call_number}",
+                    "turn_id": "turn-1",
+                    "turn_count": 1,
+                    "result": {},
+                }
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    def test_tick_dispatches_with_bounded_concurrency_and_no_duplicate_claims(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        issues = [self.issue(1), self.issue(2)]
+        linear = self.FakeLinear(issues)
+        codex = self.RecordingCodex(sleep_seconds=0.08)
+        orchestrator = Orchestrator(self.root, self.workflow, linear, codex)
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+
+        self.assertEqual(len(codex.calls), 2)
+        self.assertEqual(codex.max_active, 2)
+        self.assertEqual(orchestrator.state.snapshot()["counts"]["claimed"], 2)
+
+    def test_tick_prioritizes_unblocked_issues(self):
+        from dataclasses import replace
+        from symphonz.service.models import BlockerRef
+        from symphonz.service.orchestrator import Orchestrator
+
+        self.workflow.config["agent"]["max_concurrent_agents"] = 1
+        lower_priority = self.issue(1, priority=3)
+        higher_priority = self.issue(2, priority=1)
+        selected = self.issue(3, priority=2)
+        blocked = replace(higher_priority, blocked_by=[BlockerRef("blocker", "SYM-9", "In Progress")])
+        linear = self.FakeLinear([lower_priority, blocked, selected])
+        codex = self.RecordingCodex(sleep_seconds=0)
+        orchestrator = Orchestrator(self.root, self.workflow, linear, codex)
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+
+        self.assertEqual(codex.calls[0]["title"], "SYM-3: Issue 3")
+
+    def test_input_required_blocks_without_immediate_redispatch(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        class BlockedCodex(self.RecordingCodex):
+            def run_turns(self, **kwargs):
+                self.calls.append(kwargs)
+                raise RuntimeError("turn_input_required")
+
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        codex = BlockedCodex()
+        orchestrator = Orchestrator(self.root, self.workflow, linear, codex)
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+
+        snapshot = orchestrator.state.snapshot()
+        self.assertEqual(len(codex.calls), 1)
+        self.assertEqual(snapshot["counts"]["blocked"], 1)
+        self.assertEqual(snapshot["counts"]["claimed"], 1)
+
+    def test_failure_uses_exponential_retry_and_passes_attempt_to_prompt(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        now = [100.0]
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        codex = self.RecordingCodex(fail_first=True, sleep_seconds=0)
+        orchestrator = Orchestrator(self.root, self.workflow, linear, codex, clock=lambda: now[0])
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+        retry = orchestrator.state.snapshot()["retrying"][0]
+        self.assertEqual(retry["attempt"], 1)
+        self.assertEqual(retry["due_at"], 110.0)
+
+        now[0] = 109.0
+        orchestrator.tick()
+        self.assertEqual(len(codex.calls), 1)
+        now[0] = 110.0
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+
+        self.assertEqual(len(codex.calls), 2)
+        self.assertIn("attempt 1", codex.calls[1]["prompt"])
+
+    def test_reconciliation_cancels_terminal_run_and_removes_workspace(self):
+        from dataclasses import replace
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.workspace import workspace_path
+
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        codex = self.RecordingCodex(wait_for_cancel=True)
+        orchestrator = Orchestrator(self.root, self.workflow, linear, codex)
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        deadline = time.time() + 2
+        while not orchestrator.state.snapshot()["running"] and time.time() < deadline:
+            time.sleep(0.01)
+        workspace = workspace_path(self.root, self.workflow, issue)
+        while not workspace.exists() and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(workspace.exists())
+
+        linear.issues[issue.id] = replace(issue, state="Done")
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+
+        self.assertFalse(workspace.exists())
+        self.assertEqual(orchestrator.state.snapshot()["counts"]["claimed"], 0)
+
+    def test_runtime_events_are_written_as_json_lines(self):
+        from symphonz.service.event_log import JsonlEventLog
+        from symphonz.service.models import RuntimeState
+
+        path = self.root / "logs" / "runtime.jsonl"
+        state = RuntimeState(event_sink=JsonlEventLog(path).write)
+
+        state.add_event("service_started", "started", issue_identifier="SYM-1", detail="value")
+
+        payload = json.loads(path.read_text().strip())
+        self.assertEqual(payload["type"], "service_started")
+        self.assertEqual(payload["issue_identifier"], "SYM-1")
+        self.assertEqual(payload["data"], {"detail": "value"})
+
+    def test_shutdown_releases_workers_without_scheduling_retry(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        codex = self.RecordingCodex(wait_for_cancel=True)
+        orchestrator = Orchestrator(self.root, self.workflow, linear, codex)
+        orchestrator.tick()
+
+        orchestrator.shutdown()
+
+        snapshot = orchestrator.state.snapshot()
+        self.assertEqual(snapshot["counts"]["claimed"], 0)
+        self.assertEqual(snapshot["counts"]["retrying"], 0)
+
+
 class OrchestratorAndDashboardTests(unittest.TestCase):
     def test_orchestrator_one_shot_runs_issue_and_records_state(self):
         from symphonz.service.models import Issue
@@ -721,10 +956,16 @@ class OrchestratorAndDashboardTests(unittest.TestCase):
             def __init__(self):
                 self.prompts = []
 
-            def run_turn(self, workspace, prompt, title, approval_policy, thread_sandbox, turn_sandbox_policy, on_event):
+            def run_turns(self, workspace, prompt, title, approval_policy, thread_sandbox, turn_sandbox_policy, on_event, **kwargs):
                 self.prompts.append(prompt)
                 on_event({"type": "turn_completed", "params": {}})
-                return {"session_id": "thread-turn", "thread_id": "thread", "turn_id": "turn", "result": {}}
+                return {
+                    "session_id": "thread-turn",
+                    "thread_id": "thread",
+                    "turn_id": "turn",
+                    "turn_count": 1,
+                    "result": {},
+                }
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

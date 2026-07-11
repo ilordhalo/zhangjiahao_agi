@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Callable
+import threading
 import time
 
 
@@ -51,33 +53,42 @@ class RuntimeState:
     completed: dict[str, dict] = field(default_factory=dict)
     blocked: dict[str, dict] = field(default_factory=dict)
     retrying: dict[str, dict] = field(default_factory=dict)
+    claimed: set[str] = field(default_factory=set)
     events: list[RuntimeEvent] = field(default_factory=list)
+    event_sink: Callable[[RuntimeEvent], None] | None = field(default=None, repr=False)
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def add_event(self, event_type: str, message: str, issue_identifier: str | None = None, **data: object) -> None:
-        self.events.append(RuntimeEvent(event_type, message, issue_identifier, data=dict(data)))
-        self.events = self.events[-200:]
+        event = RuntimeEvent(event_type, message, issue_identifier, data=dict(data))
+        with self.lock:
+            self.events.append(event)
+            self.events = self.events[-200:]
+        if self.event_sink is not None:
+            self.event_sink(event)
 
     def snapshot(self) -> dict:
-        return {
-            "started_at": self.started_at,
-            "counts": {
-                "running": len(self.running),
-                "completed": len(self.completed),
-                "blocked": len(self.blocked),
-                "retrying": len(self.retrying),
-            },
-            "running": list(self.running.values()),
-            "completed": list(self.completed.values()),
-            "blocked": list(self.blocked.values()),
-            "retrying": list(self.retrying.values()),
-            "events": [
-                {
-                    "type": event.type,
-                    "message": event.message,
-                    "issue_identifier": event.issue_identifier,
-                    "timestamp": event.timestamp,
-                    "data": event.data,
-                }
-                for event in self.events
-            ],
-        }
+        with self.lock:
+            return {
+                "started_at": self.started_at,
+                "counts": {
+                    "claimed": len(self.claimed),
+                    "running": len(self.running),
+                    "completed": len(self.completed),
+                    "blocked": len(self.blocked),
+                    "retrying": len(self.retrying),
+                },
+                "running": [dict(entry) for entry in self.running.values()],
+                "completed": [dict(entry) for entry in self.completed.values()],
+                "blocked": [dict(entry) for entry in self.blocked.values()],
+                "retrying": [dict(entry) for entry in self.retrying.values()],
+                "events": [
+                    {
+                        "type": event.type,
+                        "message": event.message,
+                        "issue_identifier": event.issue_identifier,
+                        "timestamp": event.timestamp,
+                        "data": event.data,
+                    }
+                    for event in self.events
+                ],
+            }

@@ -127,9 +127,12 @@ class InstalledCliE2ETests(unittest.TestCase):
             self.assertEqual((workspace / "dispatched_issue.txt").read_text(), "QA-1")
             self.assertIn("Identifier: QA-1", (workspace / "codex_prompt.txt").read_text())
             self.assertFalse((project / ".symphonz" / "runtime").exists())
-            self.assertEqual(fake_linear.requests[0]["authorization"], "fake-linear-key")
-            self.assertEqual(fake_linear.requests[0]["operation"], "SymphonzPoll")
-            self.assertEqual(fake_linear.requests[0]["variables"]["projectSlug"], "quality-project")
+            self.assertTrue(all(request["authorization"] == "fake-linear-key" for request in fake_linear.requests))
+            operations = [request["operation"] for request in fake_linear.requests]
+            self.assertIn("SymphonzIssuesByState", operations)
+            self.assertIn("SymphonzPoll", operations)
+            poll_request = next(request for request in fake_linear.requests if request["operation"] == "SymphonzPoll")
+            self.assertEqual(poll_request["variables"]["projectSlug"], "quality-project")
 
 
 def fake_codex_source() -> str:
