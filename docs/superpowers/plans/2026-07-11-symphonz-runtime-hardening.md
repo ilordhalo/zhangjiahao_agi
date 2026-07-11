@@ -33,7 +33,7 @@
 - Produces: `BlockerRef`, paginated `LinearClient.fetch_candidate_issues`, `fetch_issues_by_states`, `execute_linear_graphql(client, arguments)`, and `linear_graphql_tool_spec()`.
 - Consumes: existing `Issue`, `LinearClient.graphql`, and file fixture endpoint.
 
-- [ ] **Step 1: Write failing pagination, blocker, and tool tests**
+- [x] **Step 1: Write failing pagination, blocker, and tool tests**
 
 Add tests that require two GraphQL pages to be joined, normalize `inverseRelations` of type `blocks`, reject multiple operations, and return a structured successful mutation result:
 
@@ -44,13 +44,13 @@ self.assertFalse(execute_linear_graphql(client, {"query": "query A {x} query B {
 self.assertTrue(execute_linear_graphql(client, {"query": "mutation Move($id: ID!) { issueUpdate(id: $id) { success } }", "variables": {"id": "1"}})["success"])
 ```
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run: `python3 -m unittest tests.test_symphonz_service.LinearAndWorkspaceTests -v`
 
 Expected: failures for missing pagination, `blocked_by`, and dynamic tool functions.
 
-- [ ] **Step 3: Implement the adapter contracts**
+- [x] **Step 3: Implement the adapter contracts**
 
 Use GraphQL `pageInfo { hasNextPage endCursor }`, an `$after: String` variable, page size 50, and a loop that rejects `hasNextPage=true` without an end cursor. `execute_linear_graphql` accepts one operation and returns:
 
@@ -58,7 +58,7 @@ Use GraphQL `pageInfo { hasNextPage endCursor }`, an `$after: String` variable, 
 {"success": True, "output": json.dumps(body), "contentItems": [{"type": "inputText", "text": json.dumps(body)}]}
 ```
 
-- [ ] **Step 4: Run focused tests and verify GREEN**
+- [x] **Step 4: Run focused tests and verify GREEN**
 
 Run: `python3 -m unittest tests.test_symphonz_service.LinearAndWorkspaceTests -v`
 
@@ -74,21 +74,21 @@ Expected: all Linear tests pass.
 - Produces: `workspace_path(project_root, workflow, issue)`, `prepare_workspace`, `run_before_run_hook`, `run_after_run_hook`, and `remove_workspace`.
 - Consumes: workflow `workspace.root`, `hooks.{after_create,before_run,after_run,before_remove,timeout_ms}`.
 
-- [ ] **Step 1: Write failing lifecycle and path safety tests**
+- [x] **Step 1: Write failing lifecycle and path safety tests**
 
 Require hook order `after_create -> before_run -> after_run -> before_remove`, timeout failure for fatal hooks, ignored cleanup-hook failure, partial-directory cleanup, and rejection of a pre-existing workspace symlink escaping the root.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `python3 -m unittest tests.test_symphonz_service.WorkspaceLifecycleTests -v`
 
 Expected: missing lifecycle APIs and symlink containment failure.
 
-- [ ] **Step 3: Implement lifecycle functions**
+- [x] **Step 3: Implement lifecycle functions**
 
 Run hooks with `subprocess.run(..., timeout=timeout_ms / 1000)`. Resolve root and workspace canonically and require `workspace.relative_to(root)` to succeed after resolution. Remove a newly created partial directory only when `after_create` fails.
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run: `python3 -m unittest tests.test_symphonz_service.WorkspaceLifecycleTests -v`
 
@@ -104,7 +104,7 @@ Expected: all workspace lifecycle tests pass.
 - Produces: `CodexAppServer.run_turns(..., max_turns, should_continue, continuation_prompt, cancel_event)`.
 - Consumes: `linear_graphql_tool_spec`, a dynamic-tool executor, and timeout settings.
 
-- [ ] **Step 1: Write failing protocol tests**
+- [x] **Step 1: Write failing protocol tests**
 
 Fake app-server scenarios must assert:
 
@@ -116,17 +116,17 @@ self.assertEqual(thread_start["params"]["dynamicTools"][0]["name"], "linear_grap
 
 Also require `response_timeout`, `turn_timeout`, `stall_timeout`, cancellation, valid tool-call replies, unsupported-tool replies, and user-input-required failure.
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `python3 -m unittest tests.test_symphonz_service.CodexAppServerTests -v`
 
 Expected: missing multi-turn, timeout, cancellation, and tool behavior.
 
-- [ ] **Step 3: Implement queue-backed protocol processing**
+- [x] **Step 3: Implement queue-backed protocol processing**
 
 Start one daemon reader thread per subprocess. Queue decoded lines and an EOF sentinel. Bound `_request` by `read_timeout_ms`; bound each turn by `turn_timeout_ms`; fail when no message arrives for `stall_timeout_ms`; check `cancel_event` while waiting. Handle `item/tool/call` by replying on the same JSON-RPC `id`.
 
-- [ ] **Step 4: Verify GREEN**
+- [x] **Step 4: Verify GREEN**
 
 Run: `python3 -m unittest tests.test_symphonz_service.CodexAppServerTests -v`
 

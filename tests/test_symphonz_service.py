@@ -5,6 +5,7 @@ import os
 import shlex
 import subprocess
 import tempfile
+import threading
 import unittest
 
 
@@ -255,6 +256,21 @@ class LinearAndWorkspaceTests(unittest.TestCase):
         self.assertEqual(result["contentItems"], [{"type": "inputText", "text": result["output"]}])
         self.assertEqual(linear_graphql_tool_spec()["name"], "linear_graphql")
 
+    def test_linear_graphql_tool_preserves_graphql_errors_as_failure(self):
+        from symphonz.service.dynamic_tools import execute_linear_graphql
+
+        class ErrorClient:
+            def graphql(self, query, variables):
+                return {"data": None, "errors": [{"message": "permission denied"}]}
+
+        result = execute_linear_graphql(
+            ErrorClient(),
+            {"query": "mutation Move { issueUpdate { success } }"},
+        )
+
+        self.assertFalse(result["success"])
+        self.assertIn("permission denied", result["output"])
+
     def test_linear_graphql_tool_allows_keywords_inside_string_literals(self):
         from symphonz.service.dynamic_tools import execute_linear_graphql
         from symphonz.service.linear import LinearClient
@@ -477,6 +493,27 @@ class WorkspaceLifecycleTests(unittest.TestCase):
 
 
 class CodexAppServerTests(unittest.TestCase):
+    def write_server(self, root: Path, body: str) -> tuple[Path, Path]:
+        server = root / "fake_app_server.py"
+        records = root / "records.jsonl"
+        server.write_text(body)
+        return server, records
+
+    def client(self, server: Path, **kwargs):
+        from symphonz.service.codex_app_server import CodexAppServer
+
+        return CodexAppServer(command=f"python3 {server}", **kwargs)
+
+    def run_kwargs(self, root: Path) -> dict:
+        return {
+            "workspace": root,
+            "prompt": "Do the work",
+            "title": "SYM-1: Test",
+            "approval_policy": "never",
+            "thread_sandbox": "workspace-write",
+            "turn_sandbox_policy": {"type": "workspaceWrite"},
+        }
+
     def test_codex_app_server_runs_single_turn(self):
         from symphonz.service.codex_app_server import CodexAppServer
 
@@ -518,6 +555,153 @@ class CodexAppServerTests(unittest.TestCase):
             self.assertEqual(result["turn_id"], "turn-1")
             self.assertEqual(result["session_id"], "thread-1-turn-1")
             self.assertTrue(any(event["type"] == "turn_completed" for event in events))
+
+    def test_codex_app_server_reuses_thread_and_executes_dynamic_tool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = root / "records.jsonl"
+            server, _ = self.write_server(
+                root,
+                "import json, sys\n"
+                f"records = open({str(records)!r}, 'a')\n"
+                "turn = 0\n"
+                "pending_tool = False\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); records.write(json.dumps(msg) + '\\n'); records.flush()\n"
+                "    method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        turn += 1\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': f'turn-{turn}'}}}), flush=True)\n"
+                "        if turn == 1:\n"
+                "            pending_tool = True\n"
+                "            print(json.dumps({'jsonrpc': '2.0', 'id': 900, 'method': 'item/tool/call', 'params': {'tool': 'linear_graphql', 'arguments': {'query': 'query One { viewer { id } }'}}}), flush=True)\n"
+                "        else: print(json.dumps({'method': 'turn/completed', 'params': {}}), flush=True)\n"
+                "    elif pending_tool and msg.get('id') == 900:\n"
+                "        pending_tool = False\n"
+                "        print(json.dumps({'method': 'turn/completed', 'params': {}}), flush=True)\n",
+            )
+            events = []
+            executor_calls = []
+            client = self.client(
+                server,
+                dynamic_tool_executor=lambda name, arguments: executor_calls.append((name, arguments))
+                or {"success": True, "output": "ok", "contentItems": []},
+            )
+
+            result = client.run_turns(
+                **self.run_kwargs(root),
+                max_turns=2,
+                should_continue=lambda: True,
+                continuation_prompt=lambda turn: f"Continue turn {turn}",
+                on_event=events.append,
+            )
+
+            messages = [json.loads(line) for line in records.read_text().splitlines()]
+            thread_start = next(message for message in messages if message.get("method") == "thread/start")
+            turn_starts = [message for message in messages if message.get("method") == "turn/start"]
+            tool_reply = next(message for message in messages if message.get("id") == 900 and "result" in message)
+            self.assertEqual(result["turn_count"], 2)
+            self.assertEqual([message["params"]["threadId"] for message in turn_starts], ["thread-1", "thread-1"])
+            self.assertEqual(thread_start["params"]["dynamicTools"][0]["name"], "linear_graphql")
+            self.assertEqual(executor_calls[0][0], "linear_graphql")
+            self.assertTrue(tool_reply["result"]["success"])
+
+    def test_codex_app_server_times_out_waiting_for_initialize(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server, _ = self.write_server(root, "import time\ntime.sleep(5)\n")
+            client = self.client(server, read_timeout_ms=30)
+
+            with self.assertRaisesRegex(RuntimeError, "response_timeout"):
+                client.run_turn(**self.run_kwargs(root))
+
+    def test_codex_app_server_enforces_turn_and_stall_timeouts(self):
+        server_source = (
+            "import json, sys, time\n"
+            "for line in sys.stdin:\n"
+            "    msg = json.loads(line); method = msg.get('method')\n"
+            "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+            "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+            "    elif method == 'turn/start':\n"
+            "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+            "        time.sleep(5)\n"
+        )
+        cases = [(40, 1000, "turn_timeout"), (1000, 40, "stall_timeout")]
+        for turn_timeout_ms, stall_timeout_ms, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                server, _ = self.write_server(root, server_source)
+                client = self.client(server, turn_timeout_ms=turn_timeout_ms, stall_timeout_ms=stall_timeout_ms)
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    client.run_turn(**self.run_kwargs(root))
+
+    def test_codex_app_server_cancels_waiting_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server, _ = self.write_server(
+                root,
+                "import json, sys, time\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        time.sleep(5)\n",
+            )
+            cancel = threading.Event()
+            timer = threading.Timer(0.05, cancel.set)
+            timer.start()
+            self.addCleanup(timer.cancel)
+            client = self.client(server, turn_timeout_ms=2000, stall_timeout_ms=2000)
+
+            with self.assertRaisesRegex(RuntimeError, "turn_cancelled"):
+                client.run_turn(**self.run_kwargs(root), cancel_event=cancel)
+
+    def test_codex_app_server_replies_to_unsupported_tool_then_completes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = root / "records.jsonl"
+            server, _ = self.write_server(
+                root,
+                "import json, sys\n"
+                f"records = open({str(records)!r}, 'a')\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); records.write(json.dumps(msg) + '\\n'); records.flush(); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        print(json.dumps({'id': 901, 'method': 'item/tool/call', 'params': {'tool': 'unknown', 'arguments': {}}}), flush=True)\n"
+                "    elif msg.get('id') == 901: print(json.dumps({'method': 'turn/completed', 'params': {}}), flush=True)\n",
+            )
+            events = []
+            result = self.client(server).run_turn(**self.run_kwargs(root), on_event=events.append)
+
+            replies = [json.loads(line) for line in records.read_text().splitlines() if json.loads(line).get("id") == 901]
+            self.assertEqual(result["turn_id"], "turn-1")
+            self.assertFalse(replies[-1]["result"]["success"])
+            self.assertTrue(any(event["type"] == "unsupported_tool_call" for event in events))
+
+    def test_codex_app_server_fails_noninteractive_user_input_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server, _ = self.write_server(
+                root,
+                "import json, sys\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        print(json.dumps({'id': 902, 'method': 'item/tool/requestUserInput', 'params': {'questions': []}}), flush=True)\n",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "turn_input_required"):
+                self.client(server).run_turn(**self.run_kwargs(root))
 
 
 class OrchestratorAndDashboardTests(unittest.TestCase):

@@ -39,6 +39,12 @@ def execute_linear_graphql(client, arguments: object) -> dict:
     except Exception as exc:
         return _failure(str(exc))
     output = json.dumps(body)
+    if isinstance(body, dict) and body.get("errors"):
+        return {
+            "success": False,
+            "output": output,
+            "contentItems": [{"type": "inputText", "text": output}],
+        }
     return {
         "success": True,
         "output": output,
