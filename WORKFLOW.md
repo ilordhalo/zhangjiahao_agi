@@ -7,10 +7,11 @@ tracker:
   active_states:
     - Todo
     - In Progress
-    - Done
+    - Ready to Publish
     - Merging
     - Rework
   terminal_states:
+    - Done
     - Closed
     - Cancelled
     - Canceled
@@ -20,16 +21,28 @@ polling:
 workspace:
   root: .symphonz/workspace
 hooks:
+  timeout_ms: 120000
   after_create: |
     set -eu
     git clone --depth 1 "${SYMPHONZ_REPO_URL:-https://example.com/your-org/your-repo.git}" .
     git fetch origin "${SYMPHONZ_BASE_BRANCH:-main}" --depth 1 || true
+  before_run: |
+    set -eu
+    git status --short
+  after_run: |
+    git status --short
+  before_remove: |
+    git status --short
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  max_retry_backoff_ms: 300000
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never
+  read_timeout_ms: 5000
+  turn_timeout_ms: 3600000
+  stall_timeout_ms: 300000
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
@@ -96,13 +109,13 @@ If a required tool is missing, first try documented fallbacks. If all fallbacks 
 - `Backlog` -> out of scope. Do not modify the issue or workspace.
 - `Todo` -> queued. Move immediately to `In Progress`, create/update the workpad, then execute.
 - `In Progress` -> implementation is underway. Continue from the existing workpad and workspace.
-- `Done` -> implementation is considered complete and must be published. Push the issue branch, create/update a GitHub pull request or GitLab merge request, attach it to Linear, then move to `Human Review`.
+- `Ready to Publish` -> implementation is complete. Push the issue branch, create/update a GitHub pull request or GitLab merge request, attach it to Linear, then move to `Human Review`.
 - `Human Review` -> review request is ready and waiting for human review. Do not change code unless review feedback arrives.
 - `Rework` -> review requested changes. Re-open execution from the current branch unless the existing review request is closed or merged.
-- `Merging` -> approved for integration. Update from `origin/main`, ensure checks are green, merge the review request, then move the Linear issue to `Closed`.
-- `Closed`, `Cancelled`, `Canceled`, `Duplicate` -> terminal. Do no further work.
+- `Merging` -> approved for integration. Update from the configured base branch, ensure checks are green, merge the review request, then move the Linear issue to `Done`.
+- `Done`, `Closed`, `Cancelled`, `Canceled`, `Duplicate` -> terminal. Do no further work.
 
-Important: in `symphonz`, `Done` is a publish trigger, not a terminal state. Terminal cleanup begins only after `Closed`, `Cancelled`, `Canceled`, or `Duplicate`.
+Important: `Ready to Publish` is the publication trigger. `Done` is terminal and starts workspace cleanup only after the merge has completed.
 
 ## Branch and Review Request Convention
 
@@ -178,14 +191,20 @@ Rules:
 ## Step 1: Start or Continue Implementation
 
 1. If the issue is `Todo`, move it to `In Progress` before code work.
-2. Sync the workspace with the latest base branch:
+2. Prepare the deterministic issue branch without resetting existing work:
 
 ```bash
 git fetch origin "${SYMPHONZ_BASE_BRANCH:-main}"
-git checkout -B "<issue-branch>" "origin/${SYMPHONZ_BASE_BRANCH:-main}"
+if git show-ref --verify --quiet "refs/heads/<issue-branch>"; then
+  git checkout "<issue-branch>"
+  test -z "$(git status --porcelain)"
+  git merge --no-edit "origin/${SYMPHONZ_BASE_BRANCH:-main}"
+else
+  git checkout -b "<issue-branch>" "origin/${SYMPHONZ_BASE_BRANCH:-main}"
+fi
 ```
 
-3. If continuing existing work, inspect branch, status, commits, and any existing review request before editing.
+3. If the existing workspace is dirty, do not reset it. Inspect the branch, status, commits, and review request, preserve intended changes, and record any blocker in the workpad.
 4. Update the workpad plan with concrete tasks, acceptance criteria, and required validation.
 5. Reproduce or inspect the problem signal and record evidence in `Notes`.
 6. Implement only the ticket scope. File a separate Linear backlog issue for meaningful out-of-scope work.
@@ -203,9 +222,9 @@ git checkout -B "<issue-branch>" "origin/${SYMPHONZ_BASE_BRANCH:-main}"
 
 For this repository, respect the project rule that CI/CD and product docs stay synchronized. If changes affect PRD, architecture, roadmap, or pipeline behavior, update the matching documentation before handoff.
 
-## Step 3: Publish on `Done`
+## Step 3: Publish on `Ready to Publish`
 
-When the Linear issue state is `Done`, perform publication instead of shutting down:
+When the Linear issue state is `Ready to Publish`, perform publication:
 
 1. Confirm the worktree is clean except intended committed changes.
 2. Confirm validation is green for the latest commit.
@@ -251,14 +270,14 @@ When the issue is `Merging`:
 3. Re-run required validation.
 4. Confirm required provider checks or pipeline status are green.
 5. Merge the review request using `gh`, `glab`, or the provider API.
-6. Move the Linear issue to `Closed` after the merge is complete.
+6. Move the Linear issue to `Done` after the merge is complete.
 
 Do not merge if validation or required pipeline checks are failing.
 
 ## Guardrails
 
 - Never modify `Backlog` issues.
-- Never treat `Done` as terminal; it means publish the branch and create/update a review request.
+- Never publish from `Done`; it is terminal. Publish only from `Ready to Publish`.
 - Never use multiple workpad comments for one issue.
 - Never leave completed checklist items unchecked.
 - Never push unvalidated changes.

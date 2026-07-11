@@ -118,10 +118,14 @@ if [ -z "$BIN_DIR" ]; then
 fi
 
 TMP_DIR=""
+STAGING_DIR=""
 
 cleanup() {
   if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
     rm -rf "$TMP_DIR"
+  fi
+  if [ -n "$STAGING_DIR" ] && [ -d "$STAGING_DIR" ]; then
+    rm -rf "$STAGING_DIR"
   fi
 }
 trap cleanup EXIT
@@ -149,19 +153,28 @@ fi
 
 mkdir -p "$BIN_DIR" "$LIB_DIR"
 BIN_DIR=$(cd "$BIN_DIR" && pwd -P)
-rm -rf "${LIB_DIR}/symphonz"
-cp -R "${SOURCE_DIR}/symphonz" "${LIB_DIR}/symphonz"
-cp "${SOURCE_DIR}/WORKFLOW.md" "${LIB_DIR}/WORKFLOW.md"
+STAGING_DIR=$(mktemp -d "${PREFIX}/.symphonz-install.XXXXXX")
+mkdir -p "${STAGING_DIR}/lib" "${STAGING_DIR}/bin"
+cp -R "${SOURCE_DIR}/symphonz" "${STAGING_DIR}/lib/symphonz"
+cp "${SOURCE_DIR}/WORKFLOW.md" "${STAGING_DIR}/lib/WORKFLOW.md"
 
 LIB_DIR_ESCAPED=$(escape_double_quoted "$LIB_DIR")
-cat > "${BIN_DIR}/symphonz" <<EOF
+cat > "${STAGING_DIR}/bin/symphonz" <<EOF
 #!/bin/sh
 SYMPHONZ_LIB_DIR="${LIB_DIR_ESCAPED}"
 PYTHONPATH="\${SYMPHONZ_LIB_DIR}\${PYTHONPATH:+:\$PYTHONPATH}"
 export PYTHONPATH
 exec python3 -c 'from symphonz.cli import main; raise SystemExit(main())' "\$@"
 EOF
-chmod +x "${BIN_DIR}/symphonz"
+chmod +x "${STAGING_DIR}/bin/symphonz"
+
+rm -rf "${LIB_DIR}/symphonz.new"
+mv "${STAGING_DIR}/lib/symphonz" "${LIB_DIR}/symphonz.new"
+cp "${STAGING_DIR}/lib/WORKFLOW.md" "${LIB_DIR}/WORKFLOW.md.new"
+rm -rf "${LIB_DIR}/symphonz"
+mv "${LIB_DIR}/symphonz.new" "${LIB_DIR}/symphonz"
+mv "${LIB_DIR}/WORKFLOW.md.new" "${LIB_DIR}/WORKFLOW.md"
+mv "${STAGING_DIR}/bin/symphonz" "${BIN_DIR}/symphonz"
 
 cat <<EOF
 symphonz installed.

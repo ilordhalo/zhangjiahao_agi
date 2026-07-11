@@ -101,6 +101,66 @@ class InstallInputTests(unittest.TestCase):
             self.assertEqual(config.gitlab_base_url, "")
             self.assertEqual(config.repo_url, "https://github.com/example/project.git")
 
+    def test_collect_install_config_noninteractive_uses_explicit_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "remote", "add", "origin", "https://example.com/group/repo.git"],
+                cwd=root,
+                check=True,
+            )
+
+            config = collect_install_config(
+                root,
+                "embedded",
+                True,
+                linear_project_slug="quality-project",
+                git_provider="github",
+                repo_url="https://github.com/example/quality.git",
+                base_branch="develop",
+                mr_target="release",
+            )
+
+            self.assertEqual(config.linear_project_slug, "quality-project")
+            self.assertEqual(config.git_provider, "github")
+            self.assertEqual(config.repo_url, "https://github.com/example/quality.git")
+            self.assertEqual(config.base_branch, "develop")
+            self.assertEqual(config.mr_target, "release")
+
+    def test_collect_install_config_noninteractive_uses_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "remote", "add", "origin", "https://github.com/example/project.git"],
+                cwd=root,
+                check=True,
+            )
+
+            config = collect_install_config(
+                root,
+                "embedded",
+                True,
+                environ={"SYMPHONZ_LINEAR_PROJECT": "env-project"},
+            )
+
+            self.assertEqual(config.linear_project_slug, "env-project")
+            self.assertEqual(config.git_provider, "github")
+
+    def test_collect_install_config_reports_missing_noninteractive_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "remote", "add", "origin", "https://github.com/example/project.git"],
+                cwd=root,
+                check=True,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "--linear-project or SYMPHONZ_LINEAR_PROJECT"):
+                collect_install_config(root, "embedded", True, environ={})
+
 
 class WorkflowInstallTests(unittest.TestCase):
     personal_values = [
@@ -134,7 +194,9 @@ class WorkflowInstallTests(unittest.TestCase):
         self.assertIn('workspace:\n  root: .symphonz/workspace', rendered)
         self.assertIn('SYMPHONZ_REPO_URL:-https://example.com/group/repo.git', rendered)
         self.assertIn("Review provider is configured by `SYMPHONZ_GIT_PROVIDER`", rendered)
-        self.assertIn("- `Done` -> implementation is considered complete", rendered)
+        self.assertIn("- `Ready to Publish` -> implementation is complete", rendered)
+        self.assertIn("- `Done`, `Closed`, `Cancelled`, `Canceled`, `Duplicate` -> terminal", rendered)
+        self.assertNotIn("git checkout -B", rendered)
 
     def test_default_workflow_template_contains_no_personal_values(self):
         template = Path("WORKFLOW.md").read_text()
@@ -264,7 +326,7 @@ class CliSmokeTests(unittest.TestCase):
             exit_code = main(["version"])
 
         self.assertEqual(exit_code, 0)
-        self.assertIn("symphonz 0.2.1", output.getvalue())
+        self.assertIn("symphonz 0.3.0", output.getvalue())
 
     def test_bin_symphonz_help_runs_from_repo_root(self):
         result = subprocess.run(
@@ -306,6 +368,40 @@ class CliSmokeTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertTrue((root / ".symphonz" / "config.toml").exists())
             self.assertTrue((root / ".symphonz" / "WORKFLOW.md").exists())
+
+    def test_install_yes_accepts_complete_command_line_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(["git", "remote", "add", "origin", "https://example.com/group/repo.git"], cwd=root, check=True)
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                exit_code = main(
+                    [
+                        "install",
+                        "--yes",
+                        "--linear-project",
+                        "quality-project",
+                        "--git-provider",
+                        "github",
+                        "--repo-url",
+                        "https://github.com/example/quality.git",
+                        "--base-branch",
+                        "develop",
+                        "--target-branch",
+                        "release",
+                    ]
+                )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(exit_code, 0)
+            config = read_config(root / ".symphonz" / "config.toml")
+            self.assertEqual(config["linear"]["project_slug"], "quality-project")
+            self.assertEqual(config["git"]["provider"], "github")
+            self.assertEqual(config["git"]["base_branch"], "develop")
+            self.assertEqual(config["git"]["mr_target"], "release")
 
 
 class ShellInstallerTests(unittest.TestCase):
@@ -356,7 +452,7 @@ class ShellInstallerTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(version.returncode, 0, version.stderr)
-            self.assertIn("symphonz 0.2.1", version.stdout)
+            self.assertIn("symphonz 0.3.0", version.stdout)
 
     def test_installed_symphonz_runs_from_prefix_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -375,7 +471,7 @@ class ShellInstallerTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("symphonz 0.2.1", result.stdout)
+            self.assertIn("symphonz 0.3.0", result.stdout)
 
     def test_install_sh_installs_from_local_source_to_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -401,7 +497,7 @@ class ShellInstallerTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(version.returncode, 0, version.stderr)
-            self.assertIn("symphonz 0.2.1", version.stdout)
+            self.assertIn("symphonz 0.3.0", version.stdout)
             self.assertTrue((prefix / "lib" / "WORKFLOW.md").exists())
             self.assertTrue((prefix / "lib" / "symphonz" / "service" / "runner.py").exists())
 
@@ -441,6 +537,11 @@ class ShellInstallerTests(unittest.TestCase):
             config = read_config(project / ".symphonz" / "config.toml")
             self.assertEqual(config["git"]["provider"], "github")
             self.assertEqual(config["git"]["gitlab_base_url"], "")
+
+    def test_repository_exposes_standard_readme_and_staged_installer(self):
+        self.assertTrue(Path("README.md").exists())
+        script = Path("install.sh").read_text()
+        self.assertIn("STAGING_DIR", script)
 
 
 if __name__ == "__main__":
