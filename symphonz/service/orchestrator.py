@@ -6,6 +6,7 @@ import threading
 import time
 
 from symphonz.service.codex_app_server import CodexAppServer
+from symphonz.service.attempt_store import AttemptStore
 from symphonz.service.linear import LinearClient
 from symphonz.service.models import Issue, RuntimeState, WorkflowDefinition
 from symphonz.service.workflow import render_prompt
@@ -26,6 +27,7 @@ class Orchestrator:
         linear_client: LinearClient,
         codex_client: CodexAppServer,
         state: RuntimeState | None = None,
+        attempt_store: AttemptStore | None = None,
         clock=time.monotonic,
     ):
         self.project_root = project_root
@@ -33,6 +35,7 @@ class Orchestrator:
         self.linear_client = linear_client
         self.codex_client = codex_client
         self.state = state or RuntimeState()
+        self.attempt_store = attempt_store or AttemptStore()
         self.clock = clock
         self.max_concurrent_agents = max(1, int(self.workflow.config.get("agent", {}).get("max_concurrent_agents", 10)))
         self.executor = ThreadPoolExecutor(max_workers=self.max_concurrent_agents, thread_name_prefix="symphonz")
@@ -104,7 +107,7 @@ class Orchestrator:
             with self.state.lock:
                 if issue.id in self.state.claimed:
                     continue
-            self._dispatch(issue, attempt=0, already_claimed=False)
+            self._dispatch(issue, already_claimed=False)
 
     def _dispatch_due_retries(self) -> None:
         now = self.clock()
@@ -121,7 +124,7 @@ class Orchestrator:
             try:
                 refreshed = self.linear_client.fetch_issues_by_ids([issue_id])
             except Exception as error:
-                self._schedule_retry(issue, int(entry["attempt"]) + 1, str(error))
+                self._reschedule_tracker_retry(issue, entry, error)
                 continue
             if not refreshed:
                 self._release(issue_id)
@@ -132,14 +135,19 @@ class Orchestrator:
                     self._cleanup_terminal_workspace(issue)
                 self._release(issue_id)
                 continue
-            self._dispatch(issue, attempt=int(entry["attempt"]), already_claimed=True)
+            self._dispatch(issue, already_claimed=True)
 
-    def _dispatch(self, issue: Issue, *, attempt: int, already_claimed: bool) -> None:
-        cancel_event = threading.Event()
-        entry = self._entry(issue, status="running", attempt=attempt)
+    def _dispatch(self, issue: Issue, *, already_claimed: bool) -> None:
         with self.state.lock:
             if issue.id in self._futures:
                 return
+        attempt = self.attempt_store.consume(issue.id, self._normalize_state(issue.state), self.max_attempts())
+        if attempt is None:
+            self._block_at_attempt_limit(issue, self.max_attempts())
+            return
+        cancel_event = threading.Event()
+        entry = self._entry(issue, status="running", attempt=attempt)
+        with self.state.lock:
             if not already_claimed:
                 self.state.claimed.add(issue.id)
             self.state.blocked.pop(issue.id, None)
@@ -214,8 +222,12 @@ class Orchestrator:
             elif cancel_reason:
                 self._finish_cancelled(completed_issue, entry, cancel_reason)
             elif outcome.get("still_active"):
-                self._schedule_retry(completed_issue, max(int(entry.get("attempt", 0)), 1), None, delay=1.0)
-                self.state.add_event("issue_continuing", f"Continuing {completed_issue.identifier}", completed_issue.identifier)
+                if self._schedule_retry(completed_issue, None, delay=1.0):
+                    self.state.add_event(
+                        "issue_continuing",
+                        f"Continuing {completed_issue.identifier}",
+                        completed_issue.identifier,
+                    )
             else:
                 if self._terminal(completed_issue):
                     self._cleanup_terminal_workspace(completed_issue)
@@ -236,18 +248,26 @@ class Orchestrator:
                 self.state.blocked[issue.id] = blocked
             self.state.add_event("issue_blocked", f"Blocked {issue.identifier}: {message}", issue.identifier)
             return
-        attempt = int(entry.get("attempt", 0)) + 1
-        self._schedule_retry(issue, attempt, message)
-        self.state.add_event("issue_retrying", f"Retrying {issue.identifier}: {message}", issue.identifier, attempt=attempt)
+        if self._schedule_retry(issue, message):
+            attempt = self.attempt_store.next_attempt(issue.id, self._normalize_state(issue.state))
+            self.state.add_event(
+                "issue_retrying",
+                f"Retrying {issue.identifier}: {message}",
+                issue.identifier,
+                attempt=attempt,
+            )
 
     def _schedule_retry(
         self,
         issue: Issue,
-        attempt: int,
         error: str | None,
         *,
         delay: float | None = None,
-    ) -> None:
+    ) -> bool:
+        attempt = self.attempt_store.next_attempt(issue.id, self._normalize_state(issue.state))
+        if attempt >= self.max_attempts():
+            self._block_at_attempt_limit(issue, attempt)
+            return False
         if delay is None:
             max_delay = max(1, int(self.workflow.config.get("agent", {}).get("max_retry_backoff_ms", 300000))) / 1000
             delay = min(10 * (2 ** max(attempt - 1, 0)), max_delay)
@@ -257,6 +277,53 @@ class Orchestrator:
             self.state.retrying[issue.id] = entry
             self._retry_issues[issue.id] = issue
             self.state.claimed.add(issue.id)
+        return True
+
+    def _reschedule_tracker_retry(self, issue: Issue, entry: dict, error: Exception) -> None:
+        tracker_retry_count = int(entry.get("tracker_retry_count", 0)) + 1
+        max_delay = max(1, int(self.workflow.config.get("agent", {}).get("max_retry_backoff_ms", 300000))) / 1000
+        delay = min(10 * (2 ** max(tracker_retry_count - 1, 0)), max_delay)
+        retry = self._entry(issue, status="retrying", attempt=int(entry["attempt"]))
+        retry.update(
+            {
+                "due_at": self.clock() + delay,
+                "due_at_epoch": time.time() + delay,
+                "error": str(error),
+                "tracker_retry_count": tracker_retry_count,
+            }
+        )
+        with self.state.lock:
+            self.state.retrying[issue.id] = retry
+            self._retry_issues[issue.id] = issue
+            self.state.claimed.add(issue.id)
+        self.state.add_event(
+            "tracker_poll_failed",
+            f"Linear retry refresh failed for {issue.identifier}: {error}",
+            issue.identifier,
+            tracker_retry_count=tracker_retry_count,
+        )
+
+    def _block_at_attempt_limit(self, issue: Issue, attempt: int) -> None:
+        blocked = self._entry(issue, status="blocked", attempt=attempt)
+        blocked.update(
+            {
+                "blocked_at": time.time(),
+                "error": "attempt_limit_exceeded",
+                "max_attempts": self.max_attempts(),
+            }
+        )
+        with self.state.lock:
+            self.state.retrying.pop(issue.id, None)
+            self._retry_issues.pop(issue.id, None)
+            self.state.blocked[issue.id] = blocked
+            self.state.claimed.add(issue.id)
+        self.state.add_event(
+            "issue_blocked",
+            f"Blocked {issue.identifier}: attempt limit exceeded",
+            issue.identifier,
+            attempt=attempt,
+            max_attempts=self.max_attempts(),
+        )
 
     def _reconcile_running(self) -> None:
         with self.state.lock:
@@ -311,7 +378,7 @@ class Orchestrator:
             elif issue.state != blocked.get("state"):
                 with self.state.lock:
                     self.state.blocked.pop(issue_id, None)
-                self._schedule_retry(issue, int(blocked.get("attempt", 0)) + 1, "state changed", delay=0)
+                self._schedule_retry(issue, "state changed", delay=0)
 
     def _finish_cancelled(self, issue: Issue, entry: dict, reason: str) -> None:
         if reason == "terminal" and issue is not None:
@@ -341,6 +408,7 @@ class Orchestrator:
         self.state.add_event("issue_completed", f"Completed {issue.identifier}", issue.identifier)
 
     def _cleanup_terminal_workspace(self, issue: Issue) -> None:
+        self.attempt_store.clear(issue.id)
         workspace = workspace_path(self.project_root, self.workflow, issue)
         try:
             remove_workspace(workspace, self.workflow, issue)
@@ -396,6 +464,9 @@ class Orchestrator:
 
     def max_turns(self) -> int:
         return max(1, int(self.workflow.config.get("agent", {}).get("max_turns", 20)))
+
+    def max_attempts(self) -> int:
+        return max(1, int(self.workflow.config.get("agent", {}).get("max_attempts", 5)))
 
     def codex_approval_policy(self) -> str | dict:
         return self.workflow.config.get("codex", {}).get("approval_policy", "never")

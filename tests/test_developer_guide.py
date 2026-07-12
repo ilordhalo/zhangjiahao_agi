@@ -61,7 +61,7 @@ class DeveloperGuideTests(unittest.TestCase):
             "进程内存",
             "八个当前边界",
             "Human Review 默认不在 active_states",
-            "指数退避重试",
+            "有预算的指数退避",
             "runtime.jsonl",
         ]:
             self.assertIn(phrase, html)

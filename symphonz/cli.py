@@ -11,9 +11,7 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     install = subcommands.add_parser("install", help="Install symphonz into the current project")
-    install.add_argument("--runtime", choices=["embedded", "global"], default="embedded")
     install.add_argument("--yes", action="store_true", help="Accept detected defaults without interactive prompts")
-    install.add_argument("--skip-runtime-download", action="store_true", help="Create embedded runtime layout without downloading Symphony")
     install.add_argument("--skip-linear-preflight", action="store_true", help="Skip the Linear connectivity check")
     install.add_argument("--linear-project", help="Linear project slug or ID")
     install.add_argument("--linear-api-key-env", help="Name of the environment variable containing the Linear API key")
@@ -63,9 +61,7 @@ def main(argv: list[str] | None = None) -> int:
         from symphonz.install import install_project
 
         install_project(
-            runtime_mode=args.runtime,
             assume_yes=args.yes,
-            skip_runtime_download=args.skip_runtime_download,
             skip_linear_preflight=args.skip_linear_preflight,
             linear_project_slug=args.linear_project,
             linear_api_key_env=args.linear_api_key_env,

@@ -2,6 +2,8 @@
 
 `symphonz` is a dependency-light CLI and built-in Python runtime that turns Linear issues into isolated Codex development sessions. It does not require OpenAI Symphony, `mise`, Elixir, Erlang, or `escript`.
 
+The built-in runtime is the only supported execution mode. Legacy project configs that reference an external `symphony` command are automatically run by the internal service instead.
+
 ## Install the CLI
 
 ```bash
@@ -46,7 +48,7 @@ Todo -> In Progress -> Ready to Publish -> Human Review
 
 `Ready to Publish`, not `Done`, pushes the deterministic issue branch and opens or updates a GitHub pull request or GitLab merge request. `Done`, `Closed`, `Cancelled`, `Canceled`, and `Duplicate` are terminal and trigger workspace cleanup.
 
-The runtime polls Linear with pagination, claims eligible issues in priority order, suppresses blocked issues, and runs a bounded worker pool. Each worker reuses one Codex app-server thread for its configured turns, exposes a guaranteed `linear_graphql` dynamic tool, records events in `.symphonz/logs/runtime.jsonl`, and retries transient failures with bounded exponential backoff.
+The runtime polls Linear with pagination, claims eligible issues in priority order, suppresses blocked issues, and runs a bounded worker pool. Each worker reuses one Codex app-server thread for its configured turns, exposes a guaranteed `linear_graphql` dynamic tool, records events in `.symphonz/logs/runtime.jsonl`, and retries transient failures with bounded exponential backoff. The default workflow allows at most five Codex invocations for one unchanged active state; reaching that limit leaves the issue Blocked until its Linear state changes. This budget survives service restarts and temporary label or blocker changes through `.symphonz/logs/attempts.sqlite3`; Linear polling failures do not consume it.
 
 The generated workflow assumes a trusted automation environment: Codex is allowed network access and unattended approvals so it can update Linear and the Git provider. Use a dedicated machine or container with least-privilege Linear and Git credentials.
 

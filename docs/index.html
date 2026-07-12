@@ -1146,7 +1146,7 @@
       <a class="brand" href="#overview" aria-label="返回 Symphonz 服务机制顶部">
         <span class="brand-mark">S</span>
         <span>Symphonz</span>
-        <span class="version">v0.3.0</span>
+        <span class="version">v0.3.1</span>
       </a>
       <nav class="nav-links" aria-label="页面章节">
         <a href="#system-map">系统地图</a>
@@ -1448,7 +1448,7 @@ Description:
               <span class="rationale-title">设计目的</span>
               <p>每次 worker invocation 创建一个 Codex thread，并在 Issue 仍处于活动状态时复用该 thread 运行最多 <code>max_turns</code> 个 turn。后续重试会创建新 thread，因此 Issue 字段、workspace 位置、基础分支和 Git provider 仍会重新注入，使会话可从文件系统和 Linear Workpad 恢复上下文。</p>
               <div class="workflow-meta"><span class="owner-tag runtime">Runtime 渲染变量</span><span class="owner-tag codex">Codex 读取上下文</span></div>
-              <p class="workflow-limit">失败或活动状态续跑会进入指数退避队列；新 invocation 会把递增的 <code>attempt</code> 注入 Prompt，提醒 Codex 复用现有 workspace。</p>
+              <p class="workflow-limit">失败或活动状态续跑会进入指数退避队列；新 invocation 会把递增的 <code>attempt</code> 注入 Prompt。达到 <code>max_attempts</code> 后进入 Blocked，只有 Linear 状态变化才会重置预算。预算按 Issue 与状态持久化到 <code>.symphonz/logs/attempts.sqlite3</code>，重启服务、并发服务实例或短暂移除标签都不会绕过限制；Linear 查询失败也不会消耗 Codex 额度。</p>
             </div>
           </article>
 
@@ -1918,7 +1918,7 @@ Effective route from `Merging -> integrate`:
             <div class="command"><code>symphonz install</code><span>交互式收集 Linear 与 Git provider 配置，并创建 .symphonz。</span></div>
             <div class="command"><code>symphonz run</code><span>仅启动 Linear 监听和 Codex 调度，不启动 Web Dashboard。</span></div>
             <div class="command"><code>symphonz run --port 4100</code><span>同时在 127.0.0.1:4100 提供 Runtime Dashboard。</span></div>
-            <div class="command"><code>symphonz version</code><span>查看当前 CLI 版本；本介绍页对应 v0.3.0。</span></div>
+            <div class="command"><code>symphonz version</code><span>查看当前 CLI 版本；本介绍页对应 v0.3.1。</span></div>
           </div>
         </div>
       </div>
@@ -1928,7 +1928,7 @@ Effective route from `Merging -> integrate`:
       <div class="section-inner">
         <div class="section-kicker">08 · Implementation Boundaries</div>
         <h2 class="section-heading">阅读运行结果时，需要知道的八个当前边界</h2>
-        <p class="section-lead">这些不是工作流愿景，而是 v0.3.0 内置 Runtime 的真实行为。明确它们，才能正确理解 Dashboard 和 Linear 中看到的状态。</p>
+        <p class="section-lead">这些不是工作流愿景，而是 v0.3.1 内置 Runtime 的真实行为。明确它们，才能正确理解 Dashboard 和 Linear 中看到的状态。</p>
         <hr class="section-rule">
 
         <div class="boundaries">
@@ -1938,7 +1938,7 @@ Effective route from `Merging -> integrate`:
           <article class="boundary"><span class="boundary-index">04</span><h3>活动 Issue 会继续推进</h3><p>若 Issue 下一轮仍属于 <code>active_states</code>，Runtime 会复用 workspace，并用 attempt 和 Workpad 恢复上下文。</p></article>
           <article class="boundary"><span class="boundary-index">05</span><h3>发布依赖 Codex 环境</h3><p>Git push、GitHub PR、GitLab MR 与 Linear 状态更新依赖 Codex 会话中可用的 token、CLI 或 MCP 工具。</p></article>
           <article class="boundary"><span class="boundary-index">06</span><h3>终态负责自动清理</h3><p>Runtime 会单独查询终态，取消仍在执行的 worker，运行 <code>before_remove</code>，再安全删除对应 workspace。</p></article>
-          <article class="boundary"><span class="boundary-index">07</span><h3>指数退避重试</h3><p>失败 turn 会进入 <code>retrying</code>，按 attempt 指数退避，并受 <code>max_retry_backoff_ms</code> 和 <code>max_turns</code> 限制。</p></article>
+          <article class="boundary"><span class="boundary-index">07</span><h3>有预算的指数退避</h3><p>失败 turn 会进入 <code>retrying</code>，按 attempt 指数退避，并受 <code>max_retry_backoff_ms</code>、<code>max_turns</code> 和 <code>max_attempts</code> 限制。Codex 预算会跨服务重启保留，Linear 网络重试单独计数，超限后保持 Blocked。</p></article>
           <article class="boundary"><span class="boundary-index">08</span><h3>结构化运行日志</h3><p>Runtime 同时维护进程内存状态，并把事件追加写入 <code>.symphonz/logs/runtime.jsonl</code>，便于故障追踪。</p></article>
         </div>
         <div class="closing-note"><strong>工程结论</strong><span>Symphonz 当前是一个轻量、可观察的轮询与会话调度器；项目级开发流程的智能部分由 Codex 在 WORKFLOW Prompt 约束下完成。</span></div>
@@ -1947,7 +1947,7 @@ Effective route from `Merging -> integrate`:
   </main>
 
   <footer>
-    <div class="footer-inner"><strong>Symphonz Developer Guide</strong><span>对应内置 Runtime v0.3.0 · 离线静态页面</span></div>
+    <div class="footer-inner"><strong>Symphonz Developer Guide</strong><span>对应内置 Runtime v0.3.1 · 离线静态页面</span></div>
   </footer>
 
   <script>

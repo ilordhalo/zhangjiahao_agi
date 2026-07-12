@@ -15,7 +15,7 @@ from symphonz.install import (
     read_config,
     write_config,
 )
-from symphonz.runtime import build_run_command, install_embedded_runtime, run_installed
+from symphonz.runtime import build_run_command, run_installed
 from symphonz.workflow import render_workflow
 
 
@@ -124,10 +124,10 @@ class InstallInputTests(unittest.TestCase):
             )
             answers = iter(["LINEAR_API_KEY", "project-slug", "", "", "", "", ""])
 
-            config = collect_install_config(root, "global", False, input_func=lambda prompt: next(answers))
+            config = collect_install_config(root, False, input_func=lambda prompt: next(answers))
 
-            self.assertEqual(config.runtime_mode, "global")
-            self.assertEqual(config.runtime_command, "symphony")
+            self.assertEqual(config.runtime_mode, "embedded")
+            self.assertEqual(config.runtime_command, "symphonz-internal")
             self.assertEqual(config.linear_project_slug, "project-slug")
             self.assertEqual(config.git_provider, "gitlab")
             self.assertEqual(config.repo_url, "https://example.com/group/repo.git")
@@ -145,7 +145,7 @@ class InstallInputTests(unittest.TestCase):
             )
             answers = iter(["LINEAR_API_KEY", "project-slug", "", "", "", ""])
 
-            config = collect_install_config(root, "global", False, input_func=lambda prompt: next(answers))
+            config = collect_install_config(root, False, input_func=lambda prompt: next(answers))
 
             self.assertEqual(config.git_provider, "github")
             self.assertEqual(config.gitlab_base_url, "")
@@ -163,7 +163,6 @@ class InstallInputTests(unittest.TestCase):
 
             config = collect_install_config(
                 root,
-                "embedded",
                 True,
                 linear_project_slug="quality-project",
                 git_provider="github",
@@ -190,7 +189,6 @@ class InstallInputTests(unittest.TestCase):
 
             config = collect_install_config(
                 root,
-                "embedded",
                 True,
                 environ={"SYMPHONZ_LINEAR_PROJECT": "env-project"},
             )
@@ -209,7 +207,7 @@ class InstallInputTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(RuntimeError, "--linear-project or SYMPHONZ_LINEAR_PROJECT"):
-                collect_install_config(root, "embedded", True, environ={})
+                collect_install_config(root, True, environ={})
 
 
 class WorkflowInstallTests(unittest.TestCase):
@@ -221,8 +219,8 @@ class WorkflowInstallTests(unittest.TestCase):
 
     def make_config(self) -> InstallConfig:
         return InstallConfig(
-            runtime_mode="global",
-            runtime_command="symphony",
+            runtime_mode="embedded",
+            runtime_command="symphonz-internal",
             linear_api_key_env="LINEAR_API_KEY",
             linear_project_slug="project-slug",
             git_provider="gitlab",
@@ -255,7 +253,7 @@ class WorkflowInstallTests(unittest.TestCase):
         for value in self.personal_values:
             self.assertNotIn(value, template)
 
-    def test_install_project_global_creates_expected_layout(self):
+    def test_install_project_creates_expected_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
@@ -264,9 +262,7 @@ class WorkflowInstallTests(unittest.TestCase):
 
             install_project(
                 project_root=root,
-                runtime_mode="global",
                 assume_yes=False,
-                skip_runtime_download=False,
                 skip_linear_preflight=True,
                 input_func=lambda prompt: next(answers),
             )
@@ -282,7 +278,7 @@ class WorkflowInstallTests(unittest.TestCase):
             for value in self.personal_values:
                 self.assertNotIn(value, rendered)
 
-    def test_install_project_embedded_uses_internal_runtime(self):
+    def test_install_project_always_uses_internal_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
@@ -291,9 +287,7 @@ class WorkflowInstallTests(unittest.TestCase):
 
             install_project(
                 project_root=root,
-                runtime_mode="embedded",
                 assume_yes=False,
-                skip_runtime_download=False,
                 skip_linear_preflight=True,
                 input_func=lambda prompt: next(answers),
             )
@@ -306,15 +300,6 @@ class WorkflowInstallTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
-    def test_install_embedded_runtime_is_noop_because_runtime_is_builtin(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-
-            install_embedded_runtime(root, skip_download=True)
-
-            self.assertFalse((root / ".symphonz" / "runtime").exists())
-            self.assertFalse((root / ".symphonz" / "bin" / "symphony").exists())
-
     def test_build_run_command_embedded_exports_expected_environment(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -367,6 +352,28 @@ class RuntimeTests(unittest.TestCase):
                 ["symphonz", "service", ".symphonz/WORKFLOW.md", "--logs-root", ".symphonz/logs", "--port", "4100"],
             )
 
+    def test_legacy_global_config_is_ignored_and_uses_internal_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = InstallConfig(
+                runtime_mode="global",
+                runtime_command="symphony",
+                linear_api_key_env="LINEAR_API_KEY",
+                linear_project_slug="project-slug",
+                git_provider="github",
+                repo_url="https://github.com/example/project.git",
+                base_branch="main",
+                mr_target="main",
+                gitlab_base_url="",
+                workspace_root=".symphonz/workspace",
+                logs_root=".symphonz/logs",
+            )
+            write_config(root / ".symphonz" / "config.toml", config)
+
+            command, _env = build_run_command(root)
+
+            self.assertEqual(command[0:2], ["symphonz", "service"])
+
     def test_print_command_includes_shell_quoted_runtime_environment(self):
         from contextlib import redirect_stdout
         from io import StringIO
@@ -410,7 +417,12 @@ class CliSmokeTests(unittest.TestCase):
             exit_code = main(["version"])
 
         self.assertEqual(exit_code, 0)
-        self.assertIn("symphonz 0.3.0", output.getvalue())
+        self.assertIn("symphonz 0.3.1", output.getvalue())
+
+    def test_install_rejects_removed_runtime_option(self):
+        with self.assertRaises(SystemExit) as raised:
+            main(["install", "--runtime", "global"])
+        self.assertEqual(raised.exception.code, 2)
 
     def test_bin_symphonz_help_runs_from_repo_root(self):
         result = subprocess.run(
@@ -432,7 +444,7 @@ class CliSmokeTests(unittest.TestCase):
             main([])
         self.assertEqual(raised.exception.code, 2)
 
-    def test_install_global_with_answers_creates_project_files(self):
+    def test_install_with_answers_creates_project_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
@@ -445,7 +457,7 @@ class CliSmokeTests(unittest.TestCase):
                 from unittest.mock import patch
 
                 with patch("builtins.input", lambda prompt: next(answers)):
-                    exit_code = main(["install", "--runtime", "global", "--skip-linear-preflight"])
+                    exit_code = main(["install", "--skip-linear-preflight"])
             finally:
                 os.chdir(old_cwd)
 
@@ -537,7 +549,7 @@ class ShellInstallerTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(version.returncode, 0, version.stderr)
-            self.assertIn("symphonz 0.3.0", version.stdout)
+            self.assertIn("symphonz 0.3.1", version.stdout)
 
     def test_installed_symphonz_runs_from_prefix_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -556,7 +568,7 @@ class ShellInstallerTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("symphonz 0.3.0", result.stdout)
+            self.assertIn("symphonz 0.3.1", result.stdout)
 
     def test_install_sh_installs_from_local_source_to_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -595,7 +607,7 @@ class ShellInstallerTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(version.returncode, 0, version.stderr)
-            self.assertIn("symphonz 0.3.0", version.stdout)
+            self.assertIn("symphonz 0.3.1", version.stdout)
             self.assertTrue((prefix / "current" / "lib" / "WORKFLOW.md").exists())
             self.assertTrue((prefix / "current" / "lib" / "symphonz" / "service" / "runner.py").exists())
 
@@ -624,8 +636,6 @@ class ShellInstallerTests(unittest.TestCase):
                 [
                     str(prefix / "bin" / "symphonz"),
                     "install",
-                    "--runtime",
-                    "global",
                     "--skip-linear-preflight",
                 ],
                 cwd=project,

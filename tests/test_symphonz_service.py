@@ -20,6 +20,7 @@ class WorkflowServiceTests(unittest.TestCase):
 
         self.assertEqual(workflow.config["tracker"]["kind"], "linear")
         self.assertEqual(workflow.config["workspace"]["root"], ".symphonz/workspace")
+        self.assertEqual(workflow.config["agent"]["max_attempts"], 5)
         self.assertIn("Todo", workflow.config["tracker"]["active_states"])
         self.assertIn("git clone --depth 1", workflow.config["hooks"]["after_create"])
         self.assertIn("{{ issue.identifier }}", workflow.prompt_template)
@@ -858,7 +859,12 @@ class OrchestratorHardeningTests(unittest.TestCase):
                 },
                 "workspace": {"root": ".symphonz/workspace"},
                 "hooks": {},
-                "agent": {"max_concurrent_agents": 2, "max_turns": 1, "max_retry_backoff_ms": 300000},
+                "agent": {
+                    "max_concurrent_agents": 2,
+                    "max_turns": 1,
+                    "max_attempts": 5,
+                    "max_retry_backoff_ms": 300000,
+                },
                 "codex": {},
             },
             prompt_template="Work on {{ issue.identifier }}{% if attempt %} attempt {{ attempt }}{% endif %}",
@@ -1012,6 +1018,195 @@ class OrchestratorHardeningTests(unittest.TestCase):
 
         self.assertEqual(len(codex.calls), 2)
         self.assertIn("attempt 1", codex.calls[1]["prompt"])
+
+    def test_failures_block_at_attempt_limit_until_issue_state_changes(self):
+        from dataclasses import replace
+        from symphonz.service.orchestrator import Orchestrator
+
+        class AlwaysFailCodex(self.RecordingCodex):
+            def run_turns(self, **kwargs):
+                self.calls.append(kwargs)
+                raise RuntimeError("persistent failure")
+
+        self.workflow.config["agent"]["max_attempts"] = 2
+        now = [0.0]
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        codex = AlwaysFailCodex()
+        orchestrator = Orchestrator(self.root, self.workflow, linear, codex, clock=lambda: now[0])
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+        now[0] = 10.0
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+
+        snapshot = orchestrator.state.snapshot()
+        self.assertEqual(len(codex.calls), 2)
+        self.assertEqual(snapshot["counts"]["retrying"], 0)
+        self.assertEqual(snapshot["blocked"][0]["error"], "attempt_limit_exceeded")
+        orchestrator.tick()
+        self.assertEqual(len(codex.calls), 2)
+
+        linear.issues[issue.id] = replace(issue, state="In Progress")
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+        self.assertEqual(len(codex.calls), 3)
+        self.assertNotIn("attempt", codex.calls[-1]["prompt"])
+
+    def test_clean_continuations_increment_attempt_and_respect_limit(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        self.workflow.config["agent"]["max_attempts"] = 2
+        now = [0.0]
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        codex = self.RecordingCodex(sleep_seconds=0)
+        orchestrator = Orchestrator(self.root, self.workflow, linear, codex, clock=lambda: now[0])
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+        self.assertEqual(orchestrator.state.snapshot()["retrying"][0]["attempt"], 1)
+        now[0] = 1.0
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+
+        snapshot = orchestrator.state.snapshot()
+        self.assertEqual(len(codex.calls), 2)
+        self.assertEqual(snapshot["blocked"][0]["error"], "attempt_limit_exceeded")
+
+    def test_active_state_change_resets_continuation_attempt_budget(self):
+        from dataclasses import replace
+        from symphonz.service.orchestrator import Orchestrator
+
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+
+        class StateChangingCodex(self.RecordingCodex):
+            def run_turns(inner_self, **kwargs):
+                result = super().run_turns(**kwargs)
+                linear.issues[issue.id] = replace(issue, state="In Progress")
+                return result
+
+        codex = StateChangingCodex(sleep_seconds=0)
+        orchestrator = Orchestrator(self.root, self.workflow, linear, codex)
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.poll_once()
+
+        retry = orchestrator.state.snapshot()["retrying"][0]
+        self.assertEqual(retry["state"], "In Progress")
+        self.assertEqual(retry["attempt"], 0)
+
+    def test_attempt_limit_survives_service_restart(self):
+        from symphonz.service.attempt_store import AttemptStore
+        from symphonz.service.orchestrator import Orchestrator
+
+        self.workflow.config["agent"]["max_attempts"] = 1
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        store_path = self.root / ".symphonz" / "logs" / "attempts.sqlite3"
+
+        first_codex = self.RecordingCodex(sleep_seconds=0)
+        first = Orchestrator(
+            self.root,
+            self.workflow,
+            linear,
+            first_codex,
+            attempt_store=AttemptStore(store_path),
+        )
+        first.tick()
+        first.wait_for_idle(timeout=2)
+        first.shutdown()
+
+        second_codex = self.RecordingCodex(sleep_seconds=0)
+        second = Orchestrator(
+            self.root,
+            self.workflow,
+            linear,
+            second_codex,
+            attempt_store=AttemptStore(store_path),
+        )
+        self.addCleanup(second.shutdown)
+        second.tick()
+
+        self.assertEqual(len(first_codex.calls), 1)
+        self.assertEqual(len(second_codex.calls), 0)
+        self.assertEqual(second.state.snapshot()["blocked"][0]["error"], "attempt_limit_exceeded")
+
+    def test_attempt_store_reservation_is_atomic_across_instances(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from symphonz.service.attempt_store import AttemptStore
+
+        store_path = self.root / ".symphonz" / "logs" / "attempts.sqlite3"
+        stores = [AttemptStore(store_path), AttemptStore(store_path)]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda store: store.consume("id-1", "todo", 1), stores))
+
+        self.assertEqual(sorted(results, key=lambda value: value is None), [0, None])
+
+    def test_attempt_limit_survives_eligibility_round_trip_in_same_state(self):
+        from dataclasses import replace
+        from symphonz.service.orchestrator import Orchestrator
+
+        self.workflow.config["agent"]["max_attempts"] = 1
+        self.workflow.config["tracker"]["required_labels"] = ["symphonz"]
+        issue = replace(self.issue(1), labels=["symphonz"])
+        linear = self.FakeLinear([issue])
+        codex = self.RecordingCodex(sleep_seconds=0)
+        orchestrator = Orchestrator(self.root, self.workflow, linear, codex)
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+        linear.issues[issue.id] = replace(issue, labels=[])
+        orchestrator.tick()
+        linear.issues[issue.id] = issue
+        orchestrator.tick()
+
+        self.assertEqual(len(codex.calls), 1)
+        self.assertEqual(orchestrator.state.snapshot()["blocked"][0]["error"], "attempt_limit_exceeded")
+
+    def test_linear_retry_refresh_failure_does_not_consume_codex_attempt(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        class FlakyRefreshLinear(self.FakeLinear):
+            def __init__(inner_self, issues):
+                super().__init__(issues)
+                inner_self.fail_refresh = False
+
+            def fetch_issues_by_ids(inner_self, ids):
+                if inner_self.fail_refresh:
+                    inner_self.fail_refresh = False
+                    raise RuntimeError("Linear unavailable")
+                return super().fetch_issues_by_ids(ids)
+
+        self.workflow.config["agent"]["max_attempts"] = 2
+        now = [0.0]
+        issue = self.issue(1)
+        linear = FlakyRefreshLinear([issue])
+        codex = self.RecordingCodex(fail_first=True, sleep_seconds=0)
+        orchestrator = Orchestrator(self.root, self.workflow, linear, codex, clock=lambda: now[0])
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+        linear.fail_refresh = True
+        now[0] = 10.0
+        orchestrator.tick()
+
+        retry = orchestrator.state.snapshot()["retrying"][0]
+        self.assertEqual(len(codex.calls), 1)
+        self.assertEqual(retry["attempt"], 1)
+        self.assertEqual(retry["tracker_retry_count"], 1)
+        self.assertTrue(any(event["type"] == "tracker_poll_failed" for event in orchestrator.state.snapshot()["events"]))
+
+        now[0] = retry["due_at"]
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+        self.assertEqual(len(codex.calls), 2)
 
     def test_reconciliation_cancels_terminal_run_and_removes_workspace(self):
         from dataclasses import replace

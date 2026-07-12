@@ -162,7 +162,6 @@ def prompt_value(input_func: Callable[[str], str], label: str, default: str) -> 
 
 def collect_install_config(
     project_root: Path,
-    runtime_mode: str,
     assume_yes: bool,
     input_func: Callable[[str], str] | None = None,
     *,
@@ -233,10 +232,9 @@ def collect_install_config(
     if not repo_url:
         raise RuntimeError("Git remote URL is required")
 
-    runtime_command = "symphonz-internal" if runtime_mode == "embedded" else "symphony"
     return InstallConfig(
-        runtime_mode=runtime_mode,
-        runtime_command=runtime_command,
+        runtime_mode="embedded",
+        runtime_command="symphonz-internal",
         linear_api_key_env=linear_api_key_env,
         linear_project_slug=linear_project_slug,
         git_provider=git_provider,
@@ -286,9 +284,7 @@ def linear_preflight(config: InstallConfig, environ: dict[str, str] | None = Non
 
 def install_project(
     project_root: Path | None = None,
-    runtime_mode: str = "embedded",
     assume_yes: bool = False,
-    skip_runtime_download: bool = False,
     skip_linear_preflight: bool = False,
     input_func: Callable[[str], str] | None = None,
     output_func: Callable[[str], None] | None = None,
@@ -298,7 +294,6 @@ def install_project(
     environ = config_values.get("environ")
     config = collect_install_config(
         root,
-        runtime_mode,
         assume_yes,
         input_func=input_func,
         **config_values,

@@ -15,7 +15,7 @@ Usage: install.sh [--prefix PATH] [--bin-dir PATH] [--source PATH] [--repo URL] 
 
 Installs symphonz to:
   CLI: first writable directory already in PATH, or PATH/bin when --prefix is set
-  Library: PATH/lib/symphonz
+  Library: PATH/current/lib/symphonz
 
 Examples:
   curl -fsSL https://raw.githubusercontent.com/ilordhalo/zhangjiahao_agi/main/install.sh | sh
@@ -194,7 +194,7 @@ if path_has_dir "$BIN_DIR"; then
   cat <<'EOF'
 Try:
   symphonz version
-  symphonz install --runtime global
+  symphonz install
 EOF
 else
   cat <<EOF
@@ -203,6 +203,6 @@ Add this to your shell profile if it is not already in PATH:
 
 Try:
   ${BIN_DIR}/symphonz version
-  ${BIN_DIR}/symphonz install --runtime global
+  ${BIN_DIR}/symphonz install
 EOF
 fi

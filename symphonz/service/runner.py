@@ -5,6 +5,7 @@ import os
 import time
 
 from symphonz.service.codex_app_server import CodexAppServer
+from symphonz.service.attempt_store import AttemptStore
 from symphonz.service.dashboard import DashboardServer
 from symphonz.service.dynamic_tools import execute_linear_graphql
 from symphonz.service.event_log import JsonlEventLog
@@ -35,7 +36,14 @@ def run_service(
         turn_timeout_ms=int(codex_config.get("turn_timeout_ms", 3_600_000)),
         stall_timeout_ms=int(codex_config.get("stall_timeout_ms", 300_000)),
     )
-    orchestrator = Orchestrator(project_root, workflow, linear, codex, state=state)
+    orchestrator = Orchestrator(
+        project_root,
+        workflow,
+        linear,
+        codex,
+        state=state,
+        attempt_store=AttemptStore(logs_root / "attempts.sqlite3"),
+    )
     orchestrator.startup_cleanup()
 
     dashboard = None
