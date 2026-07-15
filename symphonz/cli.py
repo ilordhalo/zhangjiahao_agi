@@ -11,9 +11,15 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     install = subcommands.add_parser("install", help="Install symphonz into the current project")
-    install.add_argument("--runtime", choices=["embedded", "global"], default="embedded")
     install.add_argument("--yes", action="store_true", help="Accept detected defaults without interactive prompts")
-    install.add_argument("--skip-runtime-download", action="store_true", help="Create embedded runtime layout without downloading Symphony")
+    install.add_argument("--skip-linear-preflight", action="store_true", help="Skip the Linear connectivity check")
+    install.add_argument("--linear-project", help="Linear project slug or ID")
+    install.add_argument("--linear-api-key-env", help="Name of the environment variable containing the Linear API key")
+    install.add_argument("--git-provider", choices=["github", "gitlab"])
+    install.add_argument("--repo-url", help="Git remote URL cloned into issue workspaces")
+    install.add_argument("--base-branch", help="Base branch for issue branches")
+    install.add_argument("--target-branch", help="Pull/merge request target branch")
+    install.add_argument("--gitlab-base-url", help="GitLab instance URL")
 
     run = subcommands.add_parser("run", help="Run the installed Symphony workflow")
     run.add_argument("--print-command", action="store_true", help="Print the runtime command instead of executing it")
@@ -54,7 +60,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "install":
         from symphonz.install import install_project
 
-        install_project(runtime_mode=args.runtime, assume_yes=args.yes, skip_runtime_download=args.skip_runtime_download)
+        install_project(
+            assume_yes=args.yes,
+            skip_linear_preflight=args.skip_linear_preflight,
+            linear_project_slug=args.linear_project,
+            linear_api_key_env=args.linear_api_key_env,
+            git_provider=args.git_provider,
+            repo_url=args.repo_url,
+            base_branch=args.base_branch,
+            mr_target=args.target_branch,
+            gitlab_base_url=args.gitlab_base_url,
+        )
         return 0
 
     if args.command == "run":

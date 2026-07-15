@@ -5,7 +5,10 @@ import os
 import time
 
 from symphonz.service.codex_app_server import CodexAppServer
+from symphonz.service.attempt_store import AttemptStore
 from symphonz.service.dashboard import DashboardServer
+from symphonz.service.dynamic_tools import execute_linear_graphql
+from symphonz.service.event_log import JsonlEventLog
 from symphonz.service.linear import LinearClient
 from symphonz.service.models import RuntimeState
 from symphonz.service.orchestrator import Orchestrator
@@ -21,12 +24,27 @@ def run_service(
 ) -> int:
     workflow = load_workflow(workflow_path)
     logs_root.mkdir(parents=True, exist_ok=True)
-    state = RuntimeState()
+    state = RuntimeState(event_sink=JsonlEventLog(logs_root / "runtime.jsonl").write)
     state.add_event("service_started", "Symphonz service started")
 
     linear = build_linear_client(workflow.config)
-    codex = CodexAppServer(command=workflow.config.get("codex", {}).get("command", "codex app-server"))
-    orchestrator = Orchestrator(project_root, workflow, linear, codex, state=state)
+    codex_config = workflow.config.get("codex", {})
+    codex = CodexAppServer(
+        command=codex_config.get("command", "codex app-server"),
+        dynamic_tool_executor=lambda _name, arguments: execute_linear_graphql(linear, arguments),
+        read_timeout_ms=int(codex_config.get("read_timeout_ms", 5000)),
+        turn_timeout_ms=int(codex_config.get("turn_timeout_ms", 3_600_000)),
+        stall_timeout_ms=int(codex_config.get("stall_timeout_ms", 300_000)),
+    )
+    orchestrator = Orchestrator(
+        project_root,
+        workflow,
+        linear,
+        codex,
+        state=state,
+        attempt_store=AttemptStore(logs_root / "attempts.sqlite3"),
+    )
+    orchestrator.startup_cleanup()
 
     dashboard = None
     if port is not None:
@@ -42,12 +60,13 @@ def run_service(
         interval_ms = int(workflow.config.get("polling", {}).get("interval_ms", 5000))
         print("Symphonz service running. Press Ctrl+C to stop.")
         while True:
-            orchestrator.poll_once()
+            orchestrator.tick()
             time.sleep(max(interval_ms, 1000) / 1000)
     except KeyboardInterrupt:
         state.add_event("service_stopped", "Symphonz service stopped")
         return 0
     finally:
+        orchestrator.shutdown()
         if dashboard is not None:
             dashboard.stop()
 

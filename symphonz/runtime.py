@@ -7,36 +7,11 @@ import shlex
 from symphonz.install import read_config
 
 
-INTERNAL_RUNTIME_COMMAND = "symphonz-internal"
-
-
-def install_embedded_runtime(project_root: Path, skip_download: bool) -> None:
-    """Compatibility no-op for older callers.
-
-    The runtime is now part of the installed `symphonz` package. Project installs
-    only write config, workflow, workspace, and logs directories.
-    """
-
-    return None
-
-
 def build_run_command(project_root: Path, port: int | None = None) -> tuple[list[str], dict[str, str]]:
     config = read_config(project_root / ".symphonz" / "config.toml")
-    runtime_command = config["runtime"]["command"]
-
-    if runtime_command == INTERNAL_RUNTIME_COMMAND:
-        command = ["symphonz", "service", ".symphonz/WORKFLOW.md", "--logs-root", config["logs"]["root"]]
-        if port is not None:
-            command.extend(["--port", str(port)])
-    else:
-        command = [
-            runtime_command,
-            ".symphonz/WORKFLOW.md",
-            "--logs-root",
-            config["logs"]["root"],
-        ]
-        if port is not None:
-            command.extend(["--port", str(port)])
+    command = ["symphonz", "service", ".symphonz/WORKFLOW.md", "--logs-root", config["logs"]["root"]]
+    if port is not None:
+        command.extend(["--port", str(port)])
 
     env = {
         "SYMPHONZ_REPO_URL": config["git"]["remote"],
@@ -53,18 +28,13 @@ def run_installed(print_command: bool = False, port: int | None = None, project_
     root = project_root or Path.cwd()
     command, env_updates = build_run_command(root, port=port)
     if print_command:
-        print(" ".join(shlex.quote(part) for part in command))
+        assignments = [f"{key}={shlex.quote(value)}" for key, value in env_updates.items()]
+        print(" ".join([*assignments, *(shlex.quote(part) for part in command)]))
         return 0
 
-    config = read_config(root / ".symphonz" / "config.toml")
-    if config["runtime"]["command"] != INTERNAL_RUNTIME_COMMAND:
-        import subprocess
-
-        env = os.environ.copy()
-        env.update(env_updates)
-        return subprocess.call(command, cwd=root, env=env)
-
     from symphonz.service.runner import run_service
+
+    config = read_config(root / ".symphonz" / "config.toml")
 
     env = os.environ.copy()
     env.update(env_updates)

@@ -15,7 +15,7 @@ Usage: install.sh [--prefix PATH] [--bin-dir PATH] [--source PATH] [--repo URL] 
 
 Installs symphonz to:
   CLI: first writable directory already in PATH, or PATH/bin when --prefix is set
-  Library: PATH/lib/symphonz
+  Library: PATH/current/lib/symphonz
 
 Examples:
   curl -fsSL https://raw.githubusercontent.com/ilordhalo/zhangjiahao_agi/main/install.sh | sh
@@ -104,7 +104,9 @@ done
 
 mkdir -p "$(dirname "$PREFIX")"
 PREFIX=$(cd "$(dirname "$PREFIX")" && pwd -P)/$(basename "$PREFIX")
-LIB_DIR="${PREFIX}/lib"
+RELEASES_DIR="${PREFIX}/releases"
+CURRENT_LINK="${PREFIX}/current"
+LIB_DIR="${CURRENT_LINK}/lib"
 
 if [ -z "$BIN_DIR" ]; then
   if [ "$PREFIX_SET" -eq 1 ]; then
@@ -118,10 +120,18 @@ if [ -z "$BIN_DIR" ]; then
 fi
 
 TMP_DIR=""
+STAGING_DIR=""
+POINTER_TMP=""
 
 cleanup() {
   if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
     rm -rf "$TMP_DIR"
+  fi
+  if [ -n "$STAGING_DIR" ] && [ -d "$STAGING_DIR" ]; then
+    rm -rf "$STAGING_DIR"
+  fi
+  if [ -n "$POINTER_TMP" ] && [ -L "$POINTER_TMP" ]; then
+    rm -f "$POINTER_TMP"
   fi
 }
 trap cleanup EXIT
@@ -147,21 +157,31 @@ if [ ! -f "${SOURCE_DIR}/bin/symphonz" ] || [ ! -d "${SOURCE_DIR}/symphonz" ] ||
   exit 1
 fi
 
-mkdir -p "$BIN_DIR" "$LIB_DIR"
+mkdir -p "$BIN_DIR" "$RELEASES_DIR"
 BIN_DIR=$(cd "$BIN_DIR" && pwd -P)
-rm -rf "${LIB_DIR}/symphonz"
-cp -R "${SOURCE_DIR}/symphonz" "${LIB_DIR}/symphonz"
-cp "${SOURCE_DIR}/WORKFLOW.md" "${LIB_DIR}/WORKFLOW.md"
+STAGING_DIR=$(mktemp -d "${PREFIX}/.symphonz-install.XXXXXX")
+mkdir -p "${STAGING_DIR}/release/lib" "${STAGING_DIR}/bin"
+cp -R "${SOURCE_DIR}/symphonz" "${STAGING_DIR}/release/lib/symphonz"
+cp "${SOURCE_DIR}/WORKFLOW.md" "${STAGING_DIR}/release/lib/WORKFLOW.md"
 
 LIB_DIR_ESCAPED=$(escape_double_quoted "$LIB_DIR")
-cat > "${BIN_DIR}/symphonz" <<EOF
+cat > "${STAGING_DIR}/bin/symphonz" <<EOF
 #!/bin/sh
 SYMPHONZ_LIB_DIR="${LIB_DIR_ESCAPED}"
 PYTHONPATH="\${SYMPHONZ_LIB_DIR}\${PYTHONPATH:+:\$PYTHONPATH}"
 export PYTHONPATH
 exec python3 -c 'from symphonz.cli import main; raise SystemExit(main())' "\$@"
 EOF
-chmod +x "${BIN_DIR}/symphonz"
+chmod +x "${STAGING_DIR}/bin/symphonz"
+
+RELEASE_DIR="${RELEASES_DIR}/$(date +%Y%m%d%H%M%S)-$$"
+mv "${STAGING_DIR}/release" "$RELEASE_DIR"
+ln -s "$RELEASE_DIR" "${STAGING_DIR}/current"
+POINTER_TMP="${PREFIX}/current.$$"
+mv "${STAGING_DIR}/current" "$POINTER_TMP"
+python3 -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' "$POINTER_TMP" "$CURRENT_LINK"
+POINTER_TMP=""
+mv "${STAGING_DIR}/bin/symphonz" "${BIN_DIR}/symphonz"
 
 cat <<EOF
 symphonz installed.
@@ -174,7 +194,7 @@ if path_has_dir "$BIN_DIR"; then
   cat <<'EOF'
 Try:
   symphonz version
-  symphonz install --runtime global
+  symphonz install
 EOF
 else
   cat <<EOF
@@ -183,6 +203,6 @@ Add this to your shell profile if it is not already in PATH:
 
 Try:
   ${BIN_DIR}/symphonz version
-  ${BIN_DIR}/symphonz install --runtime global
+  ${BIN_DIR}/symphonz install
 EOF
 fi

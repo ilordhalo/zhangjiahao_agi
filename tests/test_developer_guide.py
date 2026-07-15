@@ -57,12 +57,12 @@ class DeveloperGuideTests(unittest.TestCase):
             "turn/start",
             "Human Review",
             "GitHub / GitLab",
-            "同步逐个执行",
+            "有界并发执行",
             "进程内存",
             "八个当前边界",
             "Human Review 默认不在 active_states",
-            "不具备自动重试",
-            "不会写入日志文件",
+            "有预算的指数退避",
+            "runtime.jsonl",
         ]:
             self.assertIn(phrase, html)
 
@@ -120,7 +120,7 @@ class DeveloperGuideTests(unittest.TestCase):
             "Prompt 层",
             "Linear 是外部控制面",
             "一个 Issue 只维护一个 Workpad",
-            "Done 是发布命令，不是终态",
+            "Ready to Publish 是发布命令，Done 是终态",
         ]:
             self.assertIn(phrase, html)
 
@@ -133,7 +133,7 @@ class DeveloperGuideTests(unittest.TestCase):
             html,
             re.DOTALL,
         )
-        self.assertEqual([name for name, _ in turns], ["todo", "done", "rework", "merging"])
+        self.assertEqual([name for name, _ in turns], ["todo", "ready-to-publish", "rework", "merging"])
         for _, body in turns:
             self.assertIn('class="prompt-block"', body)
             self.assertIn('class="linear-sync"', body)
@@ -148,7 +148,7 @@ class DeveloperGuideTests(unittest.TestCase):
         self.assertIn("Rapid retry after 3DS return uses shared guard", rework_body)
         self.assertEqual(html.count('data-simulation-actor="human"'), 3)
         self.assertIn("最简四轮路径", html)
-        self.assertIn("在下一次 poll 前改为 Done", html)
+        self.assertIn("在下一次 poll 前改为 Ready to Publish", html)
         self.assertIn("实际运行可能出现额外的 In Progress turn", html)
 
         prompt_blocks = re.findall(r'<pre class="prompt-block">(.*?)</pre>', html, re.DOTALL)
@@ -170,9 +170,9 @@ class DeveloperGuideTests(unittest.TestCase):
             "PAY-214",
             "symphonz/PAY-214-prevent-duplicate-payment",
             "## Symphonz Workpad",
-            "Todo → In Progress → Done → Human Review → Rework → Human Review → Merging → Closed",
+            "Todo → In Progress → Ready to Publish → Human Review → Rework → Human Review → Merging → Done",
             "离线真实结构模拟，不访问 Linear 或 GitHub，不产生外部写操作",
-            "每一轮都会创建新的 Codex thread 和 turn",
+            "复用该 thread 运行最多",
             "Human Review 不触发 Codex",
         ]:
             self.assertIn(phrase, html)

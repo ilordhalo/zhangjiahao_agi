@@ -1,7 +1,9 @@
 # Symphonz Install Design
 
 Date: 2026-07-08
-Status: approved for initial documentation pass
+Status: superseded by the built-in-only runtime shipped in Symphonz 0.3.1
+
+> Historical document: external embedded/global Symphony modes described below are no longer supported. Current installs and legacy configurations always run the built-in Symphonz service.
 
 ## Goal
 

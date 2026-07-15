@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import subprocess
 
@@ -161,45 +162,79 @@ def prompt_value(input_func: Callable[[str], str], label: str, default: str) -> 
 
 def collect_install_config(
     project_root: Path,
-    runtime_mode: str,
     assume_yes: bool,
     input_func: Callable[[str], str] | None = None,
+    *,
+    linear_project_slug: str | None = None,
+    linear_api_key_env: str | None = None,
+    git_provider: str | None = None,
+    repo_url: str | None = None,
+    base_branch: str | None = None,
+    mr_target: str | None = None,
+    gitlab_base_url: str | None = None,
+    environ: dict[str, str] | None = None,
 ) -> InstallConfig:
     input_func = input_func or input
+    environ = os.environ if environ is None else environ
     defaults = detect_git_defaults(project_root)
 
+    supplied = {
+        "linear_api_key_env": linear_api_key_env or environ.get("SYMPHONZ_LINEAR_API_KEY_ENV", ""),
+        "linear_project_slug": linear_project_slug or environ.get("SYMPHONZ_LINEAR_PROJECT", ""),
+        "git_provider": git_provider or environ.get("SYMPHONZ_GIT_PROVIDER", ""),
+        "repo_url": repo_url or environ.get("SYMPHONZ_REPO_URL", ""),
+        "base_branch": base_branch or environ.get("SYMPHONZ_BASE_BRANCH", ""),
+        "mr_target": mr_target or environ.get("SYMPHONZ_TARGET_BRANCH", ""),
+        "gitlab_base_url": gitlab_base_url or environ.get("SYMPHONZ_GITLAB_BASE_URL", ""),
+    }
+
     if assume_yes:
-        linear_api_key_env = "LINEAR_API_KEY"
-        linear_project_slug = ""
-        git_provider = normalize_git_provider(defaults["git_provider"])
-        repo_url = defaults["repo_url"]
-        base_branch = defaults["base_branch"]
-        mr_target = defaults["mr_target"]
-        gitlab_base_url = defaults["gitlab_base_url"] if git_provider == "gitlab" else ""
-    else:
-        linear_api_key_env = prompt_value(input_func, "Linear API key environment variable", "LINEAR_API_KEY")
-        linear_project_slug = prompt_value(input_func, "Linear project slug or ID", "")
-        git_provider = normalize_git_provider(
-            prompt_value(input_func, "Git provider (github/gitlab)", defaults["git_provider"])
-        )
-        repo_url = prompt_value(input_func, "Git remote URL", defaults["repo_url"])
-        base_branch = prompt_value(input_func, "Base branch", defaults["base_branch"])
-        mr_target = prompt_value(input_func, "Merge request target branch", defaults["mr_target"])
+        linear_api_key_env = supplied["linear_api_key_env"] or "LINEAR_API_KEY"
+        linear_project_slug = supplied["linear_project_slug"]
+        git_provider = normalize_git_provider(supplied["git_provider"] or defaults["git_provider"])
+        repo_url = supplied["repo_url"] or defaults["repo_url"]
+        base_branch = supplied["base_branch"] or defaults["base_branch"]
+        mr_target = supplied["mr_target"] or base_branch
         gitlab_base_url = (
-            prompt_value(input_func, "GitLab base URL", defaults["gitlab_base_url"])
+            supplied["gitlab_base_url"] or defaults["gitlab_base_url"]
+            if git_provider == "gitlab"
+            else ""
+        )
+    else:
+        linear_api_key_env = supplied["linear_api_key_env"] or prompt_value(
+            input_func, "Linear API key environment variable", "LINEAR_API_KEY"
+        )
+        linear_project_slug = supplied["linear_project_slug"] or prompt_value(
+            input_func, "Linear project slug or ID", ""
+        )
+        git_provider = normalize_git_provider(
+            supplied["git_provider"]
+            or prompt_value(input_func, "Git provider (github/gitlab)", defaults["git_provider"])
+        )
+        repo_url = supplied["repo_url"] or prompt_value(input_func, "Git remote URL", defaults["repo_url"])
+        base_branch = supplied["base_branch"] or prompt_value(input_func, "Base branch", defaults["base_branch"])
+        mr_target = supplied["mr_target"] or prompt_value(
+            input_func, "Merge request target branch", defaults["mr_target"]
+        )
+        gitlab_base_url = (
+            supplied["gitlab_base_url"]
+            or prompt_value(input_func, "GitLab base URL", defaults["gitlab_base_url"])
             if git_provider == "gitlab"
             else ""
         )
 
     if not linear_project_slug:
+        if assume_yes:
+            raise RuntimeError(
+                "Linear project slug or ID is required; pass --linear-project or SYMPHONZ_LINEAR_PROJECT"
+            )
         raise RuntimeError("Linear project slug or ID is required")
     if not repo_url:
         raise RuntimeError("Git remote URL is required")
 
-    runtime_command = "symphonz-internal" if runtime_mode == "embedded" else "symphony"
     return InstallConfig(
-        runtime_mode=runtime_mode,
-        runtime_command=runtime_command,
+        runtime_mode="embedded",
+        runtime_command="symphonz-internal",
         linear_api_key_env=linear_api_key_env,
         linear_project_slug=linear_project_slug,
         git_provider=git_provider,
@@ -228,15 +263,43 @@ def create_base_layout(project_root: Path) -> None:
         (project_root / relative).mkdir(parents=True, exist_ok=True)
 
 
+def linear_preflight(config: InstallConfig, environ: dict[str, str] | None = None) -> str:
+    environ = os.environ if environ is None else environ
+    api_key = environ.get(config.linear_api_key_env, "").strip()
+    if not api_key:
+        return (
+            "Linear preflight skipped because the API key is not set. Before running the service:\n"
+            f'  export {config.linear_api_key_env}="<linear-api-key>"'
+        )
+
+    from symphonz.service.linear import LINEAR_GRAPHQL_URL, LinearClient
+
+    endpoint = environ.get("SYMPHONZ_LINEAR_ENDPOINT", LINEAR_GRAPHQL_URL)
+    client = LinearClient(api_key=api_key, project_slug=config.linear_project_slug, endpoint=endpoint)
+    body = client.graphql("query SymphonzInstallPreflight { viewer { id } }")
+    if body.get("errors") or not body.get("data", {}).get("viewer", {}).get("id"):
+        raise RuntimeError(f"Linear preflight failed: {body.get('errors') or 'viewer was not returned'}")
+    return "Linear connection verified."
+
+
 def install_project(
     project_root: Path | None = None,
-    runtime_mode: str = "embedded",
     assume_yes: bool = False,
-    skip_runtime_download: bool = False,
+    skip_linear_preflight: bool = False,
     input_func: Callable[[str], str] | None = None,
+    output_func: Callable[[str], None] | None = None,
+    **config_values: object,
 ) -> Path:
     root = project_root or Path.cwd()
-    config = collect_install_config(root, runtime_mode, assume_yes, input_func=input_func)
+    environ = config_values.get("environ")
+    config = collect_install_config(
+        root,
+        assume_yes,
+        input_func=input_func,
+        **config_values,
+    )
+    if not skip_linear_preflight:
+        (output_func or print)(linear_preflight(config, environ=environ))
     create_base_layout(root)
     write_config(root / ".symphonz" / "config.toml", config)
 
