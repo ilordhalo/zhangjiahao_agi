@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from html.parser import HTMLParser
 from http.client import HTTPConnection
+from io import BytesIO
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -131,6 +132,26 @@ class DashboardHandlerTests(unittest.TestCase):
                 unknown = self._request(method, "/api/not-a-route", authenticated=False)
                 self.assertEqual(unknown[0:2], ("json", 401))
                 self.assertEqual(unknown[3], known[3])
+
+    def test_head_responses_send_headers_without_writing_a_body(self):
+        handler_class = self.server.httpd.RequestHandlerClass
+        for authenticated, expected_status in ((True, 405), (False, 401)):
+            with self.subTest(authenticated=authenticated):
+                handler = handler_class.__new__(handler_class)
+                handler.path = "/api/tasks"
+                handler.command = "HEAD"
+                handler.headers = {"Cookie": "session=valid"} if authenticated else {}
+                handler.wfile = BytesIO()
+                response = {"headers": {}}
+                handler.send_response = lambda status: response.update(status=status)
+                handler.send_header = lambda name, value: response["headers"].update({name: value})
+                handler.end_headers = lambda: None
+
+                handler.do_HEAD()
+
+                self.assertEqual(response["status"], expected_status)
+                self.assertGreater(int(response["headers"]["Content-Length"]), 0)
+                self.assertEqual(handler.wfile.getvalue(), b"")
 
 
 class DashboardStartupTests(unittest.TestCase):

@@ -583,7 +583,8 @@ class DashboardServer:
                         self.send_header(name, value)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                if self.command != "HEAD":
+                    self.wfile.write(body)
 
             def _respond_html(
                 self,
@@ -602,7 +603,8 @@ class DashboardServer:
                         self.send_header(name, value)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                if self.command != "HEAD":
+                    self.wfile.write(body)
 
             def _respond_report(self, page: str) -> None:
                 body = page.encode("utf-8")
@@ -612,7 +614,8 @@ class DashboardServer:
                 self.send_header("Content-Security-Policy", _REPORT_CSP)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                if self.command != "HEAD":
+                    self.wfile.write(body)
 
             def _common_headers(self) -> None:
                 self.send_header("Cache-Control", "no-store")
