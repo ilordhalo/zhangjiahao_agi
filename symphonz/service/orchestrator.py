@@ -509,6 +509,7 @@ class Orchestrator:
     def _release(self, issue_id: str) -> None:
         with self.state.lock:
             self.state.claimed.discard(issue_id)
+            self.state.blocked.pop(issue_id, None)
             self.state.retrying.pop(issue_id, None)
             self._retry_issues.pop(issue_id, None)
             self._issues.pop(issue_id, None)

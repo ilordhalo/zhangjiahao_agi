@@ -2512,7 +2512,21 @@ class OrchestratorHardeningTests(unittest.TestCase):
         self.assertEqual(cancelled["cancellation_reason"], reason)
         self.assertIsNotNone(cancelled["completed_at"])
         self.assertIsNotNone(cancelled["cancelled_at"])
-        self.assertEqual(orchestrator.state.snapshot()["counts"]["claimed"], 0)
+        snapshot = orchestrator.state.snapshot()
+        self.assertEqual(snapshot["counts"]["claimed"], 0)
+        self.assertEqual(snapshot["counts"]["blocked"], 0)
+        cancellation_events = sum(event["type"] == "issue_cancelled" for event in snapshot["events"])
+
+        orchestrator.tick()
+
+        repeated = store.get_task(issue.identifier)
+        repeated_snapshot = orchestrator.state.snapshot()
+        self.assertEqual(repeated["cancelled_at"], cancelled["cancelled_at"])
+        self.assertEqual(repeated_snapshot["counts"]["blocked"], 0)
+        self.assertEqual(
+            sum(event["type"] == "issue_cancelled" for event in repeated_snapshot["events"]),
+            cancellation_events,
+        )
         return cancelled
 
     @staticmethod
