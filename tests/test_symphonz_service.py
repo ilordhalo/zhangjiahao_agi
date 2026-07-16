@@ -3731,6 +3731,152 @@ class RunnerCompositionTests(unittest.TestCase):
         self.assertEqual(runtime_types.count("service_started"), 1)
         self.assertEqual(runtime_types.count("service_stopped"), 1)
 
+    def test_dashboard_start_failure_preserves_primary_through_all_cleanup_failures(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        startup_error = RuntimeError("dashboard start failed")
+        shutdown_error = RuntimeError("orchestrator shutdown failed")
+        stop_error = RuntimeError("dashboard stop failed")
+
+        with self.assertRaises(RuntimeError) as raised:
+            self._run_lifecycle(
+                dashboard_start_error=startup_error,
+                orchestrator_shutdown_error=shutdown_error,
+                dashboard_stop_error=stop_error,
+            )
+
+        events = list(
+            reversed(RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"])
+        )
+        cleanup_events = [event for event in events if event["type"] == "service_cleanup_failed"]
+        self.assertIs(raised.exception, startup_error)
+        self.assertEqual(
+            self.lifecycle_order,
+            ["orchestrator.startup_cleanup", "dashboard.start", "orchestrator.shutdown", "dashboard.stop"],
+        )
+        self.assertEqual(self.lifecycle_orchestrator.shutdown_calls, 1)
+        self.dashboard.stop.assert_called_once_with()
+        self.assertEqual(
+            [event["data"]["operation"] for event in cleanup_events],
+            ["orchestrator.shutdown", "dashboard.stop"],
+        )
+        self.assertEqual(
+            [(event["data"]["error_type"], event["data"]["error"]) for event in cleanup_events],
+            [
+                ("RuntimeError", "orchestrator shutdown failed"),
+                ("RuntimeError", "dashboard stop failed"),
+            ],
+        )
+        self.assertEqual(events[-1]["type"], "service_stopped")
+
+    def test_poll_once_failure_preserves_primary_when_shutdown_fails(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        poll_error = ValueError("poll once failed")
+        shutdown_error = RuntimeError("shutdown after poll failed")
+
+        with self.assertRaises(ValueError) as raised:
+            self._run_lifecycle(
+                port=None,
+                poll_once_error=poll_error,
+                orchestrator_shutdown_error=shutdown_error,
+            )
+
+        events = list(
+            reversed(RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"])
+        )
+        self.assertIs(raised.exception, poll_error)
+        self.assertEqual(
+            self.lifecycle_order,
+            ["orchestrator.startup_cleanup", "orchestrator.poll_once", "orchestrator.shutdown"],
+        )
+        self.assertEqual(self.lifecycle_orchestrator.shutdown_calls, 1)
+        self.assertEqual(
+            [event["data"]["operation"] for event in events if event["type"] == "service_cleanup_failed"],
+            ["orchestrator.shutdown"],
+        )
+        self.assertEqual(events[-1]["type"], "service_stopped")
+
+    def test_successful_once_raises_first_cleanup_failure_after_later_cleanup(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        shutdown_error = RuntimeError("shutdown failed first")
+        stop_error = ValueError("stop failed second")
+
+        with self.assertRaises(RuntimeError) as raised:
+            self._run_lifecycle(
+                orchestrator_shutdown_error=shutdown_error,
+                dashboard_stop_error=stop_error,
+            )
+
+        events = list(
+            reversed(RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"])
+        )
+        self.assertIs(raised.exception, shutdown_error)
+        self.assertEqual(
+            self.lifecycle_order,
+            [
+                "orchestrator.startup_cleanup",
+                "dashboard.start",
+                "orchestrator.poll_once",
+                "orchestrator.shutdown",
+                "dashboard.stop",
+            ],
+        )
+        self.assertEqual(
+            [event["data"]["operation"] for event in events if event["type"] == "service_cleanup_failed"],
+            ["orchestrator.shutdown", "dashboard.stop"],
+        )
+        self.assertEqual(events[-1]["type"], "service_stopped")
+
+    def test_keyboard_interrupt_returns_zero_only_after_cleanup(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        result = self._run_lifecycle(once=False, tick_error=KeyboardInterrupt())
+
+        events = list(
+            reversed(RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"])
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            self.lifecycle_order,
+            [
+                "orchestrator.startup_cleanup",
+                "dashboard.start",
+                "orchestrator.tick",
+                "orchestrator.shutdown",
+                "dashboard.stop",
+            ],
+        )
+        self.assertEqual(self.lifecycle_orchestrator.shutdown_calls, 1)
+        self.dashboard.stop.assert_called_once_with()
+        self.assertEqual(events[-1]["type"], "service_stopped")
+
+    def test_successful_once_returns_after_orchestrator_owned_publisher_cleanup(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        result = self._run_lifecycle(own_publisher=True)
+
+        events = list(
+            reversed(RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"])
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            self.lifecycle_order,
+            [
+                "orchestrator.startup_cleanup",
+                "dashboard.start",
+                "orchestrator.poll_once",
+                "orchestrator.shutdown",
+                "publisher.close",
+                "dashboard.stop",
+            ],
+        )
+        self.assertEqual(self.lifecycle_orchestrator.shutdown_calls, 1)
+        self.publisher.close.assert_called_once_with()
+        self.dashboard.stop.assert_called_once_with()
+        self.assertEqual(events[-1]["type"], "service_stopped")
+
     def _write_workflow(self):
         path = self.root / "WORKFLOW.md"
         path.write_text(
@@ -3812,6 +3958,87 @@ Work on {{ issue.identifier }}.
         finally:
             self.stdout = output.getvalue()
             self.stderr = errors.getvalue()
+
+    def _run_lifecycle(
+        self,
+        *,
+        once=True,
+        port=4000,
+        dashboard_start_error=None,
+        poll_once_error=None,
+        tick_error=None,
+        orchestrator_shutdown_error=None,
+        dashboard_stop_error=None,
+        own_publisher=False,
+    ):
+        from symphonz.service import runner
+
+        if port is not None:
+            self._write_auth()
+        self.lifecycle_order = []
+        self.publisher = mock.Mock()
+        order = self.lifecycle_order
+        publisher = self.publisher
+
+        class FakeOrchestrator:
+            def __init__(inner_self, *args, **kwargs):
+                inner_self.shutdown_calls = 0
+                inner_self.publisher = publisher if own_publisher else None
+                self.lifecycle_orchestrator = inner_self
+
+            def startup_cleanup(inner_self):
+                order.append("orchestrator.startup_cleanup")
+
+            def poll_once(inner_self):
+                order.append("orchestrator.poll_once")
+                if poll_once_error is not None:
+                    raise poll_once_error
+
+            def tick(inner_self):
+                order.append("orchestrator.tick")
+                if tick_error is not None:
+                    raise tick_error
+
+            def shutdown(inner_self):
+                inner_self.shutdown_calls += 1
+                order.append("orchestrator.shutdown")
+                if inner_self.publisher is not None:
+                    order.append("publisher.close")
+                    inner_self.publisher.close()
+                if orchestrator_shutdown_error is not None:
+                    raise orchestrator_shutdown_error
+
+        self.dashboard = mock.Mock()
+        self.dashboard.port = port
+
+        def start_dashboard():
+            order.append("dashboard.start")
+            if dashboard_start_error is not None:
+                raise dashboard_start_error
+
+        def stop_dashboard():
+            order.append("dashboard.stop")
+            if dashboard_stop_error is not None:
+                raise dashboard_stop_error
+
+        self.dashboard.start.side_effect = start_dashboard
+        self.dashboard.stop.side_effect = stop_dashboard
+        workflow_path = self._write_workflow()
+        with (
+            mock.patch("symphonz.service.runner.build_linear_client", return_value=mock.Mock()),
+            mock.patch("symphonz.service.runner.CodexAppServer"),
+            mock.patch("symphonz.service.runner.Orchestrator", FakeOrchestrator),
+            mock.patch("symphonz.service.runner.DashboardServer", return_value=self.dashboard),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
+            return runner.run_service(
+                project_root=self.root,
+                workflow_path=workflow_path,
+                logs_root=self.logs_root,
+                port=port,
+                once=once,
+            )
 
     @staticmethod
     def _report_payload(issue):

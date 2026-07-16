@@ -180,6 +180,8 @@ def run_service(
 
     dashboard = None
     state.add_event("service_started", "Symphonz service started")
+    result = None
+    primary_error = None
     try:
         orchestrator.startup_cleanup()
         if dashboard_configuration is not None:
@@ -204,23 +206,46 @@ def run_service(
 
         if once:
             orchestrator.poll_once()
-            return 0
-        interval_ms = int(workflow.config.get("polling", {}).get("interval_ms", 5000))
-        print("Symphonz service running. Press Ctrl+C to stop.")
-        while True:
-            orchestrator.tick()
-            time.sleep(max(interval_ms, 1000) / 1000)
+            result = 0
+        else:
+            interval_ms = int(workflow.config.get("polling", {}).get("interval_ms", 5000))
+            print("Symphonz service running. Press Ctrl+C to stop.")
+            while True:
+                orchestrator.tick()
+                time.sleep(max(interval_ms, 1000) / 1000)
     except KeyboardInterrupt:
-        return 0
-    finally:
+        result = 0
+    except BaseException as error:
+        primary_error = error
+
+    cleanup_error = None
+    cleanup_steps = [("orchestrator.shutdown", orchestrator.shutdown)]
+    if dashboard is not None:
+        cleanup_steps.append(("dashboard.stop", dashboard.stop))
+    for operation, cleanup in cleanup_steps:
         try:
-            orchestrator.shutdown()
-        finally:
-            try:
-                if dashboard is not None:
-                    dashboard.stop()
-            finally:
-                state.add_event("service_stopped", "Symphonz service stopped")
+            cleanup()
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+            state.add_event(
+                "service_cleanup_failed",
+                f"Service cleanup failed during {operation}: {error}",
+                severity="error",
+                category="service",
+                stage="cleanup",
+                operation=operation,
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+    state.add_event("service_stopped", "Symphonz service stopped")
+
+    if primary_error is not None:
+        raise primary_error.with_traceback(primary_error.__traceback__)
+    if cleanup_error is not None:
+        raise cleanup_error.with_traceback(cleanup_error.__traceback__)
+    assert result is not None
+    return result
 
 
 def build_linear_client(config: dict) -> LinearClient:
