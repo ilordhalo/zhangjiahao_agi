@@ -7,6 +7,7 @@ from pathlib import Path
 import json
 import os
 import queue
+import select
 import signal
 import subprocess
 import threading
@@ -113,9 +114,10 @@ class CodexAppServer:
             bufsize=1,
             start_new_session=(os.name == "posix"),
         )
+        process_group_id = _capture_process_group(process)
         stream = _JsonLineStream(process.stdout)
         stderr_lines: queue.Queue[object] = queue.Queue()
-        _start_line_reader(process.stderr, stderr_lines, decode_json=False)
+        stderr_closed = _start_line_reader(process.stderr, stderr_lines, decode_json=False)
         graceful_shutdown = False
         try:
             self._request(
@@ -213,7 +215,12 @@ class CodexAppServer:
             graceful_shutdown = True
             raise
         finally:
-            _stop_process(process, graceful=graceful_shutdown)
+            _stop_process(
+                process,
+                graceful=graceful_shutdown,
+                process_group_id=process_group_id,
+                pipe_closed=(stream.closed, stderr_closed),
+            )
 
     def _request(
         self,
@@ -337,7 +344,10 @@ class CodexAppServer:
                 process,
                 {"jsonrpc": "2.0", "id": message["id"], "result": {"decision": "decline"}},
             )
-            on_event({"type": "approval_rejected", "method": method, "params": params})
+            try:
+                on_event({"type": "approval_rejected", "method": method, "params": params})
+            except Exception as error:
+                raise _ApprovalDeclined("approval_required") from error
             raise _ApprovalDeclined("approval_required")
         raise RuntimeError("approval_required")
 
@@ -377,7 +387,7 @@ class _JsonLineStream:
     def __init__(self, stdout):
         self.messages: queue.Queue[object] = queue.Queue()
         self.pending: list[dict] = []
-        _start_line_reader(stdout, self.messages, decode_json=True)
+        self.closed = _start_line_reader(stdout, self.messages, decode_json=True)
 
     def get(self, *, deadline: float, cancel_event: threading.Event, timeout_error: str) -> dict:
         if self.pending:
@@ -418,9 +428,14 @@ class _JsonLineStream:
                 return item
 
 
-def _start_line_reader(stream, target: queue.Queue[object], *, decode_json: bool) -> None:
+def _start_line_reader(
+    stream, target: queue.Queue[object], *, decode_json: bool
+) -> threading.Event:
+    closed = threading.Event()
+
     def read_lines() -> None:
         if stream is None:
+            closed.set()
             target.put(_STREAM_CLOSED)
             return
         try:
@@ -434,9 +449,11 @@ def _start_line_reader(stream, target: queue.Queue[object], *, decode_json: bool
                 else:
                     target.put(text)
         finally:
+            closed.set()
             target.put(_STREAM_CLOSED)
 
     threading.Thread(target=read_lines, daemon=True).start()
+    return closed
 
 
 def _normalize_tool_result(result: object) -> dict:
@@ -478,7 +495,33 @@ def _drain_text_queue(lines: queue.Queue[object]) -> list[str]:
             result.append(item)
 
 
-def _stop_process(process: subprocess.Popen, *, graceful: bool = False) -> None:
+def _capture_process_group(process: subprocess.Popen) -> int | None:
+    if os.name != "posix":
+        return None
+    try:
+        process_group_id = os.getpgid(process.pid)
+    except ProcessLookupError:
+        return None
+    return process_group_id if process_group_id == process.pid else None
+
+
+def _stop_process(
+    process: subprocess.Popen,
+    *,
+    graceful: bool = False,
+    process_group_id: int | None = None,
+    pipe_closed: tuple[threading.Event, ...] = (),
+) -> None:
+    if os.name == "posix" and process_group_id is not None:
+        _stop_process_group(
+            process,
+            process_group_id,
+            graceful=graceful,
+            pipe_closed=pipe_closed,
+        )
+        _close_process_streams(process)
+        return
+
     if graceful and process.poll() is None and process.stdin is not None:
         try:
             process.stdin.close()
@@ -486,24 +529,98 @@ def _stop_process(process: subprocess.Popen, *, graceful: bool = False) -> None:
         except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
             pass
     if process.poll() is None:
-        if os.name == "posix":
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        else:
-            process.terminate()
+        process.terminate()
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            if os.name == "posix":
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            else:
-                process.kill()
+            process.kill()
             process.wait(timeout=2)
+    _close_process_streams(process)
+
+
+def _stop_process_group(
+    process: subprocess.Popen,
+    process_group_id: int,
+    *,
+    graceful: bool,
+    pipe_closed: tuple[threading.Event, ...],
+) -> None:
+    leader_exited = _wait_for_process_exit_without_reaping(process.pid, timeout=0)
+    if graceful and process.stdin is not None:
+        try:
+            process.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        leader_exited = leader_exited or _wait_for_process_exit_without_reaping(
+            process.pid, timeout=2
+        )
+
+    pipes_closed = all(event.is_set() for event in pipe_closed)
+    if not leader_exited or not pipes_closed:
+        _signal_process_group(process_group_id, signal.SIGTERM)
+        deadline = time.monotonic() + 2
+        leader_exited = leader_exited or _wait_for_process_exit_without_reaping(
+            process.pid, timeout=max(0, deadline - time.monotonic())
+        )
+        pipes_closed = _wait_for_events(pipe_closed, deadline=deadline)
+
+        if not leader_exited or not pipes_closed:
+            # The unreaped session leader keeps this group ID reserved until all
+            # group signals complete, so a recycled group cannot be targeted.
+            _signal_process_group(process_group_id, signal.SIGKILL)
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2)
+    _wait_for_events(pipe_closed, deadline=time.monotonic() + 2)
+
+
+def _wait_for_process_exit_without_reaping(process_id: int, *, timeout: float) -> bool:
+    timeout = max(0, timeout)
+    if hasattr(os, "pidfd_open"):
+        try:
+            descriptor = os.pidfd_open(process_id)
+        except ProcessLookupError:
+            return True
+        try:
+            ready, _, _ = select.select([descriptor], [], [], timeout)
+            return bool(ready)
+        finally:
+            os.close(descriptor)
+    if hasattr(select, "kqueue"):
+        watcher = select.kqueue()
+        event = select.kevent(
+            process_id,
+            filter=select.KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+            fflags=select.KQ_NOTE_EXIT,
+        )
+        try:
+            return bool(watcher.control([event], 1, timeout))
+        except ProcessLookupError:
+            return True
+        finally:
+            watcher.close()
+    threading.Event().wait(timeout)
+    return False
+
+
+def _wait_for_events(events: tuple[threading.Event, ...], *, deadline: float) -> bool:
+    for event in events:
+        if not event.wait(timeout=max(0, deadline - time.monotonic())):
+            return False
+    return True
+
+
+def _signal_process_group(process_group_id: int, signal_number: int) -> None:
+    try:
+        os.killpg(process_group_id, signal_number)
+    except ProcessLookupError:
+        pass
+
+
+def _close_process_streams(process: subprocess.Popen) -> None:
     for stream in (process.stdin, process.stdout, process.stderr):
         if stream is not None:
             try:

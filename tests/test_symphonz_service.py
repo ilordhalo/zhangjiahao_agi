@@ -701,6 +701,108 @@ class CodexAppServerTests(unittest.TestCase):
             replies = [json.loads(line) for line in records.read_text().splitlines() if json.loads(line).get("id") == 950]
             self.assertEqual(replies[-1]["result"]["decision"], "decline")
 
+    def test_never_approval_policy_preserves_decline_when_event_callback_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = root / "records.jsonl"
+            server, _ = self.write_server(
+                root,
+                "import json, sys\n"
+                f"records = open({str(records)!r}, 'a')\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); records.write(json.dumps(msg) + '\\n'); records.flush(); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        print(json.dumps({'id': 951, 'method': 'item/commandExecution/requestApproval', 'params': {}}), flush=True)\n"
+                "        tail = sys.stdin.read()\n"
+                "        records.write(tail); records.flush()\n"
+                "        break\n",
+            )
+
+            def raise_on_rejection(event):
+                if event["type"] == "approval_rejected":
+                    raise RuntimeError("event callback failed")
+
+            with self.assertRaisesRegex(RuntimeError, "approval_required"):
+                self.client(server).run_turn(
+                    **self.run_kwargs(root), on_event=raise_on_rejection
+                )
+
+            replies = [
+                json.loads(line)
+                for line in records.read_text().splitlines()
+                if json.loads(line).get("id") == 951
+            ]
+            self.assertEqual(replies[-1]["result"]["decision"], "decline")
+
+    @unittest.skipUnless(os.name == "posix", "process-group cleanup is POSIX-specific")
+    def test_graceful_approval_decline_terminates_pipe_holding_descendant(self):
+        import fcntl
+        import signal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock_path = root / "descendant.lock"
+            pid_path = root / "descendant.pid"
+            server, _ = self.write_server(
+                root,
+                "import json, os, signal, subprocess, sys\n"
+                f"lock_path = {str(lock_path)!r}\n"
+                f"pid_path = {str(pid_path)!r}\n"
+                "child_code = '''import fcntl, os, signal, sys\n"
+                "lock = open(sys.argv[1], 'w')\n"
+                "fcntl.flock(lock, fcntl.LOCK_EX)\n"
+                "os.write(int(sys.argv[2]), b'1')\n"
+                "signal.pause()\n'''\n"
+                "ready_read, ready_write = os.pipe()\n"
+                "child = subprocess.Popen([sys.executable, '-c', child_code, lock_path, str(ready_write)], pass_fds=(ready_write,))\n"
+                "os.close(ready_write)\n"
+                "os.read(ready_read, 1); os.close(ready_read)\n"
+                "with open(pid_path, 'w') as output: output.write(str(child.pid))\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        print(json.dumps({'id': 952, 'method': 'item/commandExecution/requestApproval', 'params': {}}), flush=True)\n"
+                "        sys.stdin.read()\n"
+                "        break\n",
+            )
+            approval_rejected = threading.Event()
+
+            def capture_rejection(event):
+                if event["type"] == "approval_rejected":
+                    approval_rejected.set()
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    self.client(server).run_turn,
+                    **self.run_kwargs(root),
+                    on_event=capture_rejection,
+                )
+                self.assertTrue(approval_rejected.wait(timeout=2))
+                child_pid = int(pid_path.read_text())
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "approval_required"):
+                        future.result(timeout=2)
+                finally:
+                    if not future.done():
+                        os.kill(child_pid, signal.SIGKILL)
+                        try:
+                            future.result(timeout=2)
+                        except RuntimeError:
+                            pass
+
+            with lock_path.open("w") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    os.kill(child_pid, signal.SIGKILL)
+                    self.fail("descendant still holds its lifecycle lock")
+
     def test_codex_app_server_routes_concurrent_per_run_report_executors(self):
         from symphonz.service.dynamic_tools import dynamic_tool_specs, linear_graphql_tool_spec
         from symphonz.service.reporting import report_tool_spec
