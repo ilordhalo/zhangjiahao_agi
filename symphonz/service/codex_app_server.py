@@ -570,8 +570,10 @@ def _stop_process_group(
     )
     pipes_closed = _wait_for_events(pipe_closed, deadline=deadline)
 
-    if not leader_exited or not pipes_closed:
-        _signal_process_group(process_group_id, signal.SIGKILL)
+    # A descendant can ignore SIGTERM after redirecting every inherited pipe.
+    # The unreaped leader still reserves the PGID, so the final group kill is
+    # safe even when no observable process or pipe remains.
+    _signal_process_group(process_group_id, signal.SIGKILL)
     try:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired:

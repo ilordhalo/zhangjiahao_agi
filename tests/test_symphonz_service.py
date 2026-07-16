@@ -850,6 +850,7 @@ class CodexAppServerTests(unittest.TestCase):
             )
 
         signal_group.assert_any_call(12345, codex_app_server.signal.SIGTERM)
+        signal_group.assert_any_call(12345, codex_app_server.signal.SIGKILL)
         process.wait.assert_called_once()
 
     @unittest.skipUnless(os.name == "posix", "kqueue cleanup is POSIX-specific")
