@@ -47,6 +47,56 @@ class RuntimeEvent:
 
 
 @dataclass
+class RuntimeErrorRecord:
+    issue_identifier: str | None = None
+    session_id: str | None = None
+    stage: str = "runtime"
+    error_type: str = "RuntimeError"
+    message: str = ""
+    retryable: bool = False
+    attempt: int | None = None
+    timestamp: float = field(default_factory=time.time)
+    context: dict = field(default_factory=dict)
+
+
+def runtime_error_from_event(event: RuntimeEvent) -> RuntimeErrorRecord | None:
+    event_type = event.type.lower()
+    data = event.data
+    is_failed_tool = "tool" in event_type and data.get("success") is False
+    is_report_sync_failure = "report" in event_type and "sync" in event_type and (
+        "failed" in event_type or data.get("sync_status") == "failed"
+    )
+    if not (
+        event_type.endswith("_failed")
+        or is_failed_tool
+        or "exception" in event_type
+        or "timeout" in event_type
+        or "blocked" in event_type
+        or is_report_sync_failure
+    ):
+        return None
+    return RuntimeErrorRecord(
+        issue_identifier=event.issue_identifier,
+        session_id=_string_or_none(data.get("session_id") or data.get("codex_session_id")),
+        stage=_string_or_none(data.get("stage")) or event_type.split("_", 1)[0],
+        error_type=_string_or_none(data.get("error_type")) or event.type,
+        message=event.message,
+        retryable=bool(data.get("retryable", False)),
+        attempt=_integer_or_none(data.get("attempt")),
+        timestamp=event.timestamp,
+        context=dict(data),
+    )
+
+
+def _string_or_none(value: object) -> str | None:
+    return str(value) if value is not None else None
+
+
+def _integer_or_none(value: object) -> int | None:
+    return int(value) if value is not None else None
+
+
+@dataclass
 class RuntimeState:
     started_at: float = field(default_factory=time.time)
     running: dict[str, dict] = field(default_factory=dict)

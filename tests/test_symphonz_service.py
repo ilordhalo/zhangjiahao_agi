@@ -1291,6 +1291,164 @@ class OrchestratorHardeningTests(unittest.TestCase):
         self.assertEqual(snapshot["counts"]["retrying"], 0)
 
 
+class RuntimeStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "logs" / "runtime.sqlite3"
+
+    def test_runtime_store_persists_tasks_events_and_errors_across_instances(self):
+        from symphonz.service.models import RuntimeErrorRecord, RuntimeEvent
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.upsert_issue(
+            {
+                "issue_identifier": "SYM-1",
+                "issue_id": "issue-1",
+                "title": "Persist runtime history",
+                "linear_state": "Todo",
+                "status": "running",
+                "attempt": 2,
+                "workspace": "/tmp/SYM-1",
+            }
+        )
+        store.record_event(RuntimeEvent("issue_started", "Started", "SYM-1", data={"category": "lifecycle"}))
+        error_id = store.record_error(
+            RuntimeErrorRecord(
+                issue_identifier="SYM-1",
+                session_id="session-1",
+                stage="codex",
+                error_type="RuntimeError",
+                message="boom",
+                retryable=True,
+                attempt=2,
+                context={"request": {"authorization": "Bearer secret"}},
+            )
+        )
+
+        reopened = RuntimeStore(self.path)
+
+        self.assertEqual(reopened.get_task("SYM-1")["status"], "running")
+        self.assertEqual(reopened.get_task("SYM-1")["title"], "Persist runtime history")
+        self.assertEqual(reopened.list_events(issue_identifier="SYM-1")["items"][0]["type"], "issue_started")
+        error = reopened.list_errors(issue_identifier="SYM-1")["items"][0]
+        self.assertEqual(error["id"], error_id)
+        self.assertEqual(error["message"], "boom")
+        self.assertEqual(error["context"]["request"]["authorization"], "[REDACTED]")
+
+    def test_task_filters_and_cursor_pagination_use_persisted_rows(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.upsert_issue({"issue_identifier": "SYM-1", "title": "First dashboard", "status": "completed"})
+        store.upsert_issue({"issue_identifier": "SYM-2", "title": "Runtime dashboard", "status": "running"})
+        store.upsert_issue({"issue_identifier": "SYM-3", "title": "Another runtime", "status": "running"})
+
+        filtered = store.list_tasks(status="running", query="runtime", cursor=None, limit=1)
+        remaining = store.list_tasks(status="running", query="runtime", cursor=filtered["next_cursor"], limit=1)
+
+        self.assertEqual(len(filtered["items"]), 1)
+        self.assertIsNotNone(filtered["next_cursor"])
+        self.assertEqual(len(remaining["items"]), 1)
+        self.assertIsNone(remaining["next_cursor"])
+        self.assertEqual(
+            {filtered["items"][0]["issue_identifier"], remaining["items"][0]["issue_identifier"]},
+            {"SYM-2", "SYM-3"},
+        )
+
+    def test_upserting_a_task_updates_its_last_activity_timestamp(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.upsert_issue({"issue_identifier": "SYM-1", "status": "queued"})
+        first_updated_at = store.get_task("SYM-1")["updated_at"]
+        time.sleep(0.001)
+
+        store.upsert_issue({"issue_identifier": "SYM-1", "status": "running"})
+
+        self.assertGreater(store.get_task("SYM-1")["updated_at"], first_updated_at)
+
+    def test_events_errors_and_jsonl_logs_redact_secrets_and_errors_resolve(self):
+        from symphonz.service.event_log import CompositeEventSink, ErrorJsonlLog, JsonlEventLog
+        from symphonz.service.models import RuntimeErrorRecord, RuntimeEvent
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        runtime_path = self.path.parent / "runtime.jsonl"
+        errors_path = self.path.parent / "errors.jsonl"
+        event = RuntimeEvent(
+            "tool_failed",
+            "Tool failed",
+            "SYM-1",
+            data={"api_key": "top-secret", "nested": [{"password": "hidden"}]},
+        )
+        error_log = ErrorJsonlLog(errors_path)
+        CompositeEventSink(JsonlEventLog(runtime_path).write, store.record_event, error_log.write).write(event)
+
+        event_payload = json.loads(runtime_path.read_text().strip())
+        error_payload = json.loads(errors_path.read_text().strip())
+        persisted_event = store.list_events(issue_identifier="SYM-1")["items"][0]
+        self.assertEqual(event_payload["data"]["api_key"], "[REDACTED]")
+        self.assertEqual(event_payload["data"]["nested"][0]["password"], "[REDACTED]")
+        self.assertEqual(error_payload["context"]["api_key"], "[REDACTED]")
+        self.assertEqual(persisted_event["data"]["api_key"], "[REDACTED]")
+
+        error_id = store.list_errors(issue_identifier="SYM-1")["items"][0]["id"]
+        store.resolve_error(error_id, resolving_event="tool_completed")
+
+        self.assertEqual(store.list_errors(resolved=False)["items"], [])
+        self.assertEqual(store.list_errors(resolved=True)["items"][0]["resolving_event"], "tool_completed")
+
+    def test_wal_store_accepts_concurrent_event_writers(self):
+        from symphonz.service.models import RuntimeEvent
+        from symphonz.service.runtime_store import RuntimeStore
+
+        RuntimeStore(self.path)
+        failures = []
+
+        def record(index):
+            try:
+                RuntimeStore(self.path).record_event(RuntimeEvent("tool_completed", str(index), "SYM-1"))
+            except Exception as error:  # pragma: no cover - asserted below
+                failures.append(error)
+
+        writers = [threading.Thread(target=record, args=(index,)) for index in range(12)]
+        for writer in writers:
+            writer.start()
+        for writer in writers:
+            writer.join()
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(RuntimeStore(self.path).list_events(issue_identifier="SYM-1", limit=20)["items"]), 12)
+
+    def test_reports_sessions_and_login_attempts_are_persisted(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        now = time.time()
+        store = RuntimeStore(self.path)
+        store.save_report(
+            {
+                "issue_identifier": "SYM-1",
+                "report_version": 1,
+                "json_path": "/tmp/report.json",
+                "html_path": "/tmp/report.html",
+                "url": "https://reports.example/SYM-1",
+                "sync_status": "pending",
+            }
+        )
+        store.save_session("token-hash", expires_at=now + 60, metadata={"user": "admin"})
+        store.record_login_attempt("127.0.0.1", failures=2, window_started_at=now, locked_until=now + 30)
+
+        reopened = RuntimeStore(self.path)
+
+        self.assertEqual(reopened.get_report("SYM-1")["url"], "https://reports.example/SYM-1")
+        self.assertEqual(reopened.get_session("token-hash")["metadata"], {"user": "admin"})
+        self.assertEqual(reopened.get_login_attempt("127.0.0.1")["failures"], 2)
+        reopened.clear_login_attempt("127.0.0.1")
+        self.assertIsNone(reopened.get_login_attempt("127.0.0.1"))
+
+
 class OrchestratorAndDashboardTests(unittest.TestCase):
     def test_orchestrator_one_shot_runs_issue_and_records_state(self):
         from symphonz.service.models import Issue
