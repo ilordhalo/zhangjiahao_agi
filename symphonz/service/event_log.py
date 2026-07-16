@@ -56,6 +56,8 @@ def _is_secret_key(key: str) -> bool:
         normalized in _EXACT_SECRET_KEYS
         or compact in _EXACT_SECRET_KEYS
         or "secret" in normalized
+        or normalized.endswith("_api_key")
+        or normalized.endswith("_authorization")
         or normalized.endswith("_token")
         or normalized == "token"
     )
@@ -116,4 +118,7 @@ class CompositeEventSink:
     def write(self, event: RuntimeEvent) -> None:
         for sink in self._sinks:
             writer = sink.write if hasattr(sink, "write") else sink
-            writer(event)
+            try:
+                writer(event)
+            except Exception as error:
+                print(f"Symphonz event sink failed: {error}", file=sys.stderr)

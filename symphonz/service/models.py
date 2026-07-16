@@ -60,11 +60,17 @@ class RuntimeErrorRecord:
 
 
 def runtime_error_from_event(event: RuntimeEvent) -> RuntimeErrorRecord | None:
-    event_type = event.type.lower()
-    data = event.data
-    is_failed_tool = "tool" in event_type and data.get("success") is False
+    nested_event = event.data.get("event")
+    data = nested_event if isinstance(nested_event, dict) else event.data
+    event_type = str(data.get("type") or event.type).lower()
+    result = data.get("result")
+    is_failed_tool = "tool" in event_type and (
+        data.get("success") is False or (isinstance(result, dict) and result.get("success") is False)
+    )
     is_report_sync_failure = "report" in event_type and "sync" in event_type and (
-        "failed" in event_type or data.get("sync_status") == "failed"
+        "failed" in event_type
+        or data.get("linear_sync_status") == "failed"
+        or data.get("sync_status") == "failed"
     )
     if not (
         event_type.endswith("_failed")
@@ -78,14 +84,26 @@ def runtime_error_from_event(event: RuntimeEvent) -> RuntimeErrorRecord | None:
     return RuntimeErrorRecord(
         issue_identifier=event.issue_identifier,
         session_id=_string_or_none(data.get("session_id") or data.get("codex_session_id")),
-        stage=_string_or_none(data.get("stage")) or event_type.split("_", 1)[0],
-        error_type=_string_or_none(data.get("error_type")) or event.type,
-        message=event.message,
+        stage=_string_or_none(data.get("stage")) or ("codex" if nested_event else event_type.split("_", 1)[0]),
+        error_type=_string_or_none(data.get("error_type")) or str(data.get("type") or event.type),
+        message=_error_message(event.message, data),
         retryable=bool(data.get("retryable", False)),
         attempt=_integer_or_none(data.get("attempt")),
         timestamp=event.timestamp,
-        context=dict(data),
+        context=dict(event.data),
     )
+
+
+def _error_message(default: str, data: dict) -> str:
+    result = data.get("result")
+    if isinstance(result, dict):
+        for key in ("output", "error", "message"):
+            if result.get(key):
+                return str(result[key])
+    for key in ("error", "message"):
+        if data.get(key):
+            return str(data[key])
+    return default
 
 
 def _string_or_none(value: object) -> str | None:

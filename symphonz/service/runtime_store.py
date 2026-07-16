@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 import sqlite3
@@ -7,6 +8,10 @@ import time
 
 from symphonz.service.event_log import bounded_redacted_data
 from symphonz.service.models import RuntimeErrorRecord, RuntimeEvent, runtime_error_from_event
+
+
+class RuntimeStoreInputError(ValueError):
+    """Raised when a runtime-store pagination input is invalid."""
 
 
 class RuntimeStore:
@@ -69,6 +74,16 @@ class RuntimeStore:
                 """,
                 (event.timestamp, severity, category, event.type, event.issue_identifier, event.message, self._dump(data)),
             )
+            if event.issue_identifier:
+                connection.execute(
+                    """
+                    INSERT INTO issue_runs (issue_identifier, status, updated_at, details_json)
+                    VALUES (?, ?, ?, '{}')
+                    ON CONFLICT(issue_identifier) DO UPDATE SET
+                        updated_at = MAX(issue_runs.updated_at, excluded.updated_at)
+                    """,
+                    (event.issue_identifier, "unknown", event.timestamp),
+                )
             derived_error = runtime_error_from_event(event)
             if derived_error is not None:
                 self._record_error(connection, derived_error)
@@ -96,7 +111,7 @@ class RuntimeStore:
         *,
         status: str | None = None,
         query: str | None = None,
-        cursor: int | None = None,
+        cursor: str | None = None,
         limit: int = 50,
     ) -> dict:
         conditions: list[str] = []
@@ -108,19 +123,18 @@ class RuntimeStore:
             conditions.append("(issue_identifier LIKE ? OR title LIKE ?)")
             needle = f"%{query}%"
             parameters.extend([needle, needle])
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        offset = self._offset(cursor)
-        page_limit = self._limit(limit)
-        with self._connect() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT * FROM issue_runs {where}
-                ORDER BY updated_at DESC, issue_identifier ASC
-                LIMIT ? OFFSET ?
-                """,
-                (*parameters, page_limit + 1, offset),
-            ).fetchall()
-        return self._page([self._task_from_row(row) for row in rows], offset, page_limit)
+        return self._list_keyset_rows(
+            "issue_runs",
+            conditions,
+            parameters,
+            cursor,
+            limit,
+            self._task_from_row,
+            order_by="updated_at DESC, issue_identifier ASC",
+            cursor_fields=("updated_at", "issue_identifier"),
+            after_clause="updated_at < ? OR (updated_at = ? AND issue_identifier > ?)",
+            after_parameters=lambda values: (values["updated_at"], values["updated_at"], values["issue_identifier"]),
+        )
 
     def get_task(self, issue_identifier: str) -> dict | None:
         with self._connect() as connection:
@@ -136,7 +150,7 @@ class RuntimeStore:
         severity: str | None = None,
         category: str | None = None,
         event_type: str | None = None,
-        cursor: int | None = None,
+        cursor: str | None = None,
         limit: int = 50,
     ) -> dict:
         conditions: list[str] = []
@@ -145,8 +159,18 @@ class RuntimeStore:
             if value:
                 conditions.append(f"{column} = ?")
                 parameters.append(value)
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        return self._list_rows("runtime_events", where, parameters, cursor, limit, self._event_from_row)
+        return self._list_keyset_rows(
+            "runtime_events",
+            conditions,
+            parameters,
+            cursor,
+            limit,
+            self._event_from_row,
+            order_by="timestamp DESC, id DESC",
+            cursor_fields=("timestamp", "id"),
+            after_clause="timestamp < ? OR (timestamp = ? AND id < ?)",
+            after_parameters=lambda values: (values["timestamp"], values["timestamp"], values["id"]),
+        )
 
     def list_errors(
         self,
@@ -155,7 +179,7 @@ class RuntimeStore:
         stage: str | None = None,
         error_type: str | None = None,
         resolved: bool | None = None,
-        cursor: int | None = None,
+        cursor: str | None = None,
         limit: int = 50,
     ) -> dict:
         conditions: list[str] = []
@@ -168,15 +192,27 @@ class RuntimeStore:
             conditions.append("resolved_at IS NOT NULL")
         elif resolved is False:
             conditions.append("resolved_at IS NULL")
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        return self._list_rows(
+        return self._list_keyset_rows(
             "runtime_errors",
-            where,
+            conditions,
             parameters,
             cursor,
             limit,
             self._error_from_row,
-            order_by="resolved_at IS NOT NULL ASC, timestamp DESC, id DESC",
+            select_columns="*, resolved_at IS NOT NULL AS resolved_bucket",
+            order_by="resolved_bucket ASC, timestamp DESC, id DESC",
+            cursor_fields=("resolved_bucket", "timestamp", "id"),
+            after_clause=(
+                "(resolved_at IS NOT NULL) > ? OR ((resolved_at IS NOT NULL) = ? AND "
+                "(timestamp < ? OR (timestamp = ? AND id < ?)))"
+            ),
+            after_parameters=lambda values: (
+                values["resolved_bucket"],
+                values["resolved_bucket"],
+                values["timestamp"],
+                values["timestamp"],
+                values["id"],
+            ),
         )
 
     def save_report(self, entry: dict) -> None:
@@ -191,9 +227,9 @@ class RuntimeStore:
             "json_path": entry.get("json_path"),
             "html_path": entry.get("html_path"),
             "url": entry.get("url"),
-            "review_metadata_json": self._dump(entry.get("review_metadata", {})),
+            "review_metadata_json": self._dump(bounded_redacted_data(entry.get("review_metadata", {}))),
             "linear_comment_id": entry.get("linear_comment_id"),
-            "sync_status": entry.get("sync_status") or "pending",
+            "linear_sync_status": entry.get("linear_sync_status") or entry.get("sync_status") or "pending",
             "retry_count": int(entry.get("retry_count", 0)),
             "next_retry_at": entry.get("next_retry_at"),
             "created_at": float(entry.get("created_at") or time.time()),
@@ -205,10 +241,10 @@ class RuntimeStore:
                 """
                 INSERT INTO reports (
                     issue_identifier, report_version, json_path, html_path, url, review_metadata_json,
-                    linear_comment_id, sync_status, retry_count, next_retry_at, created_at, updated_at, details_json
+                    linear_comment_id, linear_sync_status, retry_count, next_retry_at, created_at, updated_at, details_json
                 ) VALUES (
                     :issue_identifier, :report_version, :json_path, :html_path, :url, :review_metadata_json,
-                    :linear_comment_id, :sync_status, :retry_count, :next_retry_at, :created_at, :updated_at, :details_json
+                    :linear_comment_id, :linear_sync_status, :retry_count, :next_retry_at, :created_at, :updated_at, :details_json
                 )
                 ON CONFLICT(issue_identifier, report_version) DO UPDATE SET
                     json_path = excluded.json_path,
@@ -216,7 +252,7 @@ class RuntimeStore:
                     url = excluded.url,
                     review_metadata_json = excluded.review_metadata_json,
                     linear_comment_id = excluded.linear_comment_id,
-                    sync_status = excluded.sync_status,
+                    linear_sync_status = excluded.linear_sync_status,
                     retry_count = excluded.retry_count,
                     next_retry_at = excluded.next_retry_at,
                     updated_at = excluded.updated_at,
@@ -237,17 +273,29 @@ class RuntimeStore:
             row = connection.execute(query, parameters).fetchone()
         return self._report_from_row(row) if row is not None else None
 
-    def list_reports(self, *, issue_identifier: str | None = None, cursor: int | None = None, limit: int = 50) -> dict:
-        where = "WHERE issue_identifier = ?" if issue_identifier else ""
+    def list_reports(self, *, issue_identifier: str | None = None, cursor: str | None = None, limit: int = 50) -> dict:
+        conditions = ["issue_identifier = ?"] if issue_identifier else []
         parameters = [issue_identifier] if issue_identifier else []
-        return self._list_rows(
+        return self._list_keyset_rows(
             "reports",
-            where,
+            conditions,
             parameters,
             cursor,
             limit,
             self._report_from_row,
             order_by="updated_at DESC, issue_identifier ASC, report_version DESC",
+            cursor_fields=("updated_at", "issue_identifier", "report_version"),
+            after_clause=(
+                "updated_at < ? OR (updated_at = ? AND "
+                "(issue_identifier > ? OR (issue_identifier = ? AND report_version < ?)))"
+            ),
+            after_parameters=lambda values: (
+                values["updated_at"],
+                values["updated_at"],
+                values["issue_identifier"],
+                values["issue_identifier"],
+                values["report_version"],
+            ),
         )
 
     def save_session(
@@ -257,7 +305,7 @@ class RuntimeStore:
             "token_hash": token_hash,
             "expires_at": expires_at,
             "created_at": time.time() if created_at is None else created_at,
-            "metadata_json": self._dump(metadata or {}),
+            "metadata_json": self._dump(bounded_redacted_data(metadata or {})),
         }
         self._write(
             lambda connection: connection.execute(
@@ -329,6 +377,53 @@ class RuntimeStore:
                 values,
             )
         )
+
+    def record_failed_login_attempt(
+        self,
+        rate_limit_key: str,
+        *,
+        now: float | None = None,
+        max_failures: int = 5,
+        window_seconds: float = 300,
+        lock_seconds: float = 900,
+    ) -> dict:
+        if max_failures < 1 or window_seconds <= 0 or lock_seconds <= 0:
+            raise ValueError("Login attempt limits must be positive")
+        current_time = time.time() if now is None else float(now)
+
+        def write(connection: sqlite3.Connection) -> dict:
+            row = connection.execute(
+                "SELECT * FROM login_attempts WHERE rate_limit_key = ?", (rate_limit_key,)
+            ).fetchone()
+            if row is not None and row["locked_until"] is not None and float(row["locked_until"]) > current_time:
+                return {
+                    "failures": row["failures"],
+                    "locked_until": row["locked_until"],
+                    "locked": True,
+                }
+            if row is None or current_time - float(row["window_started_at"]) >= window_seconds:
+                failures = 0
+                window_started_at = current_time
+            else:
+                failures = int(row["failures"])
+                window_started_at = float(row["window_started_at"])
+            failures += 1
+            locked_until = current_time + lock_seconds if failures >= max_failures else None
+            connection.execute(
+                """
+                INSERT INTO login_attempts (rate_limit_key, failures, window_started_at, locked_until, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(rate_limit_key) DO UPDATE SET
+                    failures = excluded.failures,
+                    window_started_at = excluded.window_started_at,
+                    locked_until = excluded.locked_until,
+                    updated_at = excluded.updated_at
+                """,
+                (rate_limit_key, failures, window_started_at, locked_until, current_time),
+            )
+            return {"failures": failures, "locked_until": locked_until, "locked": locked_until is not None}
+
+        return self._write(write)
 
     def get_login_attempt(self, rate_limit_key: str) -> dict | None:
         with self._connect() as connection:
@@ -408,7 +503,7 @@ class RuntimeStore:
                     url TEXT,
                     review_metadata_json TEXT NOT NULL DEFAULT '{}',
                     linear_comment_id TEXT,
-                    sync_status TEXT NOT NULL,
+                    linear_sync_status TEXT NOT NULL DEFAULT 'pending',
                     retry_count INTEGER NOT NULL DEFAULT 0,
                     next_retry_at REAL,
                     created_at REAL NOT NULL,
@@ -431,6 +526,13 @@ class RuntimeStore:
                 );
                 """
             )
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(reports)")}
+            if "linear_sync_status" not in columns:
+                connection.execute("ALTER TABLE reports ADD COLUMN linear_sync_status TEXT NOT NULL DEFAULT 'pending'")
+                if "sync_status" in columns:
+                    connection.execute(
+                        "UPDATE reports SET linear_sync_status = sync_status WHERE sync_status IS NOT NULL"
+                    )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
@@ -530,28 +632,71 @@ class RuntimeStore:
             )
         return int(cursor.lastrowid)
 
-    def _list_rows(self, table, where, parameters, cursor, limit, converter, *, order_by="timestamp DESC, id DESC") -> dict:
-        offset = self._offset(cursor)
+    def _list_keyset_rows(
+        self,
+        table: str,
+        conditions: list[str],
+        parameters: list[object],
+        cursor: str | None,
+        limit: int,
+        converter,
+        *,
+        order_by: str,
+        cursor_fields: tuple[str, ...],
+        after_clause: str,
+        after_parameters,
+        select_columns: str = "*",
+    ) -> dict:
         page_limit = self._limit(limit)
+        cursor_values = self._decode_cursor(cursor, cursor_fields)
+        page_conditions = list(conditions)
+        page_parameters = list(parameters)
+        if cursor_values is not None:
+            page_conditions.append(f"({after_clause})")
+            page_parameters.extend(after_parameters(cursor_values))
+        where = f"WHERE {' AND '.join(page_conditions)}" if page_conditions else ""
         with self._connect() as connection:
             rows = connection.execute(
-                f"SELECT * FROM {table} {where} ORDER BY {order_by} LIMIT ? OFFSET ?",
-                (*parameters, page_limit + 1, offset),
+                f"SELECT {select_columns} FROM {table} {where} ORDER BY {order_by} LIMIT ?",
+                (*page_parameters, page_limit + 1),
             ).fetchall()
-        return self._page([converter(row) for row in rows], offset, page_limit)
+        page_rows = rows[:page_limit]
+        next_cursor = None
+        if len(rows) > page_limit and page_rows:
+            next_cursor = self._encode_cursor({field: page_rows[-1][field] for field in cursor_fields})
+        return {"items": [converter(row) for row in page_rows], "next_cursor": next_cursor}
 
     @staticmethod
-    def _offset(cursor: int | None) -> int:
-        return max(int(cursor or 0), 0)
+    def _decode_cursor(cursor: str | None, fields: tuple[str, ...]) -> dict | None:
+        if cursor is None:
+            return None
+        if not isinstance(cursor, str) or not cursor:
+            raise RuntimeStoreInputError("Invalid pagination cursor")
+        try:
+            padding = "=" * (-len(cursor) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(cursor + padding).decode("utf-8"))
+            if not isinstance(payload, dict) or set(payload) != set(fields):
+                raise ValueError("unexpected cursor fields")
+            for field, value in payload.items():
+                if field == "issue_identifier":
+                    if not isinstance(value, str):
+                        raise ValueError("invalid issue identifier")
+                elif isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError("invalid ordering value")
+            return payload
+        except (UnicodeDecodeError, ValueError, TypeError) as error:
+            raise RuntimeStoreInputError("Invalid pagination cursor") from error
+
+    @staticmethod
+    def _encode_cursor(values: dict) -> str:
+        payload = json.dumps(values, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
     @staticmethod
     def _limit(limit: int) -> int:
-        return min(max(int(limit), 1), 200)
-
-    @staticmethod
-    def _page(items: list[dict], offset: int, limit: int) -> dict:
-        has_more = len(items) > limit
-        return {"items": items[:limit], "next_cursor": offset + limit if has_more else None}
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise RuntimeStoreInputError("Invalid pagination limit: expected an integer from 1 to 200")
+        return limit
 
     def _task_from_row(self, row: sqlite3.Row) -> dict:
         result = self._load(row["details_json"])
@@ -589,7 +734,15 @@ class RuntimeStore:
 
     def _report_from_row(self, row: sqlite3.Row) -> dict:
         result = self._load(row["details_json"])
-        result.update({key: row[key] for key in row.keys() if key not in {"details_json", "review_metadata_json"}})
+        result.pop("sync_status", None)
+        result.pop("linear_sync_status", None)
+        result.update(
+            {
+                key: row[key]
+                for key in row.keys()
+                if key not in {"details_json", "review_metadata_json", "sync_status"}
+            }
+        )
         result["review_metadata"] = self._load(row["review_metadata_json"])
         return result
 

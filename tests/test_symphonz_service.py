@@ -1448,6 +1448,179 @@ class RuntimeStoreTests(unittest.TestCase):
         reopened.clear_login_attempt("127.0.0.1")
         self.assertIsNone(reopened.get_login_attempt("127.0.0.1"))
 
+    def test_nested_codex_failures_are_normalized_for_sqlite_and_error_jsonl(self):
+        from symphonz.service.event_log import CompositeEventSink, ErrorJsonlLog
+        from symphonz.service.models import RuntimeEvent
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.upsert_issue({"issue_identifier": "SYM-1", "status": "running"})
+        errors_path = self.path.parent / "errors.jsonl"
+        event = RuntimeEvent(
+            "codex_event",
+            "tool_call_failed",
+            "SYM-1",
+            data={
+                "event": {
+                    "type": "tool_call_failed",
+                    "tool": "linear_graphql",
+                    "result": {"success": False, "output": "permission denied"},
+                    "session_id": "session-1",
+                    "attempt": 2,
+                }
+            },
+        )
+
+        CompositeEventSink(store.record_event, ErrorJsonlLog(errors_path)).write(event)
+
+        error = store.list_errors(issue_identifier="SYM-1")["items"][0]
+        payload = json.loads(errors_path.read_text().strip())
+        self.assertEqual(error["stage"], "codex")
+        self.assertEqual(error["error_type"], "tool_call_failed")
+        self.assertEqual(error["message"], "permission denied")
+        self.assertEqual(payload["error_type"], "tool_call_failed")
+
+    def test_keyset_pagination_has_no_duplicates_when_rows_change_between_pages(self):
+        from symphonz.service.models import RuntimeErrorRecord, RuntimeEvent
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        for identifier, updated_at in (("SYM-1", 30.0), ("SYM-2", 20.0), ("SYM-3", 10.0)):
+            store.upsert_issue({"issue_identifier": identifier, "status": "running", "updated_at": updated_at})
+        first_tasks = store.list_tasks(limit=1)
+        store.upsert_issue({"issue_identifier": "SYM-1", "status": "running", "updated_at": 40.0})
+        store.upsert_issue({"issue_identifier": "SYM-4", "status": "running", "updated_at": 50.0})
+        second_tasks = store.list_tasks(cursor=first_tasks["next_cursor"], limit=1)
+
+        events = [
+            RuntimeEvent("event", "first", "SYM-1", timestamp=30.0),
+            RuntimeEvent("event", "second", "SYM-1", timestamp=20.0),
+            RuntimeEvent("event", "third", "SYM-1", timestamp=10.0),
+        ]
+        for event in events:
+            store.record_event(event)
+        first_events = store.list_events(limit=1)
+        store.record_event(RuntimeEvent("event", "new", "SYM-1", timestamp=50.0))
+        second_events = store.list_events(cursor=first_events["next_cursor"], limit=1)
+
+        for timestamp, message in ((30.0, "first"), (20.0, "second"), (10.0, "third")):
+            store.record_error(RuntimeErrorRecord(issue_identifier="SYM-1", message=message, timestamp=timestamp))
+        first_errors = store.list_errors(limit=1)
+        store.record_error(RuntimeErrorRecord(issue_identifier="SYM-1", message="new", timestamp=50.0))
+        second_errors = store.list_errors(cursor=first_errors["next_cursor"], limit=1)
+
+        self.assertEqual(first_tasks["items"][0]["issue_identifier"], "SYM-1")
+        self.assertEqual(second_tasks["items"][0]["issue_identifier"], "SYM-2")
+        self.assertEqual(first_events["items"][0]["message"], "first")
+        self.assertEqual(second_events["items"][0]["message"], "second")
+        self.assertEqual(first_errors["items"][0]["message"], "first")
+        self.assertEqual(second_errors["items"][0]["message"], "second")
+
+    def test_recording_an_issue_event_updates_last_activity_in_the_same_transaction(self):
+        from symphonz.service.models import RuntimeEvent
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.upsert_issue({"issue_identifier": "SYM-1", "status": "running", "updated_at": 10.0})
+
+        store.record_event(RuntimeEvent("tool_completed", "Done", "SYM-1", timestamp=20.0))
+
+        self.assertEqual(store.get_task("SYM-1")["updated_at"], 20.0)
+
+    def test_report_and_session_metadata_redact_header_secrets(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.save_report(
+            {
+                "issue_identifier": "SYM-1",
+                "report_version": 1,
+                "linear_sync_status": "pending",
+                "review_metadata": {"headers": {"X-Api-Key": "hidden"}},
+            }
+        )
+        store.save_session(
+            "token-hash",
+            expires_at=time.time() + 60,
+            metadata={"headers": {"X-Api-Key": "hidden"}},
+        )
+
+        self.assertEqual(store.get_report("SYM-1")["review_metadata"]["headers"]["X-Api-Key"], "[REDACTED]")
+        self.assertEqual(store.get_session("token-hash")["metadata"]["headers"]["X-Api-Key"], "[REDACTED]")
+
+    def test_report_sync_status_uses_linear_sync_status_with_compatibility_alias(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        entry = {"issue_identifier": "SYM-1", "report_version": 1}
+        store.save_report({**entry, "linear_sync_status": "pending"})
+        self.assertEqual(store.get_report("SYM-1")["linear_sync_status"], "pending")
+        store.save_report({**entry, "sync_status": "failed"})
+        self.assertEqual(store.get_report("SYM-1")["linear_sync_status"], "failed")
+        store.save_report({**entry, "linear_sync_status": "synced"})
+
+        report = store.get_report("SYM-1")
+        self.assertEqual(report["linear_sync_status"], "synced")
+        self.assertNotIn("sync_status", report)
+
+    def test_failed_login_attempts_increment_and_lock_atomically_under_concurrency(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        now = 100.0
+        barrier = threading.Barrier(5)
+        results = []
+        failures = []
+
+        def record_failure():
+            try:
+                barrier.wait()
+                results.append(
+                    RuntimeStore(self.path).record_failed_login_attempt(
+                        "admin:127.0.0.1", now=now, max_failures=5, window_seconds=300, lock_seconds=900
+                    )
+                )
+            except Exception as error:  # pragma: no cover - asserted below
+                failures.append(error)
+
+        workers = [threading.Thread(target=record_failure) for _ in range(5)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        attempt = store.get_login_attempt("admin:127.0.0.1")
+        self.assertEqual(failures, [])
+        self.assertEqual(len(results), 5)
+        self.assertEqual(attempt["failures"], 5)
+        self.assertEqual(attempt["locked_until"], now + 900)
+        self.assertTrue(any(result["locked"] for result in results))
+
+    def test_composite_event_sink_continues_after_a_sink_fails(self):
+        from symphonz.service.event_log import CompositeEventSink, JsonlEventLog
+        from symphonz.service.models import RuntimeEvent
+
+        class FailingSink:
+            def write(self, event):
+                raise RuntimeError("sink unavailable")
+
+        path = self.path.parent / "runtime.jsonl"
+
+        CompositeEventSink(FailingSink(), JsonlEventLog(path)).write(RuntimeEvent("started", "Started"))
+
+        self.assertEqual(json.loads(path.read_text().strip())["message"], "Started")
+
+    def test_invalid_pagination_inputs_raise_clear_errors(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        with self.assertRaisesRegex(ValueError, "Invalid pagination cursor"):
+            store.list_tasks(cursor=-1)
+        with self.assertRaisesRegex(ValueError, "Invalid pagination cursor"):
+            store.list_events(cursor="not-a-cursor")
+        with self.assertRaisesRegex(ValueError, "Invalid pagination limit"):
+            store.list_errors(limit=0)
+
 
 class OrchestratorAndDashboardTests(unittest.TestCase):
     def test_orchestrator_one_shot_runs_issue_and_records_state(self):
