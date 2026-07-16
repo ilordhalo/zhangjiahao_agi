@@ -823,6 +823,56 @@ class CodexAppServerTests(unittest.TestCase):
             self.assertEqual(replies[-1]["result"]["decision"], "decline")
             self.assertLess(elapsed, 1)
 
+    @unittest.skipUnless(os.name == "posix", "process-group cleanup is POSIX-specific")
+    def test_process_group_cleanup_signals_before_reaping_when_leader_and_pipes_are_closed(self):
+        import symphonz.service.codex_app_server as codex_app_server
+
+        pipe_closed = threading.Event()
+        pipe_closed.set()
+        process = mock.Mock()
+        process.pid = 12345
+        process.stdin = None
+        process.wait.return_value = 0
+
+        with (
+            mock.patch.object(
+                codex_app_server,
+                "_wait_for_process_exit_without_reaping",
+                return_value=True,
+            ),
+            mock.patch.object(codex_app_server, "_signal_process_group") as signal_group,
+        ):
+            codex_app_server._stop_process_group(
+                process,
+                12345,
+                graceful=False,
+                pipe_closed=(pipe_closed,),
+            )
+
+        signal_group.assert_any_call(12345, codex_app_server.signal.SIGTERM)
+        process.wait.assert_called_once()
+
+    @unittest.skipUnless(os.name == "posix", "kqueue cleanup is POSIX-specific")
+    def test_kqueue_close_capability_error_does_not_escape_process_observation(self):
+        import symphonz.service.codex_app_server as codex_app_server
+
+        watcher = mock.Mock()
+        watcher.control.return_value = [object()]
+        watcher.close.side_effect = NotImplementedError("kqueue close unsupported")
+
+        with (
+            mock.patch.object(codex_app_server.os, "pidfd_open", None, create=True),
+            mock.patch.object(codex_app_server.select, "kqueue", return_value=watcher, create=True),
+            mock.patch.object(codex_app_server.select, "kevent", return_value=object(), create=True),
+        ):
+            observed = codex_app_server._wait_for_process_exit_without_reaping(
+                os.getpid(),
+                timeout=0,
+                pipe_closed=(),
+            )
+
+        self.assertTrue(observed)
+
     def test_never_approval_policy_preserves_decline_when_event_callback_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

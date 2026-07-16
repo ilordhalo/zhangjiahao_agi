@@ -558,21 +558,20 @@ def _stop_process_group(
             process.pid, timeout=2, pipe_closed=pipe_closed
         )
 
-    pipes_closed = all(event.is_set() for event in pipe_closed)
-    if not leader_exited or not pipes_closed:
-        _signal_process_group(process_group_id, signal.SIGTERM)
-        deadline = time.monotonic() + 2
-        leader_exited = leader_exited or _wait_for_process_exit_without_reaping(
-            process.pid,
-            timeout=max(0, deadline - time.monotonic()),
-            pipe_closed=pipe_closed,
-        )
-        pipes_closed = _wait_for_events(pipe_closed, deadline=deadline)
+    # Signal before reaping the session leader. Its process-table entry keeps
+    # the group ID reserved while every descendant is terminated, including
+    # descendants that redirected or closed the inherited pipes.
+    _signal_process_group(process_group_id, signal.SIGTERM)
+    deadline = time.monotonic() + 2
+    leader_exited = leader_exited or _wait_for_process_exit_without_reaping(
+        process.pid,
+        timeout=max(0, deadline - time.monotonic()),
+        pipe_closed=pipe_closed,
+    )
+    pipes_closed = _wait_for_events(pipe_closed, deadline=deadline)
 
-        if not leader_exited or not pipes_closed:
-            # The unreaped session leader keeps this group ID reserved until all
-            # group signals complete, so a recycled group cannot be targeted.
-            _signal_process_group(process_group_id, signal.SIGKILL)
+    if not leader_exited or not pipes_closed:
+        _signal_process_group(process_group_id, signal.SIGKILL)
     try:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired:
@@ -605,7 +604,7 @@ def _wait_for_process_exit_without_reaping(
             finally:
                 try:
                     os.close(descriptor)
-                except OSError:
+                except (OSError, NotImplementedError):
                     pass
     kqueue = getattr(select, "kqueue", None)
     if callable(kqueue):
@@ -629,7 +628,7 @@ def _wait_for_process_exit_without_reaping(
             finally:
                 try:
                     watcher.close()
-                except OSError:
+                except (OSError, NotImplementedError):
                     pass
 
     waitid_result = _wait_with_os_waitid(process_id, timeout=timeout)
