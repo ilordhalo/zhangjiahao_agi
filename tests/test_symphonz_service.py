@@ -1682,6 +1682,57 @@ class RuntimeStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeStoreInputError, "Invalid pagination cursor"):
             RuntimeStore(self.path).list_tasks(cursor="a")
 
+    def test_expired_task_cursor_raises_and_using_it_cleans_snapshot(self):
+        from symphonz.service.runtime_store import RuntimeStore, RuntimeStoreInputError
+
+        store = RuntimeStore(self.path)
+        snapshot_ttl_seconds = 300.0
+        for identifier in ("SYM-1", "SYM-2"):
+            store.upsert_issue({"issue_identifier": identifier, "status": "running"})
+
+        first_page = store.list_tasks(limit=1)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "UPDATE task_page_snapshots SET created_at = ?",
+                (time.time() - snapshot_ttl_seconds - 1,),
+            )
+
+        with self.assertRaisesRegex(RuntimeStoreInputError, "Expired pagination cursor"):
+            store.list_tasks(cursor=first_page["next_cursor"], limit=1)
+
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM task_page_snapshots").fetchone()[0], 0)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM task_page_snapshot_entries").fetchone()[0], 0
+            )
+
+    def test_creating_task_snapshot_performs_bounded_expiry_cleanup(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        snapshot_ttl_seconds = 300.0
+        cleanup_batch_size = 100
+        for identifier in ("SYM-1", "SYM-2"):
+            store.upsert_issue({"issue_identifier": identifier, "status": "running"})
+
+        now = time.time()
+        expired_count = cleanup_batch_size + 2
+        with sqlite3.connect(self.path) as connection:
+            connection.executemany(
+                "INSERT INTO task_page_snapshots (created_at) VALUES (?)",
+                [(now - snapshot_ttl_seconds - 1,)] * expired_count,
+            )
+            connection.execute("INSERT INTO task_page_snapshots (created_at) VALUES (?)", (now,))
+
+        store.list_tasks(limit=1)
+
+        with sqlite3.connect(self.path) as connection:
+            remaining_expired = connection.execute(
+                "SELECT COUNT(*) FROM task_page_snapshots WHERE created_at < ?",
+                (now - snapshot_ttl_seconds,),
+            ).fetchone()[0]
+            self.assertEqual(remaining_expired, 2)
+
 
 class OrchestratorAndDashboardTests(unittest.TestCase):
     def test_orchestrator_one_shot_runs_issue_and_records_state(self):

@@ -18,6 +18,9 @@ class RuntimeStoreInputError(ValueError):
 class RuntimeStore:
     """SQLite repository for runtime history used by the dashboard and auth layers."""
 
+    TASK_PAGE_SNAPSHOT_TTL_SECONDS = 300.0
+    TASK_PAGE_SNAPSHOT_CLEANUP_BATCH_SIZE = 100
+
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -541,6 +544,8 @@ class RuntimeStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at REAL NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS task_page_snapshots_created_at
+                    ON task_page_snapshots(created_at);
                 CREATE TABLE IF NOT EXISTS task_page_snapshot_entries (
                     snapshot_id INTEGER NOT NULL,
                     position INTEGER NOT NULL,
@@ -703,6 +708,7 @@ class RuntimeStore:
             where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
             def write(connection: sqlite3.Connection) -> dict:
+                self._cleanup_expired_task_page_snapshots(connection)
                 rows = connection.execute(
                     f"SELECT * FROM issue_runs {where} ORDER BY updated_at DESC, issue_identifier ASC",
                     parameters,
@@ -728,7 +734,13 @@ class RuntimeStore:
             return self._write(write)
 
         values = self._decode_cursor(cursor, ("snapshot_id", "position"))
-        with self._connect() as connection:
+        def read(connection: sqlite3.Connection) -> dict | None:
+            self._cleanup_expired_task_page_snapshots(connection)
+            snapshot = connection.execute(
+                "SELECT id FROM task_page_snapshots WHERE id = ?", (values["snapshot_id"],)
+            ).fetchone()
+            if snapshot is None:
+                return None
             rows = connection.execute(
                 """
                 SELECT task_page_snapshot_entries.position AS snapshot_position, issue_runs.*
@@ -740,13 +752,34 @@ class RuntimeStore:
                 """,
                 (values["snapshot_id"], values["position"], page_limit + 1),
             ).fetchall()
-        page_rows = rows[:page_limit]
-        next_cursor = None
-        if len(rows) > page_limit and page_rows:
-            next_cursor = self._encode_cursor(
-                {"snapshot_id": values["snapshot_id"], "position": page_rows[-1]["snapshot_position"]}
+            page_rows = rows[:page_limit]
+            next_cursor = None
+            if len(rows) > page_limit and page_rows:
+                next_cursor = self._encode_cursor(
+                    {"snapshot_id": values["snapshot_id"], "position": page_rows[-1]["snapshot_position"]}
+                )
+            return {"items": [self._task_from_row(row) for row in page_rows], "next_cursor": next_cursor}
+
+        result = self._write(read)
+        if result is None:
+            raise RuntimeStoreInputError("Expired pagination cursor")
+        return result
+
+    def _cleanup_expired_task_page_snapshots(self, connection: sqlite3.Connection) -> None:
+        cutoff = time.time() - self.TASK_PAGE_SNAPSHOT_TTL_SECONDS
+        connection.execute(
+            """
+            DELETE FROM task_page_snapshots
+            WHERE id IN (
+                SELECT id
+                FROM task_page_snapshots
+                WHERE created_at < ?
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?
             )
-        return {"items": [self._task_from_row(row) for row in page_rows], "next_cursor": next_cursor}
+            """,
+            (cutoff, self.TASK_PAGE_SNAPSHOT_CLEANUP_BATCH_SIZE),
+        )
 
     @staticmethod
     def _decode_cursor(cursor: str | None, fields: tuple[str, ...]) -> dict | None:
