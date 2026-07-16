@@ -26,6 +26,7 @@ from symphonz.service.workflow import load_workflow
 
 _LOCAL_PUBLIC_BASE_URL = "http://127.0.0.1"
 _HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+_IPV4_NUMBER = re.compile(r"(?:0[xX][0-9A-Fa-f]+|[0-9]+)")
 
 
 @dataclass(frozen=True)
@@ -263,17 +264,22 @@ def _validate_dashboard_configuration(
     if public_base_url is None:
         if not bind_is_loopback:
             raise ValueError("A usable explicit public_base_url is required for non-loopback dashboard binding")
-        validated_public_url = f"http://127.0.0.1:{port}"
+        normalized_bind_host = validated_host.rstrip(".")
+        public_host = (
+            "127.0.0.1"
+            if normalized_bind_host.casefold() == "localhost"
+            else str(ipaddress.IPv4Address(normalized_bind_host))
+        )
+        validated_public_url = f"http://{public_host}:{port}"
     else:
         validated_public_url = _public_base_url(public_base_url)
 
     parsed_public_url = urlsplit(validated_public_url)
     public_host = parsed_public_url.hostname or ""
-    if _is_wildcard_host(public_host):
-        raise ValueError("public_base_url must not use a wildcard host")
+    public_is_loopback = _validate_public_host(public_host)
     if parsed_public_url.port == 0:
         raise ValueError("public_base_url must use a positive port")
-    if not bind_is_loopback and _is_loopback_host(public_host):
+    if not bind_is_loopback and public_is_loopback:
         raise ValueError("public_base_url must be reachable from the non-loopback dashboard network")
 
     return _DashboardConfiguration(
@@ -290,10 +296,17 @@ def _validate_bind_host(value: str) -> str:
     if any(character.isspace() or ord(character) <= 31 or ord(character) == 127 for character in value):
         raise ValueError("Dashboard host must not contain whitespace or control characters")
     try:
-        ipaddress.ip_address(value)
-        return value
+        address = ipaddress.ip_address(value)
     except ValueError:
-        pass
+        if ":" in value:
+            raise ValueError("Dashboard host must be an IP address or valid hostname")
+    else:
+        if address.version == 6:
+            raise ValueError(
+                "Dashboard 0.4 requires an IPv4 bind host; use an IPv4 address or hostname "
+                "and configure public_base_url with the IPv6 proxy URL"
+            )
+        return value
 
     hostname = value[:-1] if value.endswith(".") else value
     labels = hostname.split(".")
@@ -317,11 +330,33 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
-def _is_wildcard_host(host: str) -> bool:
+def _validate_public_host(host: str) -> bool:
+    normalized = host[:-1] if host.endswith(".") else host
     try:
-        return ipaddress.ip_address(host.rstrip(".")).is_unspecified
+        address = ipaddress.ip_address(normalized)
     except ValueError:
-        return False
+        labels = normalized.split(".")
+        numeric_ipv4_alias = (
+            1 <= len(labels) <= 4
+            and all(_IPV4_NUMBER.fullmatch(label) is not None for label in labels)
+        )
+        if (
+            not normalized
+            or not normalized.isascii()
+            or len(normalized) > 253
+            or any(_HOST_LABEL.fullmatch(label) is None for label in labels)
+            or numeric_ipv4_alias
+        ):
+            raise ValueError("public_base_url must use a valid public host")
+        folded = normalized.casefold()
+        return folded == "localhost" or folded.endswith(".localhost")
+
+    effective_address = address
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        effective_address = address.ipv4_mapped
+    if effective_address.is_unspecified:
+        raise ValueError("public_base_url must not use a wildcard host")
+    return effective_address.is_loopback
 
 
 def _build_auth_service(

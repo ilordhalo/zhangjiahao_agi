@@ -3426,6 +3426,46 @@ class RunnerCompositionTests(unittest.TestCase):
 
         self.dashboard_constructor.assert_not_called()
 
+    def test_dashboard_derives_public_url_from_exact_ipv4_loopback_bind(self):
+        self._write_auth()
+        expected_urls = (
+            ("127.0.0.1", "http://127.0.0.1:4000"),
+            ("127.0.0.2", "http://127.0.0.2:4000"),
+            ("localhost", "http://127.0.0.1:4000"),
+        )
+
+        for host, expected_url in expected_urls:
+            with self.subTest(host=host):
+                result = self._run_dashboard(host=host, port=4000)
+
+                self.assertEqual(result, 0)
+                self.assertEqual(
+                    self.orchestrator.report_synchronizer.public_base_url,
+                    expected_url,
+                )
+
+    def test_dashboard_rejects_ipv6_bind_hosts_before_auth_or_bind(self):
+        invalid_bind_hosts = (
+            ("::1", None),
+            ("::", "https://reports.example.test"),
+            ("2001:db8::10", "https://[2001:db8::20]/proxy"),
+        )
+
+        for host, public_base_url in invalid_bind_hosts:
+            with self.subTest(host=host):
+                with mock.patch(
+                    "symphonz.service.runner.read_dashboard_auth",
+                    side_effect=AssertionError("dashboard auth must not be loaded"),
+                ) as auth_loader:
+                    with self.assertRaisesRegex(ValueError, "IPv4 bind host"):
+                        self._run_dashboard(
+                            host=host,
+                            port=4000,
+                            public_base_url=public_base_url,
+                        )
+                auth_loader.assert_not_called()
+                self.dashboard_constructor.assert_not_called()
+
     def test_dashboard_rejects_invalid_effective_settings_before_server_construction(self):
         self._write_auth()
         invalid_settings = (
@@ -3452,11 +3492,28 @@ class RunnerCompositionTests(unittest.TestCase):
         self._write_auth()
         unusable_urls = (
             None,
+            "http://2130706433:4000",
+            "http://127.1:4000",
+            "http://0x7f000001:4000",
             "http://127.0.0.1:4000",
             "http://localhost:4000",
+            "http://reports.localhost:4000",
             "http://0.0.0.0:4000",
             "http://0.0.0.0.:4000",
+            "http://[::1]:4000",
             "http://[::]:4000",
+            "http://[::ffff:127.0.0.1]:4000",
+            "http://[::ffff:0.0.0.0]:4000",
+            "https://-bad.example",
+            "https://reports..example",
+            "https://operator:secret@reports.example.test",
+            "https://operator@reports.example.test",
+            "https://:4000",
+            "https://reports.example.test:",
+            "https://reports.example.test:0",
+            "https://reports.example.test:65536",
+            "https://2001:db8::20",
+            "https:///reports.example.test",
         )
 
         for public_base_url in unusable_urls:
@@ -3468,6 +3525,44 @@ class RunnerCompositionTests(unittest.TestCase):
                         public_base_url=public_base_url,
                     )
                 self.dashboard_constructor.assert_not_called()
+
+    def test_non_loopback_dashboard_preserves_safe_public_urls(self):
+        self._write_auth()
+        valid_urls = (
+            (
+                "http://reports.example.test:4000/base/",
+                "http://reports.example.test:4000/base",
+                False,
+            ),
+            (
+                "https://reports.example.test./base/",
+                "https://reports.example.test./base",
+                True,
+            ),
+            (
+                "https://[2001:db8::20]:4000/proxy/",
+                "https://[2001:db8::20]:4000/proxy",
+                True,
+            ),
+        )
+
+        for public_base_url, expected_url, secure_cookie in valid_urls:
+            with self.subTest(public_base_url=public_base_url):
+                result = self._run_dashboard(
+                    host="0.0.0.0",
+                    port=4000,
+                    public_base_url=public_base_url,
+                )
+
+                self.assertEqual(result, 0)
+                self.assertEqual(
+                    self.orchestrator.report_synchronizer.public_base_url,
+                    expected_url,
+                )
+                self.assertIs(
+                    self.dashboard_constructor.call_args.args[3].secure_cookie,
+                    secure_cookie,
+                )
 
     def test_wildcard_bind_uses_public_url_and_persists_effective_port_mismatch_warning(self):
         from symphonz.service.runtime_store import RuntimeStore
