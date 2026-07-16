@@ -8,8 +8,9 @@
 - Reports render as deterministic escaped HTML/CSS, including architecture,
   validation, review metadata, sticky navigation, collapsible decisions, and
   print styles. Agent-supplied markup is never treated as HTML.
-- Publication replaces same-directory `report.json` and `report.html` through
-  fsynced temporary files and stable issue report URLs.
+- Publication writes versioned report generations through fsynced temporary
+  files and records a stable issue report URL. The authenticated handler for
+  that URL is explicitly deferred to Task 4.
 - RuntimeStore records report state before Linear synchronization. The
   runtime-owned `## Symphonz Implementation Report` comment is created once,
   updated on subsequent publication, and failed synchronization stays pending
@@ -36,9 +37,10 @@
 ## Follow-up Risk
 
 `CodexAppServerTests.test_never_approval_policy_rejects_unexpected_approval_request`
-is timing-sensitive: it failed intermittently during an earlier service/full
-run and passed in the final focused service and serial full-suite runs. This
-task does not modify the app-server path.
+is timing-sensitive. During this re-review it passed in isolation but failed
+in two serial full-suite runs because the fake app server did not record the
+decline response before process cleanup. This task does not modify the
+app-server path.
 
 ## Review Fixes 3-11
 
@@ -59,7 +61,8 @@ task does not modify the app-server path.
   `report-<generation>.html` files. RuntimeStore paths switch only after both
   files and the issue directory are fsynced. A second-write failure preserves
   the previous paths and files; successful replacement removes the superseded
-  generation. Stable report routes consume the RuntimeStore HTML path.
+  generation. Task 4 will serve the RuntimeStore-authoritative HTML generation
+  through safe artifact access; Task 3 does not implement an HTTP route.
 - `symphonz_report` now advertises a recursive strict schema with publish const,
   required fields, exact object properties, and runtime-aligned string and
   collection limits.
@@ -107,3 +110,39 @@ full-suite retry. No runner, orchestrator, or app-server code changed.
   and `runner.py` with a production-shaped test.
 - Call the concrete `ReportPublisher.sync_pending()` from `Orchestrator.tick()`,
   prove restart recovery, and remove the process-global weak registries.
+
+## Re-review Fixes 12-17
+
+- Report-sync leases now use unique owners, owner-conditional state updates,
+  and an active heartbeat renewal. A worker that observes lease loss stops
+  before a Linear create/update or report-state write.
+- `ReportPublisher` retains the validated artifact-root directory descriptor
+  for its lifetime. RuntimeStore persists relative generation names, and the
+  publisher exposes pinned-root `read_current_json()` and `read_current_html()`
+  accessors for Task 4.
+- After each successful generation commit, the issue directory is scanned and
+  every non-authoritative `report-*.json` or `report-*.html` file is removed.
+- AI-controlled Linear fields neutralize bare `http://` and `https://` text in
+  addition to existing Markdown-significant characters.
+- The advertised `review.url` schema now requires an HTTP(S) pattern and
+  rejects obvious credential-bearing authorities, matching runtime URL checks.
+- The stable report URL remains a Task 4 authenticated-handler requirement;
+  this Task 3 implementation publishes and safely reads only the authoritative
+  artifact generation.
+
+## Re-review Verification
+
+- RED: `python3 -m unittest tests.test_symphonz_reporting tests.test_symphonz_service -v`
+  failed as expected before implementation, covering the missing lease renewal,
+  owner fencing, safe readers, relative names, orphan cleanup, URL neutralizing,
+  and URL-schema behavior.
+- `python3 -m unittest tests.test_symphonz_reporting -v`: 20 passed.
+- `python3 -m unittest tests.test_symphonz_service -v`: 80 passed.
+- `python3 -m unittest discover -v`: two final serial runs each completed 166
+  passing tests and failed only in the known timing-sensitive
+  `CodexAppServerTests.test_never_approval_policy_rejects_unexpected_approval_request`.
+  Its isolated invocation passed; no forbidden app-server path was changed.
+- `env PYTHONPYCACHEPREFIX=/private/tmp/symphonz-pycache python3 -m py_compile
+  symphonz/service/reporting.py symphonz/service/runtime_store.py
+  tests/test_symphonz_reporting.py tests/test_symphonz_service.py`: passed.
+- `git diff --check`: passed.

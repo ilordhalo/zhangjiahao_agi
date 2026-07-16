@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
+import re
 import tempfile
 import threading
+import time
 import unittest
 
 
@@ -125,6 +127,9 @@ class ReportingTests(unittest.TestCase):
             **arguments
         )
 
+    def artifact_path(self, entry, key):
+        return self.root / "artifacts" / entry["issue_identifier"] / entry[key]
+
     def test_report_renderer_escapes_agent_text_and_contains_required_sections(self):
         from symphonz.service.reporting import render_report, validate_report
 
@@ -164,10 +169,12 @@ class ReportingTests(unittest.TestCase):
         self.assertNotEqual(first_entry["html_path"], second_entry["html_path"])
         self.assertRegex(Path(second_entry["json_path"]).name, r"^report-[a-z0-9]+\.json$")
         self.assertRegex(Path(second_entry["html_path"]).name, r"^report-[a-z0-9]+\.html$")
-        self.assertEqual(json.loads(Path(second_entry["json_path"]).read_text())["summary"], "Second publication.")
-        self.assertIn("Second publication.", Path(second_entry["html_path"]).read_text())
-        self.assertFalse(Path(first_entry["json_path"]).exists())
-        self.assertFalse(Path(first_entry["html_path"]).exists())
+        self.assertFalse(Path(second_entry["json_path"]).is_absolute())
+        self.assertFalse(Path(second_entry["html_path"]).is_absolute())
+        self.assertEqual(json.loads(publisher.read_current_json("SYM-123"))["summary"], "Second publication.")
+        self.assertIn("Second publication.", publisher.read_current_html("SYM-123"))
+        self.assertFalse(self.artifact_path(first_entry, "json_path").exists())
+        self.assertFalse(self.artifact_path(first_entry, "html_path").exists())
         self.assertFalse(list(report_dir.glob("*.tmp")))
         with self.assertRaisesRegex(ValueError, "active issue"):
             publisher.publish(valid_report(issue_identifier="SYM-999"))
@@ -193,10 +200,25 @@ class ReportingTests(unittest.TestCase):
         current = self.store.get_report("SYM-123")
         self.assertEqual(current["json_path"], previous["json_path"])
         self.assertEqual(current["html_path"], previous["html_path"])
-        self.assertIn("Authoritative report.", Path(current["html_path"]).read_text())
+        self.assertIn("Authoritative report.", publisher.read_current_html("SYM-123"))
         self.assertEqual(
-            sorted(path.name for path in Path(current["html_path"]).parent.iterdir()),
+            sorted(path.name for path in (self.root / "artifacts" / "SYM-123").iterdir()),
             sorted([Path(current["json_path"]).name, Path(current["html_path"]).name]),
+        )
+
+    def test_successful_publish_removes_every_non_authoritative_generation(self):
+        publisher = self.publisher()
+        publisher.publish(valid_report(summary="First generation."))
+        report_dir = self.root / "artifacts" / "SYM-123"
+        (report_dir / "report-crash.json").write_text("{}", encoding="utf-8")
+        (report_dir / "report-crash.html").write_text("orphan", encoding="utf-8")
+
+        publisher.publish(valid_report(summary="Second generation."))
+
+        entry = self.store.get_report("SYM-123")
+        self.assertEqual(
+            sorted(path.name for path in report_dir.iterdir()),
+            sorted([entry["json_path"], entry["html_path"]]),
         )
 
     def test_linear_comment_is_created_once_and_updated_on_republish(self):
@@ -239,7 +261,7 @@ class ReportingTests(unittest.TestCase):
         self.linear.fail = True
         publisher.publish(valid_report())
         pending = self.store.get_report("SYM-123")
-        Path(pending["json_path"]).unlink()
+        self.artifact_path(pending, "json_path").unlink()
         self.linear.fail = False
 
         self.assertEqual(publisher.sync_pending(now=pending["next_retry_at"]), 0)
@@ -256,7 +278,7 @@ class ReportingTests(unittest.TestCase):
         self.linear.fail = True
         publisher.publish(valid_report())
         pending = self.store.get_report("SYM-123")
-        Path(pending["json_path"]).write_text("{not-json", encoding="utf-8")
+        self.artifact_path(pending, "json_path").write_text("{not-json", encoding="utf-8")
         self.linear.fail = False
 
         self.assertEqual(publisher.sync_pending(now=pending["next_retry_at"]), 0)
@@ -362,6 +384,81 @@ class ReportingTests(unittest.TestCase):
         creates = [query for query, _ in linear.calls if "SymphonzCreateReportComment" in query]
         self.assertEqual(len(creates), 1)
 
+    def test_sync_heartbeat_keeps_a_slow_linear_operation_exclusively_leased(self):
+        lookup_started = threading.Event()
+        release_lookup = threading.Event()
+
+        class SlowLinearClient(FakeLinearClient):
+            block = False
+
+            def graphql(self, query, variables):
+                if self.block and "SymphonzFindReportComment" in query and not lookup_started.is_set():
+                    lookup_started.set()
+                    release_lookup.wait(timeout=2)
+                return super().graphql(query, variables)
+
+        linear = SlowLinearClient()
+        linear.fail = True
+        first = self.publisher(linear_client=linear, sync_lease_seconds=0.06)
+        first.publish(valid_report())
+        pending = self.store.get_report("SYM-123")
+        linear.fail = False
+        linear.block = True
+        second = self.publisher(
+            store=type(self.store)(self.root / "runtime.sqlite3"),
+            linear_client=linear,
+            sync_lease_seconds=0.06,
+        )
+        results = []
+
+        worker = threading.Thread(target=lambda: results.append(first.sync_pending(now=pending["next_retry_at"])))
+        worker.start()
+        self.assertTrue(lookup_started.wait(timeout=2))
+        time.sleep(0.15)
+        results.append(second.sync_pending(now=time.time()))
+        release_lookup.set()
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(sorted(results), [0, 1])
+        creates = [query for query, _ in linear.calls if "SymphonzCreateReportComment" in query]
+        self.assertEqual(len(creates), 1)
+
+    def test_worker_that_loses_its_lease_does_not_mutate_linear_or_sync_state(self):
+        class LeaseStealingLinearClient(FakeLinearClient):
+            publisher = None
+            steal = False
+
+            def graphql(self, query, variables):
+                if self.steal and "SymphonzFindReportComment" in query:
+                    self.steal = False
+                    self.publisher.store.claim_report_sync(
+                        "SYM-123", owner="replacement", now=time.time() + 60, lease_seconds=30,
+                    )
+                return super().graphql(query, variables)
+
+        linear = LeaseStealingLinearClient()
+        linear.fail = True
+        publisher = self.publisher(linear_client=linear)
+        linear.publisher = publisher
+        publisher.publish(valid_report())
+        pending = self.store.get_report("SYM-123")
+        linear.fail = False
+        linear.steal = True
+        linear.calls.clear()
+
+        self.assertEqual(publisher.sync_pending(now=pending["next_retry_at"]), 0)
+
+        self.assertEqual(self.store.get_report("SYM-123")["linear_sync_status"], "pending")
+        self.assertEqual(
+            [query for query, _ in linear.calls if "SymphonzCreateReportComment" in query],
+            [],
+        )
+        self.assertEqual(
+            [query for query, _ in linear.calls if "SymphonzUpdateReportComment" in query],
+            [],
+        )
+
     def test_graphql_business_failure_or_missing_comment_id_remains_pending(self):
         self.linear.create_success = False
         created = self.publisher().publish(valid_report())
@@ -385,7 +482,7 @@ class ReportingTests(unittest.TestCase):
     def test_linear_markdown_neutralizes_ai_controlled_fields(self):
         publisher = self.publisher()
         report = valid_report(
-            summary="@all\n## forged heading\n[click](https://evil.test)\n```owned```",
+            summary="@all\n## forged heading\n[click](https://evil.test)\n```owned``` http://evil.test/x https://evil.test/y",
             review={
                 **valid_report()["review"],
                 "branch": "topic`\n@team",
@@ -401,6 +498,8 @@ class ReportingTests(unittest.TestCase):
         self.assertNotIn("[click](", body)
         self.assertNotIn("```owned```", body)
         self.assertNotIn("`topic`", body)
+        self.assertNotIn("http://evil.test", body)
+        self.assertNotIn("https://evil.test", body)
         self.assertEqual(body.count("## Symphonz Implementation Report"), 1)
 
     def test_report_sync_failure_uses_error_sink_and_later_success_resolves_database_error(self):
@@ -465,3 +564,8 @@ class ReportingTests(unittest.TestCase):
             set(schema["properties"]["review"]["required"]),
             {"provider", "url", "branch", "commit", "target"},
         )
+        url_schema = schema["properties"]["review"]["properties"]["url"]
+        self.assertIn("pattern", url_schema)
+        self.assertIsNone(re.fullmatch(url_schema["pattern"], "https://user:secret@reviews.example.test/1"))
+        self.assertIsNone(re.fullmatch(url_schema["pattern"], "ftp://reviews.example.test/1"))
+        self.assertIsNotNone(re.fullmatch(url_schema["pattern"], "https://reviews.example.test/1?view=full"))

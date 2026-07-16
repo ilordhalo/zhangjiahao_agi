@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import threading
 import time
 from urllib.parse import unquote, urlsplit, urlunsplit
 import weakref
@@ -25,12 +26,68 @@ _MAX_EDGES = 48
 _MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
 _SYNC_LEASE_SECONDS = 30.0
 _BUNDLE_NAME = re.compile(r"report-[a-z0-9]+\.(?:json|html)$")
+_HTTP_URL_SCHEMA_PATTERN = r"^https?://[^/@\s]+(?:[/?#][^\s]*)?$"
 _PUBLISHERS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _PUBLISHERS_BY_ID: dict[int, "ReportPublisher"] = {}
 
 
 class ReportValidationError(ValueError):
     """Raised when a report payload cannot be safely persisted or rendered."""
+
+
+class _SyncLeaseLost(RuntimeError):
+    """Raised internally when another worker owns the report-sync lease."""
+
+
+class _SyncLeaseHeartbeat:
+    """Keeps a claimed SQLite lease alive while Linear pagination or mutations run."""
+
+    def __init__(self, store, issue_identifier: str, owner: str, lease_seconds: float):
+        self.store = store
+        self.issue_identifier = issue_identifier
+        self.owner = owner
+        self.lease_seconds = lease_seconds
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._last_renewed_at: float | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=max(1.0, self.lease_seconds * 2))
+
+    def require_owned(self, now: float) -> None:
+        checked_at = self.lease_checked_at(now)
+        if self._lost.is_set() or not self.store.owns_report_sync_lease(
+            self.issue_identifier, owner=self.owner, now=checked_at,
+        ):
+            self._lost.set()
+            raise _SyncLeaseLost("Report synchronization lease was lost.")
+
+    def lease_checked_at(self, fallback: float) -> float:
+        return self._last_renewed_at if self._last_renewed_at is not None else fallback
+
+    def _run(self) -> None:
+        interval = max(0.01, self.lease_seconds / 3)
+        while not self._stop.wait(interval):
+            renewed_at = time.time()
+            try:
+                renewed = self.store.renew_report_sync(
+                    self.issue_identifier,
+                    owner=self.owner,
+                    now=renewed_at,
+                    lease_seconds=self.lease_seconds,
+                )
+            except Exception:
+                self._lost.set()
+                return
+            if not renewed:
+                self._lost.set()
+                return
+            self._last_renewed_at = renewed_at
 
 
 @dataclass(frozen=True)
@@ -168,7 +225,7 @@ def report_tool_spec() -> dict:
         "type": "object",
         "properties": {
             "provider": short_text,
-            "url": {**text, "format": "uri"},
+            "url": {**text, "format": "uri", "pattern": _HTTP_URL_SCHEMA_PATTERN},
             "branch": short_text,
             "commit": short_text,
             "target": short_text,
@@ -332,23 +389,37 @@ class ReportPublisher:
         active_issue_id: str,
         active_issue_identifier: str,
         error_sink=None,
+        sync_lease_seconds: float = _SYNC_LEASE_SECONDS,
     ):
         self.store = store
         self.artifact_root = Path(os.path.abspath(os.fspath(artifact_root)))
         self.public_base_url = _public_base_url(public_base_url)
         self.linear_client = linear_client
         self.error_sink = error_sink
+        self.sync_lease_seconds = float(sync_lease_seconds)
+        if self.sync_lease_seconds <= 0:
+            raise ValueError("sync_lease_seconds must be positive")
         self.active_issue_id = _text(active_issue_id, "active_issue_id", _MAX_SHORT_TEXT_LENGTH)
         self.active_issue_identifier = _text(active_issue_identifier, "active_issue_identifier", 64)
         if _ISSUE_IDENTIFIER.fullmatch(self.active_issue_identifier) is None:
             raise ValueError("active_issue_identifier must be a safe Linear-style identifier.")
-        artifact_root_fd = _open_pinned_directory(self.artifact_root)
-        try:
-            root_metadata = os.fstat(artifact_root_fd)
-            self._artifact_root_identity = (root_metadata.st_dev, root_metadata.st_ino)
-        finally:
-            os.close(artifact_root_fd)
+        self._artifact_root_fd = _open_pinned_directory(self.artifact_root)
+        root_metadata = os.fstat(self._artifact_root_fd)
+        self._artifact_root_identity = (root_metadata.st_dev, root_metadata.st_ino)
         _register_publisher(linear_client, self)
+
+    def close(self) -> None:
+        """Release the pinned artifact-root descriptor when the publisher is retired."""
+        descriptor = getattr(self, "_artifact_root_fd", -1)
+        if descriptor >= 0:
+            self._artifact_root_fd = -1
+            os.close(descriptor)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def report_url(self, issue_identifier: str) -> str:
         if issue_identifier != self.active_issue_identifier:
@@ -364,8 +435,6 @@ class ReportPublisher:
         generation = secrets.token_hex(12)
         json_name = f"report-{generation}.json"
         html_name = f"report-{generation}.html"
-        json_path = self.artifact_root / document.issue_identifier / json_name
-        html_path = self.artifact_root / document.issue_identifier / html_name
         directory_fd = self._open_issue_directory(document.issue_identifier, create=True)
         try:
             try:
@@ -381,8 +450,8 @@ class ReportPublisher:
                     {
                         "issue_identifier": document.issue_identifier,
                         "report_version": 1,
-                        "json_path": str(json_path),
-                        "html_path": str(html_path),
+                        "json_path": json_name,
+                        "html_path": html_name,
                         "url": self.report_url(document.issue_identifier),
                         "review_metadata": document.to_payload()["review"],
                         "linear_comment_id": (existing or {}).get("linear_comment_id"),
@@ -399,7 +468,7 @@ class ReportPublisher:
                 self._unlink_bundle_files(directory_fd, json_name, html_name)
                 raise
             entry = self.store.get_report(document.issue_identifier)
-            self._cleanup_previous_bundle(directory_fd, existing, entry)
+            self._cleanup_unreferenced_generations(directory_fd, entry)
         finally:
             os.close(directory_fd)
         self._update_task(document, now)
@@ -408,7 +477,7 @@ class ReportPublisher:
             document.issue_identifier,
             owner=owner,
             now=now,
-            lease_seconds=_SYNC_LEASE_SECONDS,
+            lease_seconds=self.sync_lease_seconds,
         )
         if claimed is not None:
             self._sync_claimed(claimed, owner, now)
@@ -429,7 +498,7 @@ class ReportPublisher:
                     entry["issue_identifier"],
                     owner=owner,
                     now=current,
-                    lease_seconds=_SYNC_LEASE_SECONDS,
+                    lease_seconds=self.sync_lease_seconds,
                 )
                 if claimed is not None and self._sync_claimed(claimed, owner, current):
                     synced += 1
@@ -445,10 +514,16 @@ class ReportPublisher:
         descriptor = _open_existing_directory(self.artifact_root, self._artifact_root_identity)
         os.close(descriptor)
 
+    def _borrow_root_fd(self) -> int:
+        self._assert_root_unchanged()
+        if self._artifact_root_fd < 0:
+            raise RuntimeError("Report publisher has been closed.")
+        return os.dup(self._artifact_root_fd)
+
     def _open_issue_directory(self, issue_identifier: str, *, create: bool) -> int:
         if _ISSUE_IDENTIFIER.fullmatch(issue_identifier) is None:
             raise RuntimeError("Report issue directory is outside the artifact root.")
-        root_fd = _open_existing_directory(self.artifact_root, self._artifact_root_identity)
+        root_fd = self._borrow_root_fd()
         try:
             if create:
                 try:
@@ -518,18 +593,15 @@ class ReportPublisher:
         if changed:
             os.fsync(directory_fd)
 
-    def _cleanup_previous_bundle(self, directory_fd: int, previous: dict | None, current: dict) -> None:
-        if previous is None:
-            return
-        current_names = {Path(current["json_path"]).name, Path(current["html_path"]).name}
-        stale_names = []
-        for key in ("json_path", "html_path"):
-            value = previous.get(key)
-            if not value:
-                continue
-            candidate = Path(value)
-            if candidate.parent == self.artifact_root / current["issue_identifier"] and candidate.name not in current_names:
-                stale_names.append(candidate.name)
+    def _cleanup_unreferenced_generations(self, directory_fd: int, current: dict) -> None:
+        current_names = {
+            self._artifact_filename(current.get("json_path"), current["issue_identifier"], ".json"),
+            self._artifact_filename(current.get("html_path"), current["issue_identifier"], ".html"),
+        }
+        stale_names = [
+            name for name in os.listdir(directory_fd)
+            if _BUNDLE_NAME.fullmatch(name) is not None and name not in current_names
+        ]
         self._unlink_bundle_files(directory_fd, *stale_names)
 
     def _update_task(self, document: ReportDocument, now: float) -> None:
@@ -547,20 +619,59 @@ class ReportPublisher:
         )
 
     def _sync_claimed(self, entry: dict, owner: str, now: float) -> bool:
+        heartbeat = _SyncLeaseHeartbeat(
+            self.store,
+            entry["issue_identifier"],
+            owner,
+            self.sync_lease_seconds,
+        )
+        heartbeat.start()
         try:
+            heartbeat.require_owned(now)
             document = self._load_report_document(entry)
             self._validate_active_issue(document)
-            self._sync(document, entry, now)
+            self._sync(document, entry, now, heartbeat)
             return True
+        except _SyncLeaseLost:
+            return False
         except Exception as error:
-            self._pending_after_failure(entry, error, now)
+            self._pending_after_failure(entry, error, now, owner)
             return False
         finally:
+            heartbeat.stop()
             self.store.release_report_sync(entry["issue_identifier"], owner=owner)
 
+    def read_current_json(self, issue_identifier: str) -> str:
+        """Safely read the RuntimeStore-authoritative JSON generation for Task 4."""
+        entry = self._current_report_entry(issue_identifier)
+        return self._read_artifact(entry, "json_path", ".json")
+
+    def read_current_html(self, issue_identifier: str) -> str:
+        """Safely read the RuntimeStore-authoritative HTML generation for Task 4."""
+        entry = self._current_report_entry(issue_identifier)
+        return self._read_artifact(entry, "html_path", ".html")
+
+    def _current_report_entry(self, issue_identifier: str) -> dict:
+        if issue_identifier != self.active_issue_identifier:
+            raise ValueError("Report issue identifier does not match the active issue.")
+        entry = self.store.get_report(issue_identifier)
+        if entry is None:
+            raise RuntimeError("Report artifact is missing from RuntimeStore.")
+        return entry
+
     def _load_report_document(self, entry: dict) -> ReportDocument:
+        content = self._read_artifact(entry, "json_path", ".json")
+        if len(content.encode("utf-8")) > _MAX_ARTIFACT_BYTES:
+            raise RuntimeError("Report JSON artifact exceeds the safe size limit.")
+        try:
+            payload = json.loads(content)
+        except (json.JSONDecodeError, UnicodeError) as error:
+            raise RuntimeError("Report JSON artifact is corrupt.") from error
+        return validate_report(payload)
+
+    def _read_artifact(self, entry: dict, key: str, suffix: str) -> str:
         issue_identifier = str(entry.get("issue_identifier") or "")
-        filename = self._artifact_filename(entry.get("json_path"), issue_identifier, ".json")
+        filename = self._artifact_filename(entry.get(key), issue_identifier, suffix)
         directory_fd = self._open_issue_directory(issue_identifier, create=False)
         descriptor = -1
         try:
@@ -571,21 +682,17 @@ class ReportPublisher:
                     dir_fd=directory_fd,
                 )
             except FileNotFoundError as error:
-                raise RuntimeError("Report JSON artifact is missing.") from error
+                raise RuntimeError("Report artifact is missing.") from error
             metadata = os.fstat(descriptor)
             if not stat.S_ISREG(metadata.st_mode):
-                raise RuntimeError("Report JSON artifact must be a regular file.")
+                raise RuntimeError("Report artifact must be a regular file.")
             source = os.fdopen(descriptor, "r", encoding="utf-8")
             descriptor = -1
             with source:
                 content = source.read(_MAX_ARTIFACT_BYTES + 1)
             if len(content.encode("utf-8")) > _MAX_ARTIFACT_BYTES:
-                raise RuntimeError("Report JSON artifact exceeds the safe size limit.")
-            try:
-                payload = json.loads(content)
-            except (json.JSONDecodeError, UnicodeError) as error:
-                raise RuntimeError("Report JSON artifact is corrupt.") from error
-            return validate_report(payload)
+                raise RuntimeError("Report artifact exceeds the safe size limit.")
+            return content
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -595,17 +702,19 @@ class ReportPublisher:
         if not isinstance(value, str):
             raise RuntimeError("Report artifact path is missing from RuntimeStore.")
         candidate = Path(value)
-        expected_parent = self.artifact_root / issue_identifier
-        if not candidate.is_absolute() or candidate.parent != expected_parent:
-            raise RuntimeError("Report artifact path is outside the pinned artifact root.")
+        if candidate.is_absolute() or candidate.name != value:
+            raise RuntimeError("Report artifact name must be relative to the pinned artifact root.")
         if candidate.suffix != suffix or _BUNDLE_NAME.fullmatch(candidate.name) is None:
             raise RuntimeError("Report artifact path is not a versioned report bundle.")
         return candidate.name
 
-    def _sync(self, document: ReportDocument, entry: dict, now: float) -> None:
+    def _sync(self, document: ReportDocument, entry: dict, now: float, heartbeat) -> None:
+        heartbeat.require_owned(now)
         comment_id = entry.get("linear_comment_id") or self._find_comment_id(document.issue_id)
+        heartbeat.require_owned(now)
         body = self._comment_body(document, entry["url"], now)
         if comment_id:
+            heartbeat.require_owned(now)
             result = self._graphql(
                 "mutation SymphonzUpdateReportComment($id: String!, $input: CommentUpdateInput!) { "
                 "commentUpdate(id: $id, input: $input) { success comment { id } } }",
@@ -613,12 +722,14 @@ class ReportPublisher:
             )
             comment_id = self._mutation_comment_id(result, "commentUpdate")
         else:
+            heartbeat.require_owned(now)
             result = self._graphql(
                 "mutation SymphonzCreateReportComment($input: CommentCreateInput!) { "
                 "commentCreate(input: $input) { success comment { id } } }",
                 {"input": {"issueId": document.issue_id, "body": body}},
             )
             comment_id = self._mutation_comment_id(result, "commentCreate")
+        heartbeat.require_owned(now)
         updated = self._save_sync_state(
             entry,
             status="synced",
@@ -626,7 +737,11 @@ class ReportPublisher:
             next_retry_at=None,
             now=now,
             comment_id=comment_id,
+            owner=heartbeat.owner,
+            lease_checked_at=heartbeat.lease_checked_at(now),
         )
+        if updated is None:
+            raise _SyncLeaseLost("Report synchronization lease was lost before state persistence.")
         if updated.get("json_path") == entry.get("json_path") and updated.get("linear_sync_status") == "synced":
             self.store.resolve_report_sync_errors(
                 updated["issue_identifier"],
@@ -645,7 +760,7 @@ class ReportPublisher:
             raise RuntimeError(f"Linear {mutation_name} did not return a valid comment identifier.")
         return comment_id
 
-    def _pending_after_failure(self, entry: dict, error: Exception, now: float) -> dict:
+    def _pending_after_failure(self, entry: dict, error: Exception, now: float, owner: str) -> dict | None:
         retries = int(entry.get("retry_count") or 0) + 1
         retry_at = now + min(300.0, float(2 ** min(retries - 1, 8)))
         pending = self._save_sync_state(
@@ -655,7 +770,10 @@ class ReportPublisher:
             next_retry_at=retry_at,
             now=now,
             comment_id=entry.get("linear_comment_id"),
+            owner=owner,
         )
+        if pending is None:
+            return None
         record = RuntimeErrorRecord(
             issue_identifier=entry["issue_identifier"],
             stage="report_sync",
@@ -678,17 +796,21 @@ class ReportPublisher:
         next_retry_at: float | None,
         now: float,
         comment_id: str | None,
-    ) -> dict:
-        self.store.update_report_sync_state(
+        owner: str,
+        lease_checked_at: float | None = None,
+    ) -> dict | None:
+        updated = self.store.update_report_sync_state(
             entry["issue_identifier"],
             expected_json_path=entry["json_path"],
+            owner=owner,
             linear_sync_status=status,
             linear_comment_id=comment_id,
             retry_count=retry_count,
             next_retry_at=next_retry_at,
             updated_at=now,
+            lease_checked_at=lease_checked_at,
         )
-        return self.store.get_report(entry["issue_identifier"])
+        return self.store.get_report(entry["issue_identifier"]) if updated else None
 
     def _emit_error(self, record: RuntimeErrorRecord) -> None:
         if self.error_sink is None:
@@ -921,7 +1043,7 @@ def _text_schema(maximum_length: int) -> dict:
 
 def _neutralize_markdown(value: str) -> str:
     collapsed = " ".join(value.split())
-    return collapsed.translate(
+    neutralized = collapsed.translate(
         {
             ord("@"): "\uFF20",
             ord("#"): "\uFF03",
@@ -935,6 +1057,7 @@ def _neutralize_markdown(value: str) -> str:
             ord("\\"): "\uFF3C",
         }
     )
+    return neutralized.replace("https://", "https\uFF1A\uFF0F\uFF0F").replace("http://", "http\uFF1A\uFF0F\uFF0F")
 
 
 def _open_pinned_directory(path: Path) -> int:

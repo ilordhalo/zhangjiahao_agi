@@ -1620,6 +1620,46 @@ class RuntimeStoreTests(unittest.TestCase):
         self.assertTrue(store.release_report_sync("SYM-1", owner="worker-1"))
         self.assertIsNotNone(store.claim_report_sync("SYM-1", owner="worker-2", now=11.0, lease_seconds=30.0))
 
+    def test_report_sync_lease_renewal_and_state_writes_require_current_owner(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.save_report(
+            {
+                "issue_identifier": "SYM-1",
+                "json_path": "report-current.json",
+                "linear_sync_status": "pending",
+            }
+        )
+        store.claim_report_sync("SYM-1", owner="worker-1", now=10.0, lease_seconds=30.0)
+
+        self.assertFalse(store.renew_report_sync("SYM-1", owner="worker-2", now=11.0, lease_seconds=30.0))
+        self.assertTrue(store.renew_report_sync("SYM-1", owner="worker-1", now=11.0, lease_seconds=30.0))
+        self.assertFalse(
+            store.update_report_sync_state(
+                "SYM-1",
+                expected_json_path="report-current.json",
+                owner="worker-2",
+                linear_sync_status="synced",
+                linear_comment_id="comment-1",
+                retry_count=0,
+                next_retry_at=None,
+                updated_at=12.0,
+            )
+        )
+        self.assertTrue(
+            store.update_report_sync_state(
+                "SYM-1",
+                expected_json_path="report-current.json",
+                owner="worker-1",
+                linear_sync_status="synced",
+                linear_comment_id="comment-1",
+                retry_count=0,
+                next_retry_at=None,
+                updated_at=12.0,
+            )
+        )
+
     def test_report_sync_state_update_cannot_replace_a_newer_authoritative_bundle(self):
         from symphonz.service.runtime_store import RuntimeStore
 
@@ -1632,10 +1672,12 @@ class RuntimeStoreTests(unittest.TestCase):
                 "linear_sync_status": "pending",
             }
         )
+        store.claim_report_sync("SYM-1", owner="worker-1", now=10.0, lease_seconds=30.0)
 
         stale = store.update_report_sync_state(
             "SYM-1",
             expected_json_path="/artifacts/SYM-1/report-old.json",
+            owner="worker-1",
             linear_sync_status="synced",
             linear_comment_id="comment-old",
             retry_count=0,

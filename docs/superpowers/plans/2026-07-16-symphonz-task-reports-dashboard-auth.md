@@ -149,7 +149,7 @@ git commit -m "feat(auth): add persistent LAN dashboard sessions"
 - Test: `tests/test_symphonz_service.py`
 
 **Interfaces:**
-- Produces: `report_tool_spec() -> dict`, `ReportPublisher.publish(arguments) -> dict`, `validate_report(payload) -> ReportDocument`, `render_report(document) -> str`, `sync_pending(linear_client, now) -> int`.
+- Produces: `report_tool_spec() -> dict`, `ReportPublisher.publish(arguments) -> dict`, `ReportPublisher.read_current_json(issue_identifier) -> str`, `ReportPublisher.read_current_html(issue_identifier) -> str`, `validate_report(payload) -> ReportDocument`, `render_report(document) -> str`, `sync_pending(linear_client, now) -> int`.
 - Consumes: RuntimeStore report rows, transactional report-sync leases, authoritative artifact paths, artifact root, public base URL, dedicated error sink, and Linear client.
 - Extends dynamic tool routing so `linear_graphql` and `symphonz_report` are both advertised and executed.
 
@@ -182,7 +182,7 @@ class ReportPublisher:
         return {"success": True, "report_url": self.report_url(document.issue_identifier)}
 ```
 
-- [ ] **Step 4: Implement leased, paginated `## Symphonz Implementation Report` upsert, artifact-backed retry state, business-success validation, and error resolution**
+- [ ] **Step 4: Implement owner-fenced, heartbeat-renewed, paginated `## Symphonz Implementation Report` upsert, artifact-backed retry state, business-success validation, and error resolution**
 
 Run: `python3 -m unittest tests.test_symphonz_reporting -v`
 Expected: PASS for create, update, cross-process contention, temporary Linear failure, missing/corrupt artifacts, and restart retry.
@@ -206,6 +206,8 @@ git commit -m "feat(reporting): publish safe implementation reports"
 - Produces HTML routes `/`, `/tasks`, `/issues/{identifier}`, `/issues/{identifier}/report`, `/errors`, `/login`.
 - Produces authenticated JSON routes `/api/overview`, `/api/tasks`, `/api/issues/{identifier}`, `/api/issues/{identifier}/events`, `/api/issues/{identifier}/errors`, `/api/errors`.
 - Consumes: RuntimeStore query APIs, AuthService, and report HTML artifacts.
+
+The authenticated stable report handler is implemented in this Task 4 slice. It must resolve the RuntimeStore-authoritative relative generation through `ReportPublisher.read_current_html()` or an equivalent pinned-root safe read; Task 3 only publishes the bundle and stable URL.
 
 - [ ] **Step 1: Write failing HTTP tests for auth gates, safe redirect, cookies, pages, APIs, report serving, and 404s**
 

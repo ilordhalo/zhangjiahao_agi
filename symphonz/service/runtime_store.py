@@ -403,16 +403,59 @@ class RuntimeStore:
 
         return self._write(write)
 
+    def renew_report_sync(
+        self,
+        issue_identifier: str,
+        *,
+        owner: str,
+        now: float,
+        lease_seconds: float,
+    ) -> bool:
+        """Extend an unexpired report-sync lease held by exactly ``owner``."""
+        if not isinstance(owner, str) or not owner:
+            raise ValueError("Report sync lease owner must be a non-empty string")
+        current = float(now)
+        duration = float(lease_seconds)
+        if duration <= 0:
+            raise ValueError("Report sync lease duration must be positive")
+
+        def write(connection: sqlite3.Connection) -> bool:
+            cursor = connection.execute(
+                """
+                UPDATE report_sync_leases
+                SET expires_at = ?
+                WHERE issue_identifier = ? AND owner = ? AND expires_at > ?
+                """,
+                (current + duration, issue_identifier, owner, current),
+            )
+            return cursor.rowcount == 1
+
+        return self._write(write)
+
+    def owns_report_sync_lease(self, issue_identifier: str, *, owner: str, now: float) -> bool:
+        """Return whether ``owner`` still holds an unexpired report-sync lease."""
+        current = float(now)
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT 1 FROM report_sync_leases
+                WHERE issue_identifier = ? AND owner = ? AND expires_at > ?
+                """,
+                (issue_identifier, owner, current),
+            ).fetchone() is not None
+
     def update_report_sync_state(
         self,
         issue_identifier: str,
         *,
         expected_json_path: str,
+        owner: str,
         linear_sync_status: str,
         linear_comment_id: str | None,
         retry_count: int,
         next_retry_at: float | None,
         updated_at: float,
+        lease_checked_at: float | None = None,
     ) -> bool:
         assignments = [
             "linear_sync_status = ?",
@@ -431,7 +474,12 @@ class RuntimeStore:
         if self._legacy_report_sync_status:
             assignments.append("sync_status = ?")
             parameters.append(linear_sync_status)
-        parameters.extend([issue_identifier, expected_json_path])
+        parameters.extend([
+            issue_identifier,
+            expected_json_path,
+            owner,
+            float(updated_at if lease_checked_at is None else lease_checked_at),
+        ])
 
         def write(connection: sqlite3.Connection) -> bool:
             cursor = connection.execute(
@@ -439,6 +487,12 @@ class RuntimeStore:
                 UPDATE reports
                 SET {', '.join(assignments)}
                 WHERE issue_identifier = ? AND json_path = ?
+                  AND EXISTS (
+                      SELECT 1 FROM report_sync_leases
+                      WHERE report_sync_leases.issue_identifier = reports.issue_identifier
+                        AND report_sync_leases.owner = ?
+                        AND report_sync_leases.expires_at > ?
+                  )
                 """,
                 parameters,
             )
