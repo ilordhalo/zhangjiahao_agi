@@ -29,7 +29,7 @@ _MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
 _SYNC_LEASE_SECONDS = 30.0
 _BUNDLE_NAME = re.compile(r"report-[a-z0-9]+\.(?:json|html)$")
 _HTTP_URL_SCHEMA_PATTERN = (
-    r"^https?://(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])"
+    r"^https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?"
     r"(?::[0-9]{1,5})?(?:/[^\s?#\x00-\x1f\x7f]*)?$"
 )
 _PUBLISHERS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()

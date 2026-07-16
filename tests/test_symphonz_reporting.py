@@ -154,6 +154,14 @@ class ReportingTests(unittest.TestCase):
         with self.assertRaisesRegex(ReportValidationError, "at most"):
             validate_report(valid_report(implementation=["step"] * 51))
 
+    def test_advertised_review_url_schema_rejects_invalid_ipv6_hosts(self):
+        from symphonz.service.reporting import report_tool_spec
+
+        pattern = report_tool_spec()["inputSchema"]["properties"]["review"]["properties"]["url"]["pattern"]
+
+        self.assertIsNone(re.fullmatch(pattern, "https://[::::]/"))
+        self.assertIsNotNone(re.fullmatch(pattern, "https://gitlab.example.test/group/project/-/merge_requests/7"))
+
     def test_publish_uses_stable_url_atomic_replacement_and_active_issue_identity(self):
         publisher = self.publisher()
 
