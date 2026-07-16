@@ -68,6 +68,27 @@ class WorkflowServiceTests(unittest.TestCase):
 
 
 class LinearAndWorkspaceTests(unittest.TestCase):
+    def test_dynamic_tool_router_advertises_and_dispatches_report_tool(self):
+        from symphonz.service.dynamic_tools import dynamic_tool_specs, execute_dynamic_tool
+
+        class Publisher:
+            def publish(self, arguments):
+                self.arguments = arguments
+                return {"success": True, "report_url": "https://reports.example.test/issues/SYM-1/report"}
+
+        publisher = Publisher()
+        specs = dynamic_tool_specs(report_publisher=publisher)
+        result = execute_dynamic_tool(
+            "symphonz_report",
+            {"operation": "publish"},
+            linear_client=None,
+            report_publisher=publisher,
+        )
+
+        self.assertEqual([spec["name"] for spec in specs], ["linear_graphql", "symphonz_report"])
+        self.assertTrue(result["success"])
+        self.assertEqual(publisher.arguments, {"operation": "publish"})
+
     def test_linear_client_paginates_candidates_and_normalizes_blockers(self):
         from symphonz.service.linear import LinearClient
 
