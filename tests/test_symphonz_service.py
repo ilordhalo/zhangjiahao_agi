@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -3347,7 +3347,12 @@ class RunnerCompositionTests(unittest.TestCase):
                 raise RuntimeError("Linear is temporarily unavailable")
 
         issue = Issue(id="issue-1", identifier="SYM-1", title="Publish report", state="Todo")
-        collaborators = build_runtime_collaborators(self.logs_root, FailingLinear())
+        artifacts_root = self.root / "direct-artifacts"
+        collaborators = build_runtime_collaborators(
+            self.logs_root,
+            FailingLinear(),
+            artifacts_root=artifacts_root,
+        )
         publisher = collaborators.report_publisher_factory(issue)
         try:
             result = publisher.publish(self._report_payload(issue))
@@ -3364,7 +3369,152 @@ class RunnerCompositionTests(unittest.TestCase):
         self.assertEqual(len(error_lines), 1)
         self.assertEqual(json.loads(error_lines[0])["message"], "Linear is temporarily unavailable")
         self.assertEqual(report["url"], "http://127.0.0.1/issues/SYM-1/report")
+        self.assertEqual(collaborators.artifacts_root, artifacts_root)
         self.assertTrue((collaborators.artifacts_root / "SYM-1" / report["json_path"]).is_file())
+
+    def test_runtime_collaborators_only_derive_artifact_sibling_for_installed_logs(self):
+        from symphonz.service.runner import build_runtime_collaborators
+
+        with self.assertRaisesRegex(ValueError, "artifacts_root"):
+            build_runtime_collaborators(self.logs_root, mock.Mock())
+
+        installed_logs = self.root / ".symphonz" / "logs"
+        collaborators = build_runtime_collaborators(installed_logs, mock.Mock())
+
+        self.assertEqual(collaborators.artifacts_root, self.root / ".symphonz" / "artifacts")
+
+    def test_dashboard_composes_real_auth_store_and_loopback_url_before_start(self):
+        from symphonz.service.auth import AuthService, verify_password
+        from symphonz.service.runtime_store import RuntimeStore
+
+        self._write_auth()
+        result = self._run_dashboard(
+            host="localhost",
+            port=4000,
+            public_base_url=None,
+            dashboard_username="operator",
+            session_days=7,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(self.dashboard_constructor.call_count, 1)
+        arguments = self.dashboard_constructor.call_args.args
+        self.assertEqual(self.dashboard_constructor.call_args.kwargs, {})
+        self.assertEqual(len(arguments), 6)
+        self.assertEqual(arguments[:2], ("localhost", 4000))
+        self.assertIsInstance(arguments[2], RuntimeStore)
+        self.assertEqual(arguments[2].path, self.logs_root / "runtime.sqlite3")
+        self.assertIsInstance(arguments[3], AuthService)
+        self.assertIs(arguments[3].store, arguments[2])
+        self.assertEqual(arguments[3].username, "operator")
+        self.assertEqual(arguments[3].session_days, 7)
+        self.assertFalse(arguments[3].secure_cookie)
+        self.assertTrue(verify_password("secret", arguments[3].password_record))
+        self.assertEqual(arguments[4], self.root / ".symphonz" / "artifacts")
+        self.assertIs(arguments[5], True)
+        self.dashboard.start.assert_called_once_with()
+        self.dashboard.stop.assert_called_once_with()
+        self.assertEqual(
+            self.orchestrator.report_synchronizer.public_base_url,
+            "http://127.0.0.1:4000",
+        )
+        self.assertIn("Symphonz dashboard: http://localhost:4000", self.stdout)
+
+    def test_dashboard_auth_load_failure_prevents_server_construction(self):
+        with self.assertRaisesRegex(RuntimeError, "configure-dashboard"):
+            self._run_dashboard(host="127.0.0.1", port=4000)
+
+        self.dashboard_constructor.assert_not_called()
+
+    def test_dashboard_rejects_invalid_effective_settings_before_server_construction(self):
+        self._write_auth()
+        invalid_settings = (
+            ({"host": ""}, "host"),
+            ({"host": "bad host"}, "host"),
+            ({"port": 0}, "port"),
+            ({"port": 65536}, "port"),
+            ({"port": True}, "port"),
+            ({"dashboard_username": "  "}, "username"),
+            ({"session_days": 0}, "session"),
+            ({"session_days": True}, "session"),
+            ({"public_base_url": "ftp://reports.example.test"}, "public_base_url"),
+        )
+
+        for overrides, message in invalid_settings:
+            with self.subTest(overrides=overrides):
+                settings = {"host": "127.0.0.1", "port": 4000}
+                settings.update(overrides)
+                with self.assertRaisesRegex((TypeError, ValueError), message):
+                    self._run_dashboard(**settings)
+                self.dashboard_constructor.assert_not_called()
+
+    def test_non_loopback_dashboard_requires_usable_explicit_public_url(self):
+        self._write_auth()
+        unusable_urls = (
+            None,
+            "http://127.0.0.1:4000",
+            "http://localhost:4000",
+            "http://0.0.0.0:4000",
+            "http://0.0.0.0.:4000",
+            "http://[::]:4000",
+        )
+
+        for public_base_url in unusable_urls:
+            with self.subTest(public_base_url=public_base_url):
+                with self.assertRaisesRegex(ValueError, "public_base_url"):
+                    self._run_dashboard(
+                        host="0.0.0.0",
+                        port=4000,
+                        public_base_url=public_base_url,
+                    )
+                self.dashboard_constructor.assert_not_called()
+
+    def test_wildcard_bind_uses_public_url_and_persists_effective_port_mismatch_warning(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        self._write_auth()
+        result = self._run_dashboard(
+            host="0.0.0.0",
+            port=4000,
+            public_base_url="http://192.168.1.20:4000/base/",
+            effective_port=4444,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(self.dashboard_constructor.call_args.args[:2], ("0.0.0.0", 4000))
+        self.assertEqual(
+            self.orchestrator.report_synchronizer.public_base_url,
+            "http://192.168.1.20:4000/base",
+        )
+        self.assertNotIn("0.0.0.0", self.orchestrator.report_synchronizer.public_base_url)
+        events = RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"]
+        warnings = [event for event in events if event["type"] == "dashboard_url_warning"]
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0]["severity"], "warning")
+        self.assertEqual(warnings[0]["data"]["effective_port"], 4444)
+        self.assertEqual(warnings[0]["data"]["public_url_port"], 4000)
+        self.assertIn("public_base_url", warnings[0]["message"])
+        self.assertIn("Warning:", self.stderr)
+        self.assertIn("Symphonz dashboard: http://0.0.0.0:4444", self.stdout)
+
+    def test_https_public_url_enables_secure_cookie_and_hides_http_warning(self):
+        self._write_auth()
+        result = self._run_dashboard(
+            host="192.168.1.20",
+            port=443,
+            public_base_url="https://reports.example.test/base/",
+        )
+
+        self.assertEqual(result, 0)
+        arguments = self.dashboard_constructor.call_args.args
+        self.assertEqual(len(arguments), 6)
+        self.assertTrue(arguments[3].secure_cookie)
+        self.assertIs(arguments[5], False)
+        self.assertEqual(
+            self.orchestrator.report_synchronizer.public_base_url,
+            "https://reports.example.test/base",
+        )
+        self.assertNotIn("Warning:", self.stderr)
 
     def test_run_service_once_persists_lifecycle_task_and_report_without_dashboard(self):
         from dataclasses import replace
@@ -3508,6 +3658,63 @@ Work on {{ issue.identifier }}.
 """
         )
         return path
+
+    def _write_auth(self):
+        from symphonz.install import write_auth_config
+
+        write_auth_config(self.root / ".symphonz" / "auth.toml", "secret")
+
+    def _run_dashboard(self, *, effective_port=None, **overrides):
+        from symphonz.service import runner
+
+        class FakeLinear:
+            def fetch_candidate_issues(self, active_states):
+                return []
+
+            def fetch_issues_by_ids(self, ids):
+                return []
+
+            def fetch_issues_by_states(self, states):
+                return []
+
+        self.dashboard = mock.Mock()
+        self.dashboard.port = effective_port if effective_port is not None else overrides.get("port", 4000)
+        self.dashboard_constructor = mock.Mock(return_value=self.dashboard)
+        output = io.StringIO()
+        errors = io.StringIO()
+        workflow_path = self._write_workflow()
+        arguments = {
+            "project_root": self.root,
+            "workflow_path": workflow_path,
+            "logs_root": self.logs_root,
+            "port": 4000,
+            "once": True,
+            "host": "127.0.0.1",
+            "public_base_url": None,
+            "dashboard_username": "admin",
+            "session_days": 30,
+        }
+        arguments.update(overrides)
+
+        real_orchestrator = runner.Orchestrator
+
+        def capture_orchestrator(*constructor_args, **constructor_kwargs):
+            self.orchestrator = real_orchestrator(*constructor_args, **constructor_kwargs)
+            return self.orchestrator
+
+        try:
+            with (
+                mock.patch("symphonz.service.runner.build_linear_client", return_value=FakeLinear()),
+                mock.patch("symphonz.service.runner.CodexAppServer"),
+                mock.patch("symphonz.service.runner.DashboardServer", self.dashboard_constructor),
+                mock.patch("symphonz.service.runner.Orchestrator", side_effect=capture_orchestrator),
+                redirect_stdout(output),
+                redirect_stderr(errors),
+            ):
+                return runner.run_service(**arguments)
+        finally:
+            self.stdout = output.getvalue()
+            self.stderr = errors.getvalue()
 
     @staticmethod
     def _report_payload(issue):
