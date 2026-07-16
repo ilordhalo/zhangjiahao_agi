@@ -1729,6 +1729,398 @@ class OrchestratorHardeningTests(unittest.TestCase):
         self.assertEqual(snapshot["counts"]["claimed"], 0)
         self.assertEqual(snapshot["counts"]["retrying"], 0)
 
+    def test_tick_schedules_pending_report_sync_without_candidate_issues(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        class RecordingSynchronizer:
+            def __init__(inner_self):
+                inner_self.calls = []
+                inner_self.called = threading.Event()
+
+            def sync_pending(inner_self, now):
+                inner_self.calls.append(now)
+                inner_self.called.set()
+                return 0
+
+        synchronizer = RecordingSynchronizer()
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([]),
+            self.RecordingCodex(),
+            report_synchronizer=synchronizer,
+        )
+        self.addCleanup(orchestrator.shutdown)
+
+        before = time.time()
+        orchestrator.tick()
+
+        self.assertTrue(synchronizer.called.wait(timeout=1))
+        self.assertEqual(len(synchronizer.calls), 1)
+        self.assertGreaterEqual(synchronizer.calls[0], before)
+        self.assertLessEqual(synchronizer.calls[0], time.time())
+
+    def test_slow_pending_report_sync_does_not_block_tick_or_issue_worker(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        class SlowSynchronizer:
+            def __init__(inner_self):
+                inner_self.calls = 0
+                inner_self.active = 0
+                inner_self.max_active = 0
+                inner_self.started = threading.Event()
+                inner_self.release = threading.Event()
+                inner_self.lock = threading.Lock()
+
+            def sync_pending(inner_self, now):
+                with inner_self.lock:
+                    inner_self.calls += 1
+                    inner_self.active += 1
+                    inner_self.max_active = max(inner_self.max_active, inner_self.active)
+                inner_self.started.set()
+                try:
+                    if not inner_self.release.wait(timeout=2):
+                        raise RuntimeError("sync was not released")
+                    return 0
+                finally:
+                    with inner_self.lock:
+                        inner_self.active -= 1
+
+        class StartedCodex(self.RecordingCodex):
+            def __init__(inner_self):
+                super().__init__(sleep_seconds=0)
+                inner_self.started = threading.Event()
+
+            def run_turns(inner_self, **kwargs):
+                inner_self.started.set()
+                return super().run_turns(**kwargs)
+
+        self.workflow.config["agent"]["max_concurrent_agents"] = 1
+        synchronizer = SlowSynchronizer()
+        codex = StartedCodex()
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([self.issue(1)]),
+            codex,
+            report_synchronizer=synchronizer,
+        )
+        self.addCleanup(orchestrator.shutdown)
+        self.addCleanup(synchronizer.release.set)
+
+        started_at = time.monotonic()
+        orchestrator.tick()
+        elapsed = time.monotonic() - started_at
+
+        self.assertLess(elapsed, 0.25)
+        self.assertTrue(synchronizer.started.wait(timeout=1))
+        self.assertTrue(codex.started.wait(timeout=1))
+        orchestrator.tick()
+        with synchronizer.lock:
+            self.assertEqual(synchronizer.calls, 1)
+            self.assertEqual(synchronizer.max_active, 1)
+
+    def test_pending_report_sync_failure_emits_runtime_error_event(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        class FailingSynchronizer:
+            def __init__(inner_self):
+                inner_self.called = threading.Event()
+
+            def sync_pending(inner_self, now):
+                inner_self.called.set()
+                raise RuntimeError("pending sync failed")
+
+        synchronizer = FailingSynchronizer()
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([]),
+            self.RecordingCodex(),
+            report_synchronizer=synchronizer,
+        )
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        self.assertTrue(synchronizer.called.wait(timeout=1))
+        deadline = time.time() + 1
+        failures = []
+        while not failures and time.time() < deadline:
+            orchestrator.tick()
+            failures = [
+                event
+                for event in orchestrator.state.snapshot()["events"]
+                if event["type"] == "report_sync_failed"
+            ]
+            time.sleep(0.01)
+
+        self.assertTrue(failures)
+        self.assertEqual(failures[0]["data"]["stage"], "report_sync")
+        self.assertEqual(failures[0]["data"]["error_type"], "RuntimeError")
+        self.assertEqual(failures[0]["data"]["error"], "pending sync failed")
+
+    def test_concurrent_issues_use_isolated_report_publishers_and_close_each(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        class ToolLinear(self.FakeLinear):
+            def graphql(inner_self, query, variables):
+                return {"data": {"marker": variables["marker"]}}
+
+        class Publisher:
+            def __init__(inner_self, identifier):
+                inner_self.identifier = identifier
+                inner_self.close_calls = 0
+
+            def publish(inner_self, arguments):
+                return {
+                    "success": True,
+                    "issue_identifier": inner_self.identifier,
+                    "operation": arguments["operation"],
+                }
+
+            def close(inner_self):
+                inner_self.close_calls += 1
+
+        publishers = {}
+        publisher_lock = threading.Lock()
+
+        def publisher_factory(issue):
+            publisher = Publisher(issue.identifier)
+            with publisher_lock:
+                publishers[issue.identifier] = publisher
+            return publisher
+
+        class ToolCallingCodex:
+            def __init__(inner_self):
+                inner_self.barrier = threading.Barrier(2)
+                inner_self.results = {}
+                inner_self.lock = threading.Lock()
+
+            def run_turns(inner_self, **kwargs):
+                identifier = kwargs["title"].split(":", 1)[0]
+                inner_self.barrier.wait(timeout=2)
+                report_result = kwargs["dynamic_tool_executor"](
+                    "symphonz_report",
+                    {"operation": "publish"},
+                )
+                linear_result = kwargs["dynamic_tool_executor"](
+                    "linear_graphql",
+                    {"query": "query Marker { viewer { id } }", "variables": {"marker": identifier}},
+                )
+                with inner_self.lock:
+                    inner_self.results[identifier] = {
+                        "specs": [spec["name"] for spec in kwargs["dynamic_tool_specs"]],
+                        "report": json.loads(report_result["output"]),
+                        "linear": json.loads(linear_result["output"]),
+                    }
+                kwargs["on_event"](
+                    {
+                        "type": "session_started",
+                        "session_id": f"session-{identifier}",
+                        "thread_id": f"thread-{identifier}",
+                        "turn_id": f"turn-{identifier}",
+                        "turn_count": 1,
+                        "process_id": 100,
+                    }
+                )
+                if identifier == "SYM-2":
+                    raise RuntimeError("codex failed after tool call")
+                return {
+                    "session_id": f"session-{identifier}",
+                    "thread_id": f"thread-{identifier}",
+                    "turn_id": f"turn-{identifier}",
+                    "turn_count": 1,
+                    "result": {},
+                }
+
+        issues = [self.issue(1), self.issue(2)]
+        codex = ToolCallingCodex()
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            ToolLinear(issues),
+            codex,
+            report_publisher_factory=publisher_factory,
+        )
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+
+        self.assertEqual(set(publishers), {"SYM-1", "SYM-2"})
+        self.assertEqual(set(codex.results), {"SYM-1", "SYM-2"})
+        for identifier in ("SYM-1", "SYM-2"):
+            self.assertEqual(codex.results[identifier]["specs"], ["linear_graphql", "symphonz_report"])
+            self.assertEqual(codex.results[identifier]["report"]["issue_identifier"], identifier)
+            self.assertEqual(codex.results[identifier]["linear"]["data"]["marker"], identifier)
+            self.assertEqual(publishers[identifier].close_calls, 1)
+
+    def test_runtime_store_persists_dispatch_codex_completion_and_cleanup_fields(self):
+        from dataclasses import replace
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+        from symphonz.service.workspace import workspace_path
+
+        class MilestoneCodex:
+            def __init__(inner_self):
+                inner_self.started = threading.Event()
+                inner_self.release = threading.Event()
+
+            def run_turns(inner_self, **kwargs):
+                kwargs["on_event"](
+                    {
+                        "type": "tool_call_completed",
+                        "session_id": "session-1",
+                        "thread_id": "thread-1",
+                        "turn_id": "turn-1",
+                        "turn_count": 1,
+                        "process_id": 321,
+                    }
+                )
+                inner_self.started.set()
+                if not inner_self.release.wait(timeout=2):
+                    raise RuntimeError("codex was not released")
+                return {
+                    "session_id": "session-1",
+                    "thread_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "turn_count": 1,
+                    "result": {},
+                }
+
+        issue = replace(
+            self.issue(1),
+            branch_name="codex/sym-1",
+            url="https://linear.example.test/SYM-1",
+        )
+        linear = self.FakeLinear([issue])
+        codex = MilestoneCodex()
+        store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            linear,
+            codex,
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+        self.addCleanup(codex.release.set)
+
+        orchestrator.tick()
+        self.assertTrue(codex.started.wait(timeout=1))
+        deadline = time.time() + 1
+        running = store.get_task(issue.identifier)
+        while (running is None or running.get("codex_session_id") != "session-1") and time.time() < deadline:
+            time.sleep(0.01)
+            running = store.get_task(issue.identifier)
+
+        self.assertEqual(running["status"], "running")
+        self.assertEqual(running["issue_id"], issue.id)
+        self.assertEqual(running["linear_state"], "Todo")
+        self.assertEqual(running["attempt"], 0)
+        self.assertEqual(running["workspace"], str(workspace_path(self.root, self.workflow, issue)))
+        self.assertEqual(running["codex_process_id"], "321")
+        self.assertEqual(running["codex_thread_id"], "thread-1")
+        self.assertEqual(running["codex_turn_id"], "turn-1")
+        self.assertEqual(running["codex_session_id"], "session-1")
+        self.assertEqual(running["branch"], "codex/sym-1")
+        self.assertEqual(running["last_event"], "tool_call_completed")
+        self.assertIsNotNone(running["started_at"])
+
+        linear.issues[issue.id] = replace(issue, state="Done")
+        codex.release.set()
+        orchestrator.wait_for_idle(timeout=2)
+
+        completed = store.get_task(issue.identifier)
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["linear_state"], "Done")
+        self.assertEqual(completed["codex_thread_id"], "thread-1")
+        self.assertEqual(completed["codex_turn_id"], "turn-1")
+        self.assertEqual(completed["codex_session_id"], "session-1")
+        self.assertIsNotNone(completed["completed_at"])
+        self.assertEqual(completed["workspace_cleanup_status"], "removed")
+        self.assertIsNotNone(completed["workspace_cleaned_at"])
+
+    def test_runtime_store_persists_retry_and_attempt_limit_block(self):
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+
+        class AlwaysFailCodex:
+            def __init__(inner_self):
+                inner_self.calls = 0
+
+            def run_turns(inner_self, **kwargs):
+                inner_self.calls += 1
+                raise RuntimeError(f"failure-{inner_self.calls}")
+
+        self.workflow.config["agent"]["max_attempts"] = 2
+        now = [0.0]
+        issue = self.issue(1)
+        store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([issue]),
+            AlwaysFailCodex(),
+            clock=lambda: now[0],
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+
+        retrying = store.get_task(issue.identifier)
+        self.assertEqual(retrying["status"], "retrying")
+        self.assertEqual(retrying["attempt"], 1)
+        self.assertEqual(retrying["latest_error_summary"], "failure-1")
+        self.assertEqual(retrying["due_at"], 10.0)
+
+        now[0] = 10.0
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+
+        blocked = store.get_task(issue.identifier)
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertEqual(blocked["attempt"], 2)
+        self.assertEqual(blocked["latest_error_summary"], "attempt_limit_exceeded")
+        self.assertEqual(blocked["max_attempts"], 2)
+        self.assertIsNotNone(blocked["blocked_at"])
+
+    def test_runtime_store_persists_terminal_cancellation_reason_and_timestamp(self):
+        from dataclasses import replace
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        codex = self.RecordingCodex(wait_for_cancel=True)
+        store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            linear,
+            codex,
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        deadline = time.time() + 1
+        while not codex.calls and time.time() < deadline:
+            time.sleep(0.01)
+        linear.issues[issue.id] = replace(issue, state="Done")
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+
+        cancelled = store.get_task(issue.identifier)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["linear_state"], "Done")
+        self.assertEqual(cancelled["cancellation_reason"], "terminal")
+        self.assertIsNotNone(cancelled["cancelled_at"])
+        self.assertIsNotNone(cancelled["completed_at"])
+        self.assertEqual(cancelled["workspace_cleanup_status"], "removed")
+
 
 class RuntimeStoreTests(unittest.TestCase):
     def setUp(self):
