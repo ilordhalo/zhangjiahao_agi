@@ -29,6 +29,21 @@ class WorkflowServiceTests(unittest.TestCase):
         self.assertIn("git clone --depth 1", workflow.config["hooks"]["after_create"])
         self.assertIn("{{ issue.identifier }}", workflow.prompt_template)
 
+    def test_workflow_blocks_human_review_until_report_and_review_links_are_synchronized(self):
+        from symphonz.service.workflow import load_workflow
+
+        prompt = load_workflow(Path("WORKFLOW.md")).prompt_template
+
+        review_index = prompt.index("Create or update a review request")
+        report_index = prompt.index("Call `symphonz_report`")
+        human_review_index = prompt.index("Move the issue to `Human Review`", report_index)
+        self.assertLess(review_index, report_index)
+        self.assertLess(report_index, human_review_index)
+        self.assertIn("missing or failed report publication is a publication blocker", prompt)
+        self.assertIn("report URL and review request URL", prompt)
+        self.assertNotIn("document the blocker in the workpad and move to `Human Review`", prompt)
+        self.assertNotIn("record the blocker, and move to `Human Review`", prompt)
+
     def test_render_prompt_supports_issue_variables_and_description_condition(self):
         from symphonz.service.models import Issue
         from symphonz.service.workflow import render_prompt

@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import base64
 import binascii
+import getpass
 import os
 from pathlib import Path
 import secrets
@@ -14,6 +15,10 @@ from symphonz.service.auth import DashboardAuth, PasswordRecord, hash_password, 
 
 
 DEFAULT_GITLAB_BASE_URL = "https://gitlab.example.com"
+DEFAULT_DASHBOARD_HOST = "127.0.0.1"
+DEFAULT_DASHBOARD_PORT = 4000
+DEFAULT_DASHBOARD_USERNAME = "admin"
+DEFAULT_DASHBOARD_SESSION_DAYS = 30
 SUPPORTED_GIT_PROVIDERS = {"github", "gitlab"}
 
 
@@ -30,6 +35,11 @@ class InstallConfig:
     gitlab_base_url: str
     workspace_root: str
     logs_root: str
+    dashboard_host: str = DEFAULT_DASHBOARD_HOST
+    dashboard_port: int = DEFAULT_DASHBOARD_PORT
+    dashboard_public_base_url: str = "http://127.0.0.1:4000"
+    dashboard_username: str = DEFAULT_DASHBOARD_USERNAME
+    dashboard_session_days: int = DEFAULT_DASHBOARD_SESSION_DAYS
 
 
 def toml_quote(value: str) -> str:
@@ -61,6 +71,13 @@ def write_config(path: Path, config: InstallConfig) -> None:
             "",
             "[logs]",
             f"root = {toml_quote(config.logs_root)}",
+            "",
+            "[dashboard]",
+            f"host = {toml_quote(config.dashboard_host)}",
+            f"port = {toml_quote(str(config.dashboard_port))}",
+            f"public_base_url = {toml_quote(config.dashboard_public_base_url)}",
+            f"username = {toml_quote(config.dashboard_username)}",
+            f"session_days = {toml_quote(str(config.dashboard_session_days))}",
             "",
         ]
     )
@@ -333,6 +350,22 @@ def prompt_value(input_func: Callable[[str], str], label: str, default: str) -> 
     return value or default
 
 
+def _positive_integer(value: object, label: str) -> int:
+    if isinstance(value, bool):
+        raise RuntimeError(f"{label} must be a positive integer")
+    try:
+        parsed = int(str(value))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"{label} must be a positive integer") from error
+    if parsed <= 0:
+        raise RuntimeError(f"{label} must be a positive integer")
+    return parsed
+
+
+def _dashboard_url(port: int) -> str:
+    return f"http://127.0.0.1:{port}"
+
+
 def collect_install_config(
     project_root: Path,
     assume_yes: bool,
@@ -345,6 +378,11 @@ def collect_install_config(
     base_branch: str | None = None,
     mr_target: str | None = None,
     gitlab_base_url: str | None = None,
+    dashboard_host: str | None = None,
+    dashboard_port: int | None = None,
+    dashboard_public_base_url: str | None = None,
+    dashboard_username: str | None = None,
+    dashboard_session_days: int | None = None,
     environ: dict[str, str] | None = None,
 ) -> InstallConfig:
     input_func = input_func or input
@@ -359,6 +397,21 @@ def collect_install_config(
         "base_branch": base_branch or environ.get("SYMPHONZ_BASE_BRANCH", ""),
         "mr_target": mr_target or environ.get("SYMPHONZ_TARGET_BRANCH", ""),
         "gitlab_base_url": gitlab_base_url or environ.get("SYMPHONZ_GITLAB_BASE_URL", ""),
+        "dashboard_host": dashboard_host
+        if dashboard_host is not None
+        else environ.get("SYMPHONZ_DASHBOARD_HOST", ""),
+        "dashboard_port": dashboard_port
+        if dashboard_port is not None
+        else environ.get("SYMPHONZ_DASHBOARD_PORT", ""),
+        "dashboard_public_base_url": dashboard_public_base_url
+        if dashboard_public_base_url is not None
+        else environ.get("SYMPHONZ_DASHBOARD_PUBLIC_BASE_URL", ""),
+        "dashboard_username": dashboard_username
+        if dashboard_username is not None
+        else environ.get("SYMPHONZ_DASHBOARD_USERNAME", ""),
+        "dashboard_session_days": dashboard_session_days
+        if dashboard_session_days is not None
+        else environ.get("SYMPHONZ_DASHBOARD_SESSION_DAYS", ""),
     }
 
     if assume_yes:
@@ -372,6 +425,23 @@ def collect_install_config(
             supplied["gitlab_base_url"] or defaults["gitlab_base_url"]
             if git_provider == "gitlab"
             else ""
+        )
+        dashboard_host = str(supplied["dashboard_host"] or DEFAULT_DASHBOARD_HOST)
+        dashboard_port = _positive_integer(
+            DEFAULT_DASHBOARD_PORT
+            if supplied["dashboard_port"] == ""
+            else supplied["dashboard_port"],
+            "Dashboard port",
+        )
+        dashboard_public_base_url = str(
+            supplied["dashboard_public_base_url"] or _dashboard_url(dashboard_port)
+        )
+        dashboard_username = str(supplied["dashboard_username"] or DEFAULT_DASHBOARD_USERNAME)
+        dashboard_session_days = _positive_integer(
+            DEFAULT_DASHBOARD_SESSION_DAYS
+            if supplied["dashboard_session_days"] == ""
+            else supplied["dashboard_session_days"],
+            "Dashboard session days",
         )
     else:
         linear_api_key_env = supplied["linear_api_key_env"] or prompt_value(
@@ -395,6 +465,32 @@ def collect_install_config(
             if git_provider == "gitlab"
             else ""
         )
+        dashboard_host = str(supplied["dashboard_host"] or prompt_value(
+            input_func, "Dashboard host", DEFAULT_DASHBOARD_HOST
+        ))
+        dashboard_port = _positive_integer(
+            prompt_value(input_func, "Dashboard port", str(DEFAULT_DASHBOARD_PORT))
+            if supplied["dashboard_port"] == ""
+            else supplied["dashboard_port"],
+            "Dashboard port",
+        )
+        dashboard_public_base_url = str(
+            supplied["dashboard_public_base_url"]
+            or prompt_value(input_func, "Dashboard LAN/public base URL", _dashboard_url(dashboard_port))
+        )
+        dashboard_username = str(supplied["dashboard_username"] or prompt_value(
+            input_func, "Dashboard username", DEFAULT_DASHBOARD_USERNAME
+        ))
+        dashboard_session_days = _positive_integer(
+            prompt_value(
+                input_func,
+                "Dashboard session days",
+                str(DEFAULT_DASHBOARD_SESSION_DAYS),
+            )
+            if supplied["dashboard_session_days"] == ""
+            else supplied["dashboard_session_days"],
+            "Dashboard session days",
+        )
 
     if not linear_project_slug:
         if assume_yes:
@@ -404,6 +500,12 @@ def collect_install_config(
         raise RuntimeError("Linear project slug or ID is required")
     if not repo_url:
         raise RuntimeError("Git remote URL is required")
+    if not dashboard_host.strip():
+        raise RuntimeError("Dashboard host is required")
+    if not dashboard_public_base_url.strip():
+        raise RuntimeError("Dashboard LAN/public base URL is required")
+    if not dashboard_username.strip():
+        raise RuntimeError("Dashboard username is required")
 
     return InstallConfig(
         runtime_mode="embedded",
@@ -417,13 +519,23 @@ def collect_install_config(
         gitlab_base_url=gitlab_base_url,
         workspace_root=".symphonz/workspace",
         logs_root=".symphonz/logs",
+        dashboard_host=dashboard_host,
+        dashboard_port=dashboard_port,
+        dashboard_public_base_url=dashboard_public_base_url,
+        dashboard_username=dashboard_username,
+        dashboard_session_days=dashboard_session_days,
     )
 
 
 def ensure_gitignore(project_root: Path) -> None:
     gitignore = project_root / ".gitignore"
     existing = gitignore.read_text().splitlines() if gitignore.exists() else []
-    additions = [".symphonz/workspace/", ".symphonz/logs/", ".symphonz/auth.toml"]
+    additions = [
+        ".symphonz/artifacts/",
+        ".symphonz/logs/",
+        ".symphonz/workspace/",
+        ".symphonz/auth.toml",
+    ]
     updated = existing[:]
     for item in additions:
         if item not in updated:
@@ -432,8 +544,142 @@ def ensure_gitignore(project_root: Path) -> None:
 
 
 def create_base_layout(project_root: Path) -> None:
-    for relative in [".symphonz", ".symphonz/workspace", ".symphonz/logs"]:
+    for relative in [
+        ".symphonz",
+        ".symphonz/artifacts",
+        ".symphonz/logs",
+        ".symphonz/workspace",
+    ]:
         (project_root / relative).mkdir(parents=True, exist_ok=True)
+
+
+def _dashboard_password(
+    *,
+    password: str | None,
+    environ: dict[str, str],
+    getpass_func: Callable[[str], str] | None,
+    environment_required: bool,
+) -> str:
+    if password is not None:
+        resolved = password
+    elif environment_required:
+        resolved = environ.get("SYMPHONZ_DASHBOARD_PASSWORD", "")
+        if not resolved:
+            raise RuntimeError(
+                "Dashboard password is required; set SYMPHONZ_DASHBOARD_PASSWORD for non-interactive installation"
+            )
+    else:
+        resolved = environ.get("SYMPHONZ_DASHBOARD_PASSWORD", "")
+        if not resolved:
+            resolved = (getpass_func or getpass.getpass)("Dashboard password: ")
+    if not resolved:
+        raise RuntimeError("dashboard password is required")
+    return resolved
+
+
+def _render_dashboard_section(
+    host: str,
+    port: int,
+    public_base_url: str,
+    username: str,
+    session_days: int,
+) -> str:
+    return "\n".join(
+        [
+            "[dashboard]",
+            f"host = {toml_quote(host)}",
+            f"port = {toml_quote(str(port))}",
+            f"public_base_url = {toml_quote(public_base_url)}",
+            f"username = {toml_quote(username)}",
+            f"session_days = {toml_quote(str(session_days))}",
+            "",
+            "",
+        ]
+    )
+
+
+def _replace_dashboard_section(content: str, section: str) -> str:
+    lines = content.splitlines(keepends=True)
+    start = next((index for index, line in enumerate(lines) if line.strip() == "[dashboard]"), None)
+    if start is None:
+        if not content:
+            return section.rstrip("\n") + "\n"
+        separator = "" if content.endswith("\n\n") else "\n" if content.endswith("\n") else "\n\n"
+        return content + separator + section.rstrip("\n") + "\n"
+
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        stripped = lines[index].strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            end = index
+            break
+    replacement = section if end < len(lines) else section.rstrip("\n") + "\n"
+    return "".join(lines[:start]) + replacement + "".join(lines[end:])
+
+
+def configure_dashboard(
+    project_root: Path | None = None,
+    *,
+    host: str | None = None,
+    port: int | None = None,
+    public_base_url: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+    session_days: int | None = None,
+    environ: dict[str, str] | None = None,
+    getpass_func: Callable[[str], str] | None = None,
+) -> Path:
+    root = project_root or Path.cwd()
+    config_path = root / ".symphonz" / "config.toml"
+    if not config_path.is_file():
+        raise RuntimeError(f"Symphonz configuration does not exist at {config_path}; run `symphonz install` first")
+
+    environ = os.environ if environ is None else environ
+    content = config_path.read_text()
+    current = _parse_config(content).get("dashboard", {})
+    resolved_host = (host if host is not None else current.get("host", DEFAULT_DASHBOARD_HOST)).strip()
+    resolved_port = _positive_integer(
+        port if port is not None else current.get("port", DEFAULT_DASHBOARD_PORT),
+        "Dashboard port",
+    )
+    resolved_public_base_url = (
+        public_base_url
+        if public_base_url is not None
+        else current.get("public_base_url", _dashboard_url(resolved_port))
+    ).strip()
+    resolved_username = (
+        username if username is not None else current.get("username", DEFAULT_DASHBOARD_USERNAME)
+    ).strip()
+    resolved_session_days = _positive_integer(
+        session_days
+        if session_days is not None
+        else current.get("session_days", DEFAULT_DASHBOARD_SESSION_DAYS),
+        "Dashboard session days",
+    )
+    if not resolved_host:
+        raise RuntimeError("Dashboard host is required")
+    if not resolved_public_base_url:
+        raise RuntimeError("Dashboard LAN/public base URL is required")
+    if not resolved_username:
+        raise RuntimeError("Dashboard username is required")
+    resolved_password = _dashboard_password(
+        password=password,
+        environ=environ,
+        getpass_func=getpass_func,
+        environment_required=False,
+    )
+
+    section = _render_dashboard_section(
+        resolved_host,
+        resolved_port,
+        resolved_public_base_url,
+        resolved_username,
+        resolved_session_days,
+    )
+    write_auth_config(root / ".symphonz" / "auth.toml", resolved_password)
+    config_path.write_text(_replace_dashboard_section(content, section))
+    ensure_gitignore(root)
+    return root / ".symphonz"
 
 
 def linear_preflight(config: InstallConfig, environ: dict[str, str] | None = None) -> str:
@@ -460,6 +706,7 @@ def install_project(
     assume_yes: bool = False,
     skip_linear_preflight: bool = False,
     input_func: Callable[[str], str] | None = None,
+    getpass_func: Callable[[str], str] | None = None,
     output_func: Callable[[str], None] | None = None,
     **config_values: object,
 ) -> Path:
@@ -471,10 +718,17 @@ def install_project(
         input_func=input_func,
         **config_values,
     )
+    password = _dashboard_password(
+        password=None,
+        environ=(os.environ if environ is None else environ) if assume_yes else {},
+        getpass_func=getpass_func,
+        environment_required=assume_yes,
+    )
     if not skip_linear_preflight:
         (output_func or print)(linear_preflight(config, environ=environ))
     create_base_layout(root)
     write_config(root / ".symphonz" / "config.toml", config)
+    write_auth_config(root / ".symphonz" / "auth.toml", password)
 
     from symphonz.workflow import write_workflow
 

@@ -11,6 +11,7 @@ from symphonz.cli import main
 from symphonz.install import (
     InstallConfig,
     collect_install_config,
+    configure_dashboard,
     detect_git_defaults,
     ensure_gitignore,
     install_project,
@@ -278,6 +279,136 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(parsed["linear"]["project_slug"], "REPLACE_WITH_LINEAR_PROJECT_SLUG")
             self.assertEqual(parsed["git"]["gitlab_base_url"], "https://gitlab.example.com")
 
+    def test_write_config_serializes_dashboard_values_as_strings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            config = InstallConfig(
+                runtime_mode="embedded",
+                runtime_command="symphonz-internal",
+                linear_api_key_env="LINEAR_API_KEY",
+                linear_project_slug="project",
+                git_provider="github",
+                repo_url="https://github.com/example/project.git",
+                base_branch="main",
+                mr_target="main",
+                gitlab_base_url="",
+                workspace_root=".symphonz/workspace",
+                logs_root=".symphonz/logs",
+                dashboard_host="0.0.0.0",
+                dashboard_port=4100,
+                dashboard_public_base_url="http://192.0.2.10:4100",
+                dashboard_username="operator",
+                dashboard_session_days=14,
+            )
+
+            write_config(path, config)
+
+            parsed = read_config(path)
+            self.assertEqual(
+                parsed["dashboard"],
+                {
+                    "host": "0.0.0.0",
+                    "port": "4100",
+                    "public_base_url": "http://192.0.2.10:4100",
+                    "username": "operator",
+                    "session_days": "14",
+                },
+            )
+
+    def test_configure_dashboard_preserves_other_config_bytes_and_workflow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            symphonz = root / ".symphonz"
+            symphonz.mkdir()
+            config_path = symphonz / "config.toml"
+            original_prefix = (
+                "# preserve this comment\n"
+                "[linear]\n"
+                "api_key_env = \"LINEAR_API_KEY\"\n"
+                "project_slug = \"team\"\n\n"
+                "[dashboard]\n"
+                "host = \"127.0.0.1\"\n"
+                "port = \"4000\"\n"
+                "public_base_url = \"http://127.0.0.1:4000\"\n"
+                "username = \"old\"\n"
+                "session_days = \"30\"\n\n"
+            )
+            original_suffix = (
+                "[git]\n"
+                "provider = \"gitlab\"\n"
+                "remote = \"ssh://git.example.test/team/repo.git\"\n"
+                "# preserve suffix comment\n"
+            )
+            config_path.write_text(original_prefix + original_suffix)
+            workflow = symphonz / "WORKFLOW.md"
+            workflow.write_text("project-specific workflow\n")
+
+            with (
+                patch("symphonz.install.run_git", side_effect=AssertionError("Git must not run")),
+                patch("symphonz.install.linear_preflight", side_effect=AssertionError("Linear must not run")),
+                patch("symphonz.workflow.write_workflow", side_effect=AssertionError("workflow must not change")),
+            ):
+                configure_dashboard(
+                    root,
+                    host="0.0.0.0",
+                    port=4200,
+                    public_base_url="http://192.0.2.20:4200",
+                    username="admin",
+                    password="migration-secret",
+                    session_days=9,
+                )
+
+            content = config_path.read_text()
+            self.assertTrue(content.startswith("# preserve this comment\n[linear]\n"))
+            self.assertTrue(content.endswith(original_suffix))
+            self.assertEqual(workflow.read_text(), "project-specific workflow\n")
+            self.assertNotIn("migration-secret", content)
+            self.assertEqual(read_config(config_path)["git"]["remote"], "ssh://git.example.test/team/repo.git")
+            self.assertEqual(read_config(config_path)["dashboard"]["port"], "4200")
+            self.assertEqual((symphonz / "auth.toml").stat().st_mode & 0o777, 0o600)
+
+    def test_configure_dashboard_adds_section_and_uses_environment_password(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / ".symphonz" / "config.toml"
+            config_path.parent.mkdir()
+            legacy = '[linear]\nproject_slug = "legacy"\n\n[git]\nprovider = "github"\n'
+            config_path.write_text(legacy)
+
+            configure_dashboard(
+                root,
+                host="127.0.0.2",
+                port=4300,
+                public_base_url="http://127.0.0.2:4300",
+                username="operator",
+                session_days=5,
+                environ={"SYMPHONZ_DASHBOARD_PASSWORD": "environment-secret"},
+                getpass_func=lambda prompt: self.fail("getpass should not be called"),
+            )
+
+            content = config_path.read_text()
+            self.assertTrue(content.startswith(legacy))
+            self.assertEqual(read_config(config_path)["dashboard"]["host"], "127.0.0.2")
+            self.assertNotIn("environment-secret", content)
+            self.assertIn(".symphonz/artifacts/", (root / ".gitignore").read_text())
+
+    def test_configure_dashboard_requires_a_secure_password(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / ".symphonz" / "config.toml"
+            config_path.parent.mkdir()
+            config_path.write_text('[linear]\nproject_slug = "legacy"\n')
+
+            with self.assertRaisesRegex(RuntimeError, "dashboard password is required"):
+                configure_dashboard(
+                    root,
+                    environ={},
+                    getpass_func=lambda prompt: "",
+                )
+
+            self.assertEqual(config_path.read_text(), '[linear]\nproject_slug = "legacy"\n')
+            self.assertFalse((root / ".symphonz" / "auth.toml").exists())
+
 
 class InstallInputTests(unittest.TestCase):
     def test_linear_preflight_explains_missing_environment_value(self):
@@ -352,7 +483,22 @@ class InstallInputTests(unittest.TestCase):
                 cwd=root,
                 check=True,
             )
-            answers = iter(["LINEAR_API_KEY", "project-slug", "", "", "", "", ""])
+            answers = iter(
+                [
+                    "LINEAR_API_KEY",
+                    "project-slug",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "0.0.0.0",
+                    "4100",
+                    "http://192.0.2.30:4100",
+                    "operator",
+                    "12",
+                ]
+            )
 
             config = collect_install_config(root, False, input_func=lambda prompt: next(answers))
 
@@ -363,6 +509,11 @@ class InstallInputTests(unittest.TestCase):
             self.assertEqual(config.repo_url, "https://example.com/group/repo.git")
             self.assertEqual(config.base_branch, "main")
             self.assertEqual(config.mr_target, "main")
+            self.assertEqual(config.dashboard_host, "0.0.0.0")
+            self.assertEqual(config.dashboard_port, 4100)
+            self.assertEqual(config.dashboard_public_base_url, "http://192.0.2.30:4100")
+            self.assertEqual(config.dashboard_username, "operator")
+            self.assertEqual(config.dashboard_session_days, 12)
 
     def test_collect_install_config_accepts_github_provider(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -373,7 +524,7 @@ class InstallInputTests(unittest.TestCase):
                 cwd=root,
                 check=True,
             )
-            answers = iter(["LINEAR_API_KEY", "project-slug", "", "", "", ""])
+            answers = iter(["LINEAR_API_KEY", "project-slug", "", "", "", "", "", "", "", "", ""])
 
             config = collect_install_config(root, False, input_func=lambda prompt: next(answers))
 
@@ -420,11 +571,23 @@ class InstallInputTests(unittest.TestCase):
             config = collect_install_config(
                 root,
                 True,
-                environ={"SYMPHONZ_LINEAR_PROJECT": "env-project"},
+                environ={
+                    "SYMPHONZ_LINEAR_PROJECT": "env-project",
+                    "SYMPHONZ_DASHBOARD_HOST": "0.0.0.0",
+                    "SYMPHONZ_DASHBOARD_PORT": "4400",
+                    "SYMPHONZ_DASHBOARD_PUBLIC_BASE_URL": "http://192.0.2.40:4400",
+                    "SYMPHONZ_DASHBOARD_USERNAME": "env-admin",
+                    "SYMPHONZ_DASHBOARD_SESSION_DAYS": "21",
+                },
             )
 
             self.assertEqual(config.linear_project_slug, "env-project")
             self.assertEqual(config.git_provider, "github")
+            self.assertEqual(config.dashboard_host, "0.0.0.0")
+            self.assertEqual(config.dashboard_port, 4400)
+            self.assertEqual(config.dashboard_public_base_url, "http://192.0.2.40:4400")
+            self.assertEqual(config.dashboard_username, "env-admin")
+            self.assertEqual(config.dashboard_session_days, 21)
 
     def test_collect_install_config_reports_missing_noninteractive_field(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -438,6 +601,26 @@ class InstallInputTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "--linear-project or SYMPHONZ_LINEAR_PROJECT"):
                 collect_install_config(root, True, environ={})
+
+    def test_collect_install_config_rejects_explicit_zero_dashboard_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "remote", "add", "origin", "https://github.com/example/project.git"],
+                cwd=root,
+                check=True,
+            )
+
+            for field in ("dashboard_port", "dashboard_session_days"):
+                with self.subTest(field=field):
+                    with self.assertRaisesRegex(RuntimeError, "positive integer"):
+                        collect_install_config(
+                            root,
+                            True,
+                            linear_project_slug="project",
+                            **{field: 0},
+                        )
 
 
 class WorkflowInstallTests(unittest.TestCase):
@@ -476,6 +659,14 @@ class WorkflowInstallTests(unittest.TestCase):
         self.assertIn("- `Ready to Publish` -> implementation is complete", rendered)
         self.assertIn("- `Done`, `Closed`, `Cancelled`, `Canceled`, `Duplicate` -> terminal", rendered)
         self.assertNotIn("git checkout -B", rendered)
+        review_index = rendered.index("Create or update a review request")
+        report_index = rendered.index("Call `symphonz_report`")
+        human_review_index = rendered.index("Move the issue to `Human Review`", report_index)
+        self.assertLess(review_index, report_index)
+        self.assertLess(report_index, human_review_index)
+        self.assertIn("A missing or failed report publication is a publication blocker", rendered)
+        self.assertIn("report URL and review request URL", rendered)
+        self.assertIn("### Implementation Report", rendered)
 
     def test_default_workflow_template_contains_no_personal_values(self):
         template = Path("WORKFLOW.md").read_text()
@@ -488,21 +679,37 @@ class WorkflowInstallTests(unittest.TestCase):
             root = Path(tmp)
             subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
             subprocess.run(["git", "remote", "add", "origin", "https://example.com/group/repo.git"], cwd=root, check=True)
-            answers = iter(["LINEAR_API_KEY", "project-slug", "", "", "", "", ""])
+            answers = iter(["LINEAR_API_KEY", "project-slug", "", "", "", "", "", "", "", "", "", ""])
 
             install_project(
                 project_root=root,
                 assume_yes=False,
                 skip_linear_preflight=True,
                 input_func=lambda prompt: next(answers),
+                getpass_func=lambda prompt: "dashboard-secret",
             )
 
             self.assertTrue((root / ".symphonz" / "WORKFLOW.md").exists())
             self.assertTrue((root / ".symphonz" / "config.toml").exists())
             self.assertTrue((root / ".symphonz" / "workspace").is_dir())
             self.assertTrue((root / ".symphonz" / "logs").is_dir())
+            self.assertTrue((root / ".symphonz" / "artifacts").is_dir())
+            self.assertTrue((root / ".symphonz" / "auth.toml").is_file())
+            self.assertEqual((root / ".symphonz" / "auth.toml").stat().st_mode & 0o777, 0o600)
             self.assertFalse((root / ".symphonz" / "runtime").exists())
-            self.assertIn(".symphonz/workspace/", (root / ".gitignore").read_text())
+            gitignore = (root / ".gitignore").read_text()
+            for ignored in (
+                ".symphonz/artifacts/",
+                ".symphonz/logs/",
+                ".symphonz/workspace/",
+                ".symphonz/auth.toml",
+            ):
+                self.assertIn(ignored, gitignore)
+
+            config = read_config(root / ".symphonz" / "config.toml")
+            self.assertEqual(config["dashboard"]["host"], "127.0.0.1")
+            self.assertEqual(config["dashboard"]["port"], "4000")
+            self.assertNotIn("dashboard-secret", (root / ".symphonz" / "config.toml").read_text())
 
             rendered = (root / ".symphonz" / "WORKFLOW.md").read_text()
             for value in self.personal_values:
@@ -513,13 +720,14 @@ class WorkflowInstallTests(unittest.TestCase):
             root = Path(tmp)
             subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
             subprocess.run(["git", "remote", "add", "origin", "https://github.com/example/project.git"], cwd=root, check=True)
-            answers = iter(["LINEAR_API_KEY", "project-slug", "", "", "", ""])
+            answers = iter(["LINEAR_API_KEY", "project-slug", "", "", "", "", "", "", "", "", ""])
 
             install_project(
                 project_root=root,
                 assume_yes=False,
                 skip_linear_preflight=True,
                 input_func=lambda prompt: next(answers),
+                getpass_func=lambda prompt: "dashboard-secret",
             )
 
             config = read_config(root / ".symphonz" / "config.toml")
@@ -550,7 +758,26 @@ class RuntimeTests(unittest.TestCase):
 
             command, env = build_run_command(root)
 
-            self.assertEqual(command, ["symphonz", "service", ".symphonz/WORKFLOW.md", "--logs-root", ".symphonz/logs"])
+            self.assertEqual(
+                command,
+                [
+                    "symphonz",
+                    "service",
+                    ".symphonz/WORKFLOW.md",
+                    "--logs-root",
+                    ".symphonz/logs",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "4000",
+                    "--public-base-url",
+                    "http://127.0.0.1:4000",
+                    "--dashboard-username",
+                    "admin",
+                    "--session-days",
+                    "30",
+                ],
+            )
             self.assertEqual(env["SYMPHONZ_REPO_URL"], "https://example.com/group/repo.git")
             self.assertEqual(env["SYMPHONZ_BASE_BRANCH"], "main")
             self.assertEqual(env["SYMPHONZ_MR_TARGET"], "main")
@@ -579,7 +806,116 @@ class RuntimeTests(unittest.TestCase):
 
             self.assertEqual(
                 command,
-                ["symphonz", "service", ".symphonz/WORKFLOW.md", "--logs-root", ".symphonz/logs", "--port", "4100"],
+                [
+                    "symphonz",
+                    "service",
+                    ".symphonz/WORKFLOW.md",
+                    "--logs-root",
+                    ".symphonz/logs",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "4100",
+                    "--public-base-url",
+                    "http://127.0.0.1:4000",
+                    "--dashboard-username",
+                    "admin",
+                    "--session-days",
+                    "30",
+                ],
+            )
+
+    def test_build_run_command_uses_configured_dashboard_and_temporary_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = InstallConfig(
+                runtime_mode="embedded",
+                runtime_command="symphonz-internal",
+                linear_api_key_env="LINEAR_API_KEY",
+                linear_project_slug="project-slug",
+                git_provider="github",
+                repo_url="https://github.com/example/project.git",
+                base_branch="main",
+                mr_target="main",
+                gitlab_base_url="",
+                workspace_root=".symphonz/workspace",
+                logs_root=".symphonz/logs",
+                dashboard_host="0.0.0.0",
+                dashboard_port=4000,
+                dashboard_public_base_url="http://192.0.2.50:4000",
+                dashboard_username="operator",
+                dashboard_session_days=8,
+            )
+            write_config(root / ".symphonz" / "config.toml", config)
+
+            command, _env = build_run_command(root, host="127.0.0.2", port=4500)
+
+            self.assertEqual(command[command.index("--host") + 1], "127.0.0.2")
+            self.assertEqual(command[command.index("--port") + 1], "4500")
+            self.assertEqual(command[command.index("--public-base-url") + 1], "http://192.0.2.50:4000")
+            self.assertEqual(command[command.index("--dashboard-username") + 1], "operator")
+            self.assertEqual(command[command.index("--session-days") + 1], "8")
+
+    def test_run_installed_propagates_configured_dashboard_and_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = InstallConfig(
+                runtime_mode="embedded",
+                runtime_command="symphonz-internal",
+                linear_api_key_env="LINEAR_API_KEY",
+                linear_project_slug="project-slug",
+                git_provider="github",
+                repo_url="https://github.com/example/project.git",
+                base_branch="main",
+                mr_target="main",
+                gitlab_base_url="",
+                workspace_root=".symphonz/workspace",
+                logs_root=".symphonz/logs",
+                dashboard_host="0.0.0.0",
+                dashboard_port=4000,
+                dashboard_public_base_url="http://192.0.2.60:4000",
+                dashboard_username="operator",
+                dashboard_session_days=6,
+            )
+            write_config(root / ".symphonz" / "config.toml", config)
+
+            with patch("symphonz.service.runner.run_service", return_value=17) as service:
+                exit_code = run_installed(project_root=root, host="127.0.0.3", port=4600)
+
+            self.assertEqual(exit_code, 17)
+            self.assertEqual(service.call_args.kwargs["host"], "127.0.0.3")
+            self.assertEqual(service.call_args.kwargs["port"], 4600)
+            self.assertEqual(service.call_args.kwargs["public_base_url"], "http://192.0.2.60:4000")
+            self.assertEqual(service.call_args.kwargs["dashboard_username"], "operator")
+            self.assertEqual(service.call_args.kwargs["session_days"], 6)
+
+    def test_legacy_config_stays_loopback_only_and_keeps_explicit_port(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / ".symphonz" / "config.toml"
+            path.parent.mkdir()
+            path.write_text(
+                "[runtime]\nmode = \"embedded\"\ncommand = \"symphonz-internal\"\n\n"
+                "[linear]\napi_key_env = \"LINEAR_API_KEY\"\nproject_slug = \"project\"\n\n"
+                "[git]\nprovider = \"github\"\nremote = \"https://github.com/example/project.git\"\n"
+                "base_branch = \"main\"\nmr_target = \"main\"\ngitlab_base_url = \"\"\n\n"
+                "[workspace]\nroot = \".symphonz/workspace\"\n\n"
+                "[logs]\nroot = \".symphonz/logs\"\n"
+            )
+
+            command, _env = build_run_command(root, port=4700)
+
+            self.assertEqual(
+                command,
+                [
+                    "symphonz",
+                    "service",
+                    ".symphonz/WORKFLOW.md",
+                    "--logs-root",
+                    ".symphonz/logs",
+                    "--port",
+                    "4700",
+                ],
             )
 
     def test_legacy_global_config_is_ignored_and_uses_internal_runtime(self):
@@ -647,7 +983,7 @@ class CliSmokeTests(unittest.TestCase):
             exit_code = main(["version"])
 
         self.assertEqual(exit_code, 0)
-        self.assertIn("symphonz 0.3.1", output.getvalue())
+        self.assertEqual(output.getvalue(), "symphonz 0.4.0\n")
 
     def test_install_rejects_removed_runtime_option(self):
         with self.assertRaises(SystemExit) as raised:
@@ -680,13 +1016,16 @@ class CliSmokeTests(unittest.TestCase):
             subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
             subprocess.run(["git", "remote", "add", "origin", "https://example.com/group/repo.git"], cwd=root, check=True)
             old_cwd = Path.cwd()
-            answers = iter(["LINEAR_API_KEY", "project-slug", "", "", "", "", ""])
+            answers = iter(["LINEAR_API_KEY", "project-slug", "", "", "", "", "", "", "", "", "", ""])
 
             try:
                 os.chdir(root)
                 from unittest.mock import patch
 
-                with patch("builtins.input", lambda prompt: next(answers)):
+                with (
+                    patch("builtins.input", lambda prompt: next(answers)),
+                    patch("getpass.getpass", return_value="dashboard-secret") as password_prompt,
+                ):
                     exit_code = main(["install", "--skip-linear-preflight"])
             finally:
                 os.chdir(old_cwd)
@@ -694,6 +1033,8 @@ class CliSmokeTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertTrue((root / ".symphonz" / "config.toml").exists())
             self.assertTrue((root / ".symphonz" / "WORKFLOW.md").exists())
+            password_prompt.assert_called_once()
+            self.assertNotIn("dashboard-secret", (root / ".symphonz" / "config.toml").read_text())
 
     def test_install_yes_accepts_complete_command_line_configuration(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -703,23 +1044,35 @@ class CliSmokeTests(unittest.TestCase):
             old_cwd = Path.cwd()
             try:
                 os.chdir(root)
-                exit_code = main(
-                    [
-                        "install",
-                        "--yes",
-                        "--skip-linear-preflight",
-                        "--linear-project",
-                        "quality-project",
-                        "--git-provider",
-                        "github",
-                        "--repo-url",
-                        "https://github.com/example/quality.git",
-                        "--base-branch",
-                        "develop",
-                        "--target-branch",
-                        "release",
-                    ]
-                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "SYMPHONZ_DASHBOARD_HOST": "0.0.0.0",
+                        "SYMPHONZ_DASHBOARD_PORT": "4800",
+                        "SYMPHONZ_DASHBOARD_PUBLIC_BASE_URL": "http://192.0.2.80:4800",
+                        "SYMPHONZ_DASHBOARD_USERNAME": "ci-admin",
+                        "SYMPHONZ_DASHBOARD_PASSWORD": "ci-secret",
+                        "SYMPHONZ_DASHBOARD_SESSION_DAYS": "15",
+                    },
+                    clear=False,
+                ):
+                    exit_code = main(
+                        [
+                            "install",
+                            "--yes",
+                            "--skip-linear-preflight",
+                            "--linear-project",
+                            "quality-project",
+                            "--git-provider",
+                            "github",
+                            "--repo-url",
+                            "https://github.com/example/quality.git",
+                            "--base-branch",
+                            "develop",
+                            "--target-branch",
+                            "release",
+                        ]
+                    )
             finally:
                 os.chdir(old_cwd)
 
@@ -729,6 +1082,92 @@ class CliSmokeTests(unittest.TestCase):
             self.assertEqual(config["git"]["provider"], "github")
             self.assertEqual(config["git"]["base_branch"], "develop")
             self.assertEqual(config["git"]["mr_target"], "release")
+            self.assertEqual(config["dashboard"]["host"], "0.0.0.0")
+            self.assertEqual(config["dashboard"]["port"], "4800")
+            self.assertNotIn("ci-secret", (root / ".symphonz" / "config.toml").read_text())
+
+    def test_install_yes_requires_dashboard_password(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run(
+                ["git", "remote", "add", "origin", "https://github.com/example/project.git"],
+                cwd=root,
+                check=True,
+            )
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.dict(os.environ, {"SYMPHONZ_LINEAR_PROJECT": "project"}, clear=True):
+                    with self.assertRaisesRegex(RuntimeError, "SYMPHONZ_DASHBOARD_PASSWORD"):
+                        main(["install", "--yes", "--skip-linear-preflight"])
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertFalse((root / ".symphonz" / "config.toml").exists())
+
+    def test_configure_dashboard_cli_dispatches_all_values(self):
+        with patch("symphonz.install.configure_dashboard", return_value=Path(".symphonz")) as configure:
+            exit_code = main(
+                [
+                    "configure-dashboard",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "4900",
+                    "--public-base-url",
+                    "http://192.0.2.90:4900",
+                    "--username",
+                    "operator",
+                    "--session-days",
+                    "11",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        configure.assert_called_once_with(
+            host="0.0.0.0",
+            port=4900,
+            public_base_url="http://192.0.2.90:4900",
+            username="operator",
+            session_days=11,
+        )
+
+    def test_run_cli_dispatches_temporary_host_and_port(self):
+        with patch("symphonz.runtime.run_installed", return_value=0) as run:
+            exit_code = main(["run", "--host", "127.0.0.2", "--port", "4950"])
+
+        self.assertEqual(exit_code, 0)
+        run.assert_called_once_with(print_command=False, host="127.0.0.2", port=4950)
+
+    def test_service_cli_dispatches_dashboard_internals(self):
+        with patch("symphonz.service.runner.run_service", return_value=0) as service:
+            exit_code = main(
+                [
+                    "service",
+                    ".symphonz/WORKFLOW.md",
+                    "--logs-root",
+                    ".symphonz/logs",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "4000",
+                    "--public-base-url",
+                    "http://192.0.2.100:4000",
+                    "--dashboard-username",
+                    "admin",
+                    "--session-days",
+                    "7",
+                    "--once",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(service.call_args.kwargs["host"], "0.0.0.0")
+        self.assertEqual(service.call_args.kwargs["port"], 4000)
+        self.assertEqual(service.call_args.kwargs["public_base_url"], "http://192.0.2.100:4000")
+        self.assertEqual(service.call_args.kwargs["dashboard_username"], "admin")
+        self.assertEqual(service.call_args.kwargs["session_days"], 7)
 
 
 class ShellInstallerTests(unittest.TestCase):
@@ -779,7 +1218,7 @@ class ShellInstallerTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(version.returncode, 0, version.stderr)
-            self.assertIn("symphonz 0.3.1", version.stdout)
+            self.assertIn("symphonz 0.4.0", version.stdout)
 
     def test_installed_symphonz_runs_from_prefix_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -798,7 +1237,7 @@ class ShellInstallerTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("symphonz 0.3.1", result.stdout)
+            self.assertIn("symphonz 0.4.0", result.stdout)
 
     def test_install_sh_installs_from_local_source_to_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -837,7 +1276,7 @@ class ShellInstallerTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(version.returncode, 0, version.stderr)
-            self.assertIn("symphonz 0.3.1", version.stdout)
+            self.assertIn("symphonz 0.4.0", version.stdout)
             self.assertTrue((prefix / "current" / "lib" / "WORKFLOW.md").exists())
             self.assertTrue((prefix / "current" / "lib" / "symphonz" / "service" / "runner.py").exists())
 
@@ -861,15 +1300,22 @@ class ShellInstallerTests(unittest.TestCase):
             )
             self.assertEqual(install.returncode, 0, install.stderr)
 
-            answers = "\n".join(["LINEAR_API_KEY", "project-slug", "", "", "", ""]) + "\n"
+            env = os.environ.copy()
+            env.update(
+                {
+                    "SYMPHONZ_LINEAR_PROJECT": "project-slug",
+                    "SYMPHONZ_DASHBOARD_PASSWORD": "installed-cli-secret",
+                }
+            )
             result = subprocess.run(
                 [
                     str(prefix / "bin" / "symphonz"),
                     "install",
+                    "--yes",
                     "--skip-linear-preflight",
                 ],
                 cwd=project,
-                input=answers,
+                env=env,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -881,11 +1327,21 @@ class ShellInstallerTests(unittest.TestCase):
             config = read_config(project / ".symphonz" / "config.toml")
             self.assertEqual(config["git"]["provider"], "github")
             self.assertEqual(config["git"]["gitlab_base_url"], "")
+            self.assertEqual(config["dashboard"]["host"], "127.0.0.1")
+            self.assertEqual((project / ".symphonz" / "auth.toml").stat().st_mode & 0o777, 0o600)
 
     def test_repository_exposes_standard_readme_and_staged_installer(self):
         self.assertTrue(Path("README.md").exists())
         script = Path("install.sh").read_text()
         self.assertIn("STAGING_DIR", script)
+
+        readme = Path("README.md").read_text()
+        self.assertIn("symphonz configure-dashboard", readme)
+        self.assertIn("SYMPHONZ_DASHBOARD_PASSWORD", readme)
+        self.assertIn("--host", readme)
+        self.assertIn("--port", readme)
+        self.assertIn("HTTP", readme)
+        self.assertIn("report", readme.lower())
 
 
 if __name__ == "__main__":
