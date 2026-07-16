@@ -3,12 +3,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 import base64
+import binascii
 import os
 from pathlib import Path
 import secrets
+import stat
 import subprocess
+import tempfile
 
-from symphonz.service.auth import DashboardAuth, PasswordRecord, hash_password
+from symphonz.service.auth import DashboardAuth, PasswordRecord, hash_password, validate_password_record
 
 
 DEFAULT_GITLAB_BASE_URL = "https://gitlab.example.com"
@@ -66,10 +69,14 @@ def write_config(path: Path, config: InstallConfig) -> None:
 
 
 def read_config(path: Path) -> dict[str, dict[str, str]]:
+    return _parse_config(path.read_text())
+
+
+def _parse_config(content: str) -> dict[str, dict[str, str]]:
     parsed: dict[str, dict[str, str]] = {}
     current_section: str | None = None
 
-    for raw_line in path.read_text().splitlines():
+    for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line:
             continue
@@ -109,6 +116,9 @@ def parse_toml_string(value: str) -> str:
 
 
 def write_auth_config(path: Path, password: str) -> DashboardAuth:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _validate_auth_destination(path)
     record = hash_password(password)
     session_secret = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
     content = "\n".join(
@@ -121,29 +131,111 @@ def write_auth_config(path: Path, password: str) -> DashboardAuth:
             "",
         ]
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    descriptor = -1
+    temporary_path: Path | None = None
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as auth_file:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+        )
+        temporary_path = Path(temporary_name)
+        os.fchmod(descriptor, 0o600)
+        auth_file = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        with auth_file:
             auth_file.write(content)
+            auth_file.flush()
+            os.fsync(auth_file.fileno())
+        _validate_auth_destination(path)
+        os.replace(temporary_path, path)
+        temporary_path = None
+        directory_descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     finally:
-        os.chmod(path, 0o600)
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
     return DashboardAuth(password_record=record, session_secret=session_secret)
 
 
 def read_dashboard_auth(project_root: Path) -> DashboardAuth:
     auth_path = project_root / ".symphonz" / "auth.toml"
-    auth_values = read_config(auth_path).get("auth", {})
+    content = _read_private_auth_file(auth_path)
+    auth_values = _parse_config(content).get("auth", {})
     required = ("algorithm", "salt", "password_hash", "session_secret")
     if any(not auth_values.get(field) for field in required):
-        raise RuntimeError(f"Dashboard auth configuration is invalid: {auth_path}")
-    return DashboardAuth(
-        password_record=PasswordRecord(
-            algorithm=auth_values["algorithm"],
-            salt=auth_values["salt"],
-            password_hash=auth_values["password_hash"],
-        ),
-        session_secret=auth_values["session_secret"],
+        raise _auth_config_error(auth_path, "required auth fields are missing")
+    record = PasswordRecord(
+        algorithm=auth_values["algorithm"],
+        salt=auth_values["salt"],
+        password_hash=auth_values["password_hash"],
+    )
+    try:
+        validate_password_record(record)
+        _decode_auth_value(auth_values["session_secret"], "session_secret", 32)
+    except (RuntimeError, ValueError) as error:
+        raise _auth_config_error(auth_path, str(error)) from error
+    return DashboardAuth(password_record=record, session_secret=auth_values["session_secret"])
+
+
+def _validate_auth_destination(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(metadata.st_mode):
+        raise RuntimeError(f"Dashboard auth configuration destination must not be a symbolic link: {path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"Dashboard auth configuration destination must be a regular file: {path}")
+
+
+def _read_private_auth_file(path: Path) -> str:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise _auth_config_error(path, "file does not exist") from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise _auth_config_error(path, "file must not be a symbolic link")
+
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened_metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_metadata.st_mode):
+            raise _auth_config_error(path, "file must be a regular file")
+        if stat.S_IMODE(opened_metadata.st_mode) != 0o600:
+            raise _auth_config_error(path, "file permissions must be exactly 0600")
+        auth_file = os.fdopen(descriptor, "r", encoding="utf-8")
+        descriptor = -1
+        with auth_file:
+            return auth_file.read()
+    except (OSError, UnicodeError) as error:
+        raise _auth_config_error(path, f"file cannot be opened safely: {error}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _decode_auth_value(value: str, field: str, expected_bytes: int) -> bytes:
+    try:
+        decoded = base64.b64decode(value.encode("ascii"), validate=True)
+    except (binascii.Error, UnicodeEncodeError, ValueError) as error:
+        raise ValueError(f"{field} must be valid Base64") from error
+    if len(decoded) != expected_bytes:
+        raise ValueError(f"{field} must decode to exactly {expected_bytes} bytes")
+    return decoded
+
+
+def _auth_config_error(path: Path, reason: str) -> RuntimeError:
+    return RuntimeError(
+        f"Dashboard auth configuration is invalid at {path}: {reason}. "
+        "Run `symphonz configure-dashboard` to regenerate it."
     )
 
 

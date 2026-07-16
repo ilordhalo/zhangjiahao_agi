@@ -403,7 +403,29 @@ class RuntimeStore:
         window_seconds: float = 300,
         lock_seconds: float = 900,
     ) -> dict:
-        if max_failures < 1 or window_seconds <= 0 or lock_seconds <= 0:
+        reservation = self.reserve_login_attempt(
+            rate_limit_key,
+            now=now,
+            max_attempts=max_failures,
+            window_seconds=window_seconds,
+            lock_seconds=lock_seconds,
+        )
+        return {
+            "failures": reservation["failures"],
+            "locked_until": reservation["locked_until"],
+            "locked": not reservation["reserved"] or reservation["locked_until"] is not None,
+        }
+
+    def reserve_login_attempt(
+        self,
+        rate_limit_key: str,
+        *,
+        now: float | None = None,
+        max_attempts: int = 5,
+        window_seconds: float = 300,
+        lock_seconds: float = 900,
+    ) -> dict:
+        if max_attempts < 1 or window_seconds <= 0 or lock_seconds <= 0:
             raise ValueError("Login attempt limits must be positive")
         current_time = time.time() if now is None else float(now)
 
@@ -413,9 +435,9 @@ class RuntimeStore:
             ).fetchone()
             if row is not None and row["locked_until"] is not None and float(row["locked_until"]) > current_time:
                 return {
-                    "failures": row["failures"],
+                    "reserved": False,
+                    "failures": int(row["failures"]),
                     "locked_until": row["locked_until"],
-                    "locked": True,
                 }
             if row is None or current_time - float(row["window_started_at"]) >= window_seconds:
                 failures = 0
@@ -423,8 +445,15 @@ class RuntimeStore:
             else:
                 failures = int(row["failures"])
                 window_started_at = float(row["window_started_at"])
+            if failures >= max_attempts:
+                locked_until = current_time + lock_seconds
+                connection.execute(
+                    "UPDATE login_attempts SET locked_until = ?, updated_at = ? WHERE rate_limit_key = ?",
+                    (locked_until, current_time, rate_limit_key),
+                )
+                return {"reserved": False, "failures": failures, "locked_until": locked_until}
             failures += 1
-            locked_until = current_time + lock_seconds if failures >= max_failures else None
+            locked_until = current_time + lock_seconds if failures >= max_attempts else None
             connection.execute(
                 """
                 INSERT INTO login_attempts (rate_limit_key, failures, window_started_at, locked_until, updated_at)
@@ -437,7 +466,7 @@ class RuntimeStore:
                 """,
                 (rate_limit_key, failures, window_started_at, locked_until, current_time),
             )
-            return {"failures": failures, "locked_until": locked_until, "locked": locked_until is not None}
+            return {"reserved": True, "failures": failures, "locked_until": locked_until}
 
         return self._write(write)
 

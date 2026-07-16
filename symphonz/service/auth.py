@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import base64
+import binascii
 from dataclasses import dataclass
 import hashlib
 import hmac
 from http.cookies import CookieError, SimpleCookie
-import json
 import secrets
-import subprocess
 import time
 from urllib.parse import urlsplit
 
@@ -17,9 +16,15 @@ from symphonz.service.runtime_store import RuntimeStore
 SCRYPT_N = 2**14
 SCRYPT_R = 8
 SCRYPT_P = 1
+PBKDF2_ITERATIONS = 600_000
 SALT_BYTES = 16
+PASSWORD_HASH_BYTES = 32
+SESSION_SECRET_BYTES = 32
 TOKEN_BYTES = 32
 SESSION_COOKIE_NAME = "symphonz_session"
+SCRYPT_ALGORITHM = "scrypt-v1"
+PBKDF2_ALGORITHM = "pbkdf2-sha256-v1"
+SUPPORTED_PASSWORD_ALGORITHMS = frozenset({SCRYPT_ALGORITHM, PBKDF2_ALGORITHM})
 
 
 class AuthenticationError(ValueError):
@@ -61,54 +66,76 @@ def hash_password(password: str) -> PasswordRecord:
     if not isinstance(password, str) or not password:
         raise ValueError("Dashboard password must not be empty")
     salt = secrets.token_bytes(SALT_BYTES)
-    password_hash = _scrypt(password.encode("utf-8"), salt)
+    algorithm = SCRYPT_ALGORITHM if callable(getattr(hashlib, "scrypt", None)) else PBKDF2_ALGORITHM
+    password_hash = _derive_password(password.encode("utf-8"), salt, algorithm)
     return PasswordRecord(
-        algorithm="scrypt",
+        algorithm=algorithm,
         salt=base64.b64encode(salt).decode("ascii"),
         password_hash=base64.b64encode(password_hash).decode("ascii"),
     )
 
 
 def verify_password(password: str, record: PasswordRecord) -> bool:
-    if not isinstance(password, str) or record.algorithm != "scrypt":
+    if not isinstance(password, str):
         return False
     try:
-        salt = base64.b64decode(record.salt.encode("ascii"), validate=True)
-        expected_hash = base64.b64decode(record.password_hash.encode("ascii"), validate=True)
-    except (ValueError, UnicodeEncodeError):
+        salt, expected_hash = validate_password_record(record)
+        calculated_hash = _derive_password(password.encode("utf-8"), salt, record.algorithm)
+    except (RuntimeError, ValueError):
         return False
-    calculated_hash = _scrypt(password.encode("utf-8"), salt)
     return hmac.compare_digest(calculated_hash, expected_hash)
 
 
-def _scrypt(password: bytes, salt: bytes) -> bytes:
-    native_scrypt = getattr(hashlib, "scrypt", None)
-    if native_scrypt is not None:
-        return native_scrypt(password, salt=salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P)
-    payload = json.dumps(
-        {"password": base64.b64encode(password).decode("ascii"), "salt": base64.b64encode(salt).decode("ascii")}
-    ).encode("utf-8")
-    script = (
-        "const crypto=require('crypto'),chunks=[];"
-        "process.stdin.on('data',chunk=>chunks.push(chunk));"
-        "process.stdin.on('end',()=>{const value=JSON.parse(Buffer.concat(chunks).toString());"
-        "const hash=crypto.scryptSync(Buffer.from(value.password,'base64'),Buffer.from(value.salt,'base64'),64,"
-        "{N:16384,r:8,p:1,maxmem:33554432});process.stdout.write(hash.toString('base64'));});"
-    )
+def validate_password_record(record: PasswordRecord) -> tuple[bytes, bytes]:
+    if record.algorithm not in SUPPORTED_PASSWORD_ALGORITHMS:
+        raise ValueError(f"unsupported password algorithm {record.algorithm!r}")
+    salt = _decode_base64(record.salt, "salt", SALT_BYTES)
+    password_hash = _decode_base64(record.password_hash, "password_hash", PASSWORD_HASH_BYTES)
+    if record.algorithm == SCRYPT_ALGORITHM and not callable(getattr(hashlib, "scrypt", None)):
+        raise RuntimeError("scrypt password record is unavailable on this Python runtime")
+    return salt, password_hash
+
+
+def session_generation(session_secret: str) -> str:
+    secret = _decode_base64(session_secret, "session_secret", SESSION_SECRET_BYTES)
+    return hashlib.sha256(b"symphonz-session-generation-v1\0" + secret).hexdigest()
+
+
+def _decode_base64(value: str, field: str, expected_bytes: int) -> bytes:
     try:
-        result = subprocess.run(
-            ["node", "-e", script], input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
+        decoded = base64.b64decode(value.encode("ascii"), validate=True)
+    except (binascii.Error, UnicodeEncodeError, ValueError) as error:
+        raise ValueError(f"{field} must be valid Base64") from error
+    if len(decoded) != expected_bytes:
+        raise ValueError(f"{field} must decode to exactly {expected_bytes} bytes")
+    return decoded
+
+
+def _derive_password(password: bytes, salt: bytes, algorithm: str) -> bytes:
+    if algorithm == SCRYPT_ALGORITHM:
+        native_scrypt = getattr(hashlib, "scrypt", None)
+        if not callable(native_scrypt):
+            raise RuntimeError("scrypt password record is unavailable on this Python runtime")
+        return native_scrypt(
+            password,
+            salt=salt,
+            n=SCRYPT_N,
+            r=SCRYPT_R,
+            p=SCRYPT_P,
+            dklen=PASSWORD_HASH_BYTES,
         )
-    except (FileNotFoundError, subprocess.CalledProcessError) as error:
-        raise RuntimeError("Python must provide hashlib.scrypt for dashboard authentication") from error
-    return base64.b64decode(result.stdout, validate=True)
+    if algorithm == PBKDF2_ALGORITHM:
+        return hashlib.pbkdf2_hmac(
+            "sha256", password, salt, PBKDF2_ITERATIONS, dklen=PASSWORD_HASH_BYTES
+        )
+    raise ValueError(f"unsupported password algorithm {algorithm!r}")
 
 
 def safe_next_path(value: str | None) -> str | None:
     if not value or not value.startswith("/") or value.startswith("//") or "\\" in value:
         return None
     parsed = urlsplit(value)
-    if parsed.scheme or parsed.netloc or any(character in value for character in "\r\n"):
+    if parsed.scheme or parsed.netloc or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
         return None
     return value
 
@@ -121,6 +148,7 @@ class AuthService:
         store: RuntimeStore,
         username: str,
         password_record: PasswordRecord,
+        session_secret: str,
         session_days: int,
         secure_cookie: bool = False,
         clock=time.time,
@@ -136,12 +164,13 @@ class AuthService:
         self.secure_cookie = secure_cookie
         self.clock = clock
         self._username_key = self._normalize_username(username)
+        self._session_generation = session_generation(session_secret)
 
     def login(self, username: str, password: str, client_key: str) -> LoginResult:
         now = float(self.clock())
         rate_limit_key = self._rate_limit_key(username, client_key)
-        attempt = self.store.get_login_attempt(rate_limit_key)
-        if attempt and attempt["locked_until"] is not None and float(attempt["locked_until"]) > now:
+        reservation = self.store.reserve_login_attempt(rate_limit_key, now=now)
+        if not reservation["reserved"]:
             raise LoginLockedError("Too many failed login attempts; try again later")
 
         username_matches = hmac.compare_digest(
@@ -149,7 +178,6 @@ class AuthService:
         )
         password_matches = verify_password(password, self.password_record)
         if not username_matches or not password_matches:
-            self.store.record_failed_login_attempt(rate_limit_key, now=now)
             raise AuthenticationError("Invalid username or password")
 
         self.store.clear_login_attempt(rate_limit_key)
@@ -159,7 +187,11 @@ class AuthService:
             self.token_hash(token),
             expires_at=expires_at,
             created_at=now,
-            metadata={"username": self.username},
+            metadata={
+                "username": self.username,
+                "username_key": self._username_key,
+                "auth_generation": self._session_generation,
+            },
         )
         return LoginResult(token=token, expires_at=expires_at, set_cookie=self._set_cookie(token))
 
@@ -169,10 +201,20 @@ class AuthService:
         stored = self.store.get_session(self.token_hash(token), now=float(self.clock()))
         if stored is None:
             return None
-        username = stored["metadata"].get("username")
-        if not isinstance(username, str) or not username:
+        metadata = stored["metadata"]
+        username_key = metadata.get("username_key")
+        auth_generation = metadata.get("auth_generation")
+        if not isinstance(username_key, str) or not isinstance(auth_generation, str):
             return None
-        return Session(username=username, expires_at=float(stored["expires_at"]), created_at=float(stored["created_at"]))
+        if not hmac.compare_digest(username_key.encode("utf-8"), self._username_key.encode("utf-8")):
+            return None
+        if not hmac.compare_digest(auth_generation.encode("utf-8"), self._session_generation.encode("ascii")):
+            return None
+        return Session(
+            username=self.username,
+            expires_at=float(stored["expires_at"]),
+            created_at=float(stored["created_at"]),
+        )
 
     def authenticate_cookie(self, header: str | None) -> Session | None:
         if not header:

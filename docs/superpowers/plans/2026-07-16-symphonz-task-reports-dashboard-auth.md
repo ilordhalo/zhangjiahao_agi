@@ -6,7 +6,7 @@
 
 **Architecture:** Add one transactional SQLite repository shared by the orchestrator, report publisher, dashboard, and authentication service. Codex publishes validated structured reports through a new dynamic tool; Symphonz renders escaped HTML, persists it outside workspaces, and idempotently synchronizes a dedicated Linear comment. Split the current monolithic dashboard into routing and deterministic template modules while preserving the standard-library-only runtime.
 
-**Tech Stack:** Python 3.9+ standard library, `sqlite3`, `hashlib.scrypt`, `http.server`, `unittest`, HTML/CSS/vanilla JavaScript, fake Linear/Codex fixtures, browser screenshot verification.
+**Tech Stack:** Python 3.9+ standard library, `sqlite3`, versioned `hashlib.scrypt`/`hashlib.pbkdf2_hmac`, `http.server`, `unittest`, HTML/CSS/vanilla JavaScript, fake Linear/Codex fixtures, browser screenshot verification.
 
 ## Global Constraints
 
@@ -86,11 +86,11 @@ git commit -m "feat(runtime): persist task history and errors"
 - Test: `tests/test_symphonz_cli.py`
 
 **Interfaces:**
-- Produces: `hash_password(password) -> PasswordRecord`, `verify_password(...) -> bool`, `AuthService(store, username, password_record, session_days, secure_cookie)`, `authenticate_cookie(header)`, `login(username, password, client_key)`, `logout(token)`.
+- Produces: `hash_password(password) -> PasswordRecord`, `verify_password(...) -> bool`, `AuthService(store, username, password_record, session_secret, session_days, secure_cookie)`, `authenticate_cookie(header)`, `login(username, password, client_key)`, `logout(token)`.
 - Produces: `write_auth_config(path, password)` and `read_dashboard_auth(project_root)`.
-- Consumes: `RuntimeStore` session and login-attempt operations from Task 1.
+- Consumes: `RuntimeStore` session operations and atomic `reserve_login_attempt(...)` from Task 1.
 
-- [ ] **Step 1: Write failing password, session, expiry, logout, and lockout tests**
+- [ ] **Step 1: Write failing versioned KDF, reservation, session-generation, auth-file, redirect, expiry, and logout tests**
 
 ```python
 def test_login_session_survives_auth_service_restart(self):
@@ -104,7 +104,9 @@ def test_login_session_survives_auth_service_restart(self):
 Run: `python3 -m unittest tests.test_symphonz_auth -v`
 Expected: FAIL because `symphonz.service.auth` does not exist.
 
-- [ ] **Step 3: Implement scrypt records, constant-time verification, token hashing, persistent expiry, logout, and five-attempt lockout**
+- [ ] **Step 3: Implement standard-library versioned KDFs, reservation-first lockout, generation-bound sessions, token hashing, persistent expiry, and logout**
+
+New records use `scrypt-v1` with a 16-byte salt, `n=2**14`, `r=8`, `p=1`, and 32-byte output when `hashlib.scrypt` exists. Otherwise they use `pbkdf2-sha256-v1` with exactly 600,000 iterations and 32-byte output. Verification dispatches by algorithm with `hmac.compare_digest`; a runtime without scrypt rejects loaded `scrypt-v1` records, and no Node/subprocess KDF is allowed. Login reserves one of five attempt slots atomically before KDF work and releases the SQLite transaction before deriving a password hash. Sessions include an irreversible generation derived from `session_secret`, so credential or username rotation invalidates existing tokens.
 
 ```python
 @dataclass(frozen=True)
@@ -119,10 +121,10 @@ class AuthService:
     def logout(self, token: str) -> None: ...
 ```
 
-- [ ] **Step 4: Add auth-file permissions and Git-ignore tests**
+- [ ] **Step 4: Add strict auth-file, atomic replacement, control-character, and Git-ignore tests**
 
 Run: `python3 -m unittest tests.test_symphonz_auth tests.test_symphonz_cli.ConfigTests -v`
-Expected: PASS, including mode `0600` and no plaintext password.
+Expected: PASS, including exact mode `0600`, regular non-symlink validation, strict Base64 and record lengths, exclusive same-directory atomic replacement with file/directory sync, no plaintext password, and rejection of U+0000-U+001F plus U+007F in redirect paths.
 
 - [ ] **Step 5: Commit the authentication slice**
 

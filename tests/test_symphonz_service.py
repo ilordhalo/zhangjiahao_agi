@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
 import io
 import json
@@ -1596,6 +1597,27 @@ class RuntimeStoreTests(unittest.TestCase):
         self.assertEqual(attempt["failures"], 5)
         self.assertEqual(attempt["locked_until"], now + 900)
         self.assertTrue(any(result["locked"] for result in results))
+
+    def test_login_attempt_reservations_allow_only_five_concurrent_kdf_slots(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        now = 100.0
+        barrier = threading.Barrier(10)
+
+        def reserve():
+            barrier.wait()
+            return RuntimeStore(self.path).reserve_login_attempt(
+                "admin:127.0.0.1", now=now, max_attempts=5, window_seconds=300, lock_seconds=900
+            )
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            results = list(executor.map(lambda _unused: reserve(), range(10)))
+
+        attempt = store.get_login_attempt("admin:127.0.0.1")
+        self.assertEqual(sum(result["reserved"] for result in results), 5)
+        self.assertEqual(attempt["failures"], 5)
+        self.assertEqual(attempt["locked_until"], now + 900)
 
     def test_composite_event_sink_continues_after_a_sink_fails(self):
         from symphonz.service.event_log import CompositeEventSink, JsonlEventLog

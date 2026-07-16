@@ -1,9 +1,11 @@
 from pathlib import Path
+import base64
 import json
 import os
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from symphonz.cli import main
 from symphonz.install import (
@@ -34,12 +36,159 @@ class ConfigTests(unittest.TestCase):
 
             content = path.read_text()
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            self.assertIn('algorithm = "scrypt"', content)
+            self.assertRegex(content, r'algorithm = "(?:scrypt-v1|pbkdf2-sha256-v1)"')
             self.assertNotIn(password, content)
             auth = read_dashboard_auth(root)
             self.assertTrue(auth.password_record.password_hash)
             self.assertTrue(auth.session_secret)
             self.assertIn(".symphonz/auth.toml", (root / ".gitignore").read_text())
+
+    def test_read_dashboard_auth_rejects_corrupt_fields(self):
+        corrupt_values = {
+            "unsupported algorithm": ("algorithm", "pbkdf2"),
+            "invalid salt base64": ("salt", "!invalid"),
+            "invalid session secret base64": ("session_secret", "!invalid"),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / ".symphonz" / "auth.toml"
+            write_auth_config(path, "correct")
+            original = path.read_text()
+
+            for label, (field, value) in corrupt_values.items():
+                with self.subTest(label=label):
+                    lines = [f'{field} = "{value}"' if line.startswith(f"{field} = ") else line for line in original.splitlines()]
+                    path.write_text("\n".join(lines) + "\n")
+                    os.chmod(path, 0o600)
+                    with self.assertRaisesRegex(RuntimeError, "configure-dashboard"):
+                        read_dashboard_auth(root)
+
+            encoded_values = {
+                "short salt": ("salt", base64.b64encode(b"s" * 15).decode("ascii")),
+                "short password hash": ("password_hash", base64.b64encode(b"h" * 31).decode("ascii")),
+                "short session secret": ("session_secret", base64.b64encode(b"k" * 31).decode("ascii")),
+            }
+            for label, (field, value) in encoded_values.items():
+                with self.subTest(label=label):
+                    lines = [f'{field} = "{value}"' if line.startswith(f"{field} = ") else line for line in original.splitlines()]
+                    path.write_text("\n".join(lines) + "\n")
+                    os.chmod(path, 0o600)
+                    with self.assertRaisesRegex(RuntimeError, "configure-dashboard"):
+                        read_dashboard_auth(root)
+
+    def test_read_dashboard_auth_rejects_invalid_utf8_with_actionable_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / ".symphonz" / "auth.toml"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"[auth]\nalgorithm = \"\xff\"\n")
+            os.chmod(path, 0o600)
+
+            with self.assertRaisesRegex(RuntimeError, "configure-dashboard"):
+                read_dashboard_auth(root)
+
+    def test_read_dashboard_auth_rejects_scrypt_when_runtime_has_no_scrypt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / ".symphonz" / "auth.toml"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "\n".join(
+                    [
+                        "[auth]",
+                        'algorithm = "scrypt-v1"',
+                        f'salt = "{base64.b64encode(b"s" * 16).decode("ascii")}"',
+                        f'password_hash = "{base64.b64encode(b"h" * 32).decode("ascii")}"',
+                        f'session_secret = "{base64.b64encode(b"k" * 32).decode("ascii")}"',
+                        "",
+                    ]
+                )
+            )
+            os.chmod(path, 0o600)
+
+            with patch("symphonz.service.auth.hashlib.scrypt", None, create=True):
+                with self.assertRaisesRegex(RuntimeError, "scrypt.*unavailable"):
+                    read_dashboard_auth(root)
+
+    def test_read_dashboard_auth_rejects_non_private_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / ".symphonz" / "auth.toml"
+            write_auth_config(path, "correct")
+            os.chmod(path, 0o640)
+
+            with self.assertRaisesRegex(RuntimeError, "0600"):
+                read_dashboard_auth(root)
+
+    def test_auth_config_read_and_write_reject_destination_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / ".symphonz" / "auth.toml"
+            write_auth_config(path, "correct")
+            target = root / "target.toml"
+            path.replace(target)
+            path.symlink_to(target)
+            original = target.read_text()
+
+            with self.assertRaisesRegex(RuntimeError, "symbolic link"):
+                read_dashboard_auth(root)
+            with self.assertRaisesRegex(RuntimeError, "symbolic link"):
+                write_auth_config(path, "replacement")
+
+            self.assertEqual(target.read_text(), original)
+
+    def test_auth_config_read_and_write_reject_non_regular_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / ".symphonz" / "auth.toml"
+            path.mkdir(parents=True)
+
+            with self.assertRaisesRegex(RuntimeError, "regular file"):
+                read_dashboard_auth(root)
+            with self.assertRaisesRegex(RuntimeError, "regular file"):
+                write_auth_config(path, "replacement")
+
+    def test_write_auth_config_atomically_replaces_with_private_synced_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".symphonz" / "auth.toml"
+            path.parent.mkdir(parents=True)
+            path.write_text("old-config")
+            os.chmod(path, 0o644)
+            real_replace = os.replace
+            observed = {}
+
+            def inspect_replace(source, destination):
+                source_path = Path(source)
+                observed["same_directory"] = source_path.parent == path.parent
+                observed["temporary_mode"] = source_path.stat().st_mode & 0o777
+                observed["destination_before_replace"] = Path(destination).read_text()
+                real_replace(source, destination)
+
+            with (
+                patch("symphonz.install.os.replace", side_effect=inspect_replace) as replace,
+                patch("symphonz.install.os.fsync", wraps=os.fsync) as fsync,
+            ):
+                write_auth_config(path, "replacement")
+
+            replace.assert_called_once()
+            self.assertGreaterEqual(fsync.call_count, 2)
+            self.assertEqual(observed["same_directory"], True)
+            self.assertEqual(observed["temporary_mode"], 0o600)
+            self.assertEqual(observed["destination_before_replace"], "old-config")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_write_auth_config_replace_failure_preserves_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".symphonz" / "auth.toml"
+            path.parent.mkdir(parents=True)
+            path.write_text("old-config")
+
+            with patch("symphonz.install.os.replace", side_effect=OSError("replace failed")):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    write_auth_config(path, "replacement")
+
+            self.assertEqual(path.read_text(), "old-config")
+            self.assertEqual(list(path.parent.glob(".auth.toml.*.tmp")), [])
 
     def test_write_config_uses_env_var_for_linear_key(self):
         with tempfile.TemporaryDirectory() as tmp:

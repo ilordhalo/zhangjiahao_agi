@@ -84,7 +84,7 @@ The runtime owns report storage, rendering, URL generation, and Linear synchroni
     ZHA-9/
 ```
 
-`.symphonz/auth.toml`, `.symphonz/artifacts/`, `.symphonz/logs/`, and `.symphonz/workspace/` are ignored by Git. `auth.toml` is written with mode `0600`. Reports survive terminal workspace cleanup.
+`.symphonz/auth.toml`, `.symphonz/artifacts/`, `.symphonz/logs/`, and `.symphonz/workspace/` are ignored by Git. `auth.toml` is atomically replaced from an exclusive same-directory `0600` temporary file after file and directory sync. Reads require a regular non-symlink file with exact mode `0600`; malformed or unsupported records fail closed with a configuration-regeneration error. Reports survive terminal workspace cleanup.
 
 ## Configuration
 
@@ -103,7 +103,7 @@ Secret authentication material lives in `.symphonz/auth.toml`:
 
 ```toml
 [auth]
-algorithm = "scrypt"
+algorithm = "scrypt-v1"
 salt = "<base64>"
 password_hash = "<base64>"
 session_secret = "<base64>"
@@ -123,13 +123,15 @@ This command updates only `[dashboard]`, writes `auth.toml`, and updates `.gitig
 
 ## LAN Authentication
 
-The dashboard has one configured user. Passwords use `hashlib.scrypt` with a random 16-byte salt, `n=2**14`, `r=8`, and `p=1`. Comparisons use `hmac.compare_digest`.
+The dashboard has one configured user. Password records are versioned and use only Python standard-library KDFs. New records prefer `scrypt-v1` through `hashlib.scrypt` with a random 16-byte salt, `n=2**14`, `r=8`, `p=1`, and a 32-byte output. When that API is unavailable, new records use `pbkdf2-sha256-v1` through `hashlib.pbkdf2_hmac` with exactly 600,000 iterations and a 32-byte output. Verification dispatches by the recorded algorithm and uses `hmac.compare_digest`; no Node or subprocess KDF is permitted. Loading a `scrypt-v1` record on a runtime without `hashlib.scrypt` fails startup with an actionable error.
 
 Successful login creates a random 32-byte token. Only its SHA-256 digest is stored in the `dashboard_sessions` SQLite table. The browser receives the raw token in a `symphonz_session` cookie with `HttpOnly`, `SameSite=Lax`, `Path=/`, and `Max-Age` matching `session_days`. `Secure` is set automatically when `public_base_url` is HTTPS.
 
-Sessions survive service restarts, expire after the configured duration, and are deleted on logout. Login attempts are stored by normalized username and client address. Five failures within five minutes lock that key for fifteen minutes. Successful login clears its failure record.
+Sessions store an irreversible configuration generation derived from `session_secret` plus the normalized configured username. They survive restarts only while that generation and username remain unchanged; credential-secret or username rotation invalidates existing sessions. Sessions expire after the configured duration and are deleted on logout.
 
-Every route except `GET /login`, `POST /login`, and `GET /healthz` requires authentication. The login handler accepts only form-encoded bodies within a small size limit. A validated `next` value may contain only an absolute path beginning with one `/`; this prevents open redirects. Logout is a POST operation.
+Login attempts are stored by normalized username and client address. Each request must atomically reserve one of five slots before password KDF work begins. Requests without a reservation are rejected without executing the KDF, and the SQLite write transaction ends before KDF work. The fifth reservation locks that key for fifteen minutes within the five-minute attempt window; a successful permitted login clears the reservation record.
+
+Every route except `GET /login`, `POST /login`, and `GET /healthz` requires authentication. The login handler accepts only form-encoded bodies within a small size limit. A validated `next` value may contain only an absolute path beginning with one `/` and must reject every character below U+0020 plus U+007F; this prevents open redirects and control-character response splitting. Logout is a POST operation.
 
 Because 0.4.0 is LAN-only, HTTP is permitted. The UI displays a persistent unencrypted-connection warning when the request is not HTTPS. Documentation states that Internet exposure requires a later TLS/reverse-proxy deployment.
 
@@ -296,7 +298,7 @@ HTML routes render complete first content for resilience. JavaScript progressive
 
 ## Verification Strategy
 
-- Unit tests for scrypt verification, session persistence, expiration, logout, rate limits, cookie flags, and safe redirects.
+- Unit tests for versioned scrypt/PBKDF2 verification, concurrent attempt reservation, session-generation rotation, expiration, logout, strict auth-file handling, cookie flags, and safe redirects including all ASCII controls.
 - Unit tests for report schema limits, escaping, architecture rendering, atomic replacement, and stable URLs.
 - Unit tests for RuntimeStore migrations, pagination, filtering, redaction, error resolution, and concurrent access.
 - HTTP tests for login gates, authenticated APIs, task pages, report pages, logout, and missing resources.
