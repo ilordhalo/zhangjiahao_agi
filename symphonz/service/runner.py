@@ -179,10 +179,10 @@ def run_service(
     )
 
     dashboard = None
-    state.add_event("service_started", "Symphonz service started")
     result = None
     primary_error = None
     try:
+        state.add_event("service_started", "Symphonz service started")
         orchestrator.startup_cleanup()
         if dashboard_configuration is not None:
             assert auth_service is not None
@@ -218,7 +218,7 @@ def run_service(
     except BaseException as error:
         primary_error = error
 
-    cleanup_error = None
+    lifecycle_error = None
     cleanup_steps = [("orchestrator.shutdown", orchestrator.shutdown)]
     if dashboard is not None:
         cleanup_steps.append(("dashboard.stop", dashboard.stop))
@@ -226,9 +226,10 @@ def run_service(
         try:
             cleanup()
         except BaseException as error:
-            if cleanup_error is None:
-                cleanup_error = error
-            state.add_event(
+            if lifecycle_error is None:
+                lifecycle_error = error
+            _persist_lifecycle_event(
+                state,
                 "service_cleanup_failed",
                 f"Service cleanup failed during {operation}: {error}",
                 severity="error",
@@ -238,14 +239,41 @@ def run_service(
                 error_type=type(error).__name__,
                 error=str(error),
             )
-    state.add_event("service_stopped", "Symphonz service stopped")
+    stopped_persistence_error = _persist_lifecycle_event(
+        state,
+        "service_stopped",
+        "Symphonz service stopped",
+    )
+    if lifecycle_error is None:
+        lifecycle_error = stopped_persistence_error
 
     if primary_error is not None:
         raise primary_error.with_traceback(primary_error.__traceback__)
-    if cleanup_error is not None:
-        raise cleanup_error.with_traceback(cleanup_error.__traceback__)
+    if lifecycle_error is not None:
+        raise lifecycle_error.with_traceback(lifecycle_error.__traceback__)
     assert result is not None
     return result
+
+
+def _persist_lifecycle_event(
+    state: RuntimeState,
+    event_type: str,
+    message: str,
+    **data: object,
+) -> BaseException | None:
+    try:
+        state.add_event(event_type, message, **data)
+    except BaseException as error:
+        try:
+            print(
+                f"Symphonz lifecycle event persistence failed for {event_type}: "
+                f"{type(error).__name__}: {error}",
+                file=sys.stderr,
+            )
+        except BaseException:
+            pass
+        return error
+    return None
 
 
 def build_linear_client(config: dict) -> LinearClient:

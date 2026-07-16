@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from unittest import mock
 
@@ -3748,6 +3749,9 @@ class RunnerCompositionTests(unittest.TestCase):
         events = list(
             reversed(RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"])
         )
+        cleanup_errors = RuntimeStore(self.logs_root / "runtime.sqlite3").list_errors(
+            stage="cleanup"
+        )["items"]
         cleanup_events = [event for event in events if event["type"] == "service_cleanup_failed"]
         self.assertIs(raised.exception, startup_error)
         self.assertEqual(
@@ -3767,7 +3771,43 @@ class RunnerCompositionTests(unittest.TestCase):
                 ("RuntimeError", "dashboard stop failed"),
             ],
         )
+        self.assertEqual(
+            {error["context"]["operation"] for error in cleanup_errors},
+            {"orchestrator.shutdown", "dashboard.stop"},
+        )
         self.assertEqual(events[-1]["type"], "service_stopped")
+
+    def test_service_started_persistence_base_exception_still_runs_lifecycle_cleanup(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        class FatalPersistenceError(BaseException):
+            pass
+
+        persistence_error = FatalPersistenceError("service_started persistence failed")
+
+        try:
+            self._run_lifecycle(
+                event_persistence_errors={"service_started": [persistence_error]},
+            )
+        except FatalPersistenceError as raised:
+            propagated_error = raised
+            traceback_frames = traceback.extract_tb(raised.__traceback__)
+        else:
+            self.fail("service_started persistence failure did not propagate")
+
+        events = list(
+            reversed(RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"])
+        )
+        self.assertIs(propagated_error, persistence_error)
+        self.assertIn("record_event", [frame.name for frame in traceback_frames])
+        self.assertEqual(self.lifecycle_order, ["orchestrator.shutdown"])
+        self.assertEqual(self.lifecycle_orchestrator.shutdown_calls, 1)
+        self.dashboard.stop.assert_not_called()
+        self.assertEqual(
+            self.event_persistence_attempts,
+            ["service_started", "service_stopped"],
+        )
+        self.assertEqual([event["type"] for event in events], ["service_stopped"])
 
     def test_poll_once_failure_preserves_primary_when_shutdown_fails(self):
         from symphonz.service.runtime_store import RuntimeStore
@@ -3796,6 +3836,136 @@ class RunnerCompositionTests(unittest.TestCase):
             ["orchestrator.shutdown"],
         )
         self.assertEqual(events[-1]["type"], "service_stopped")
+
+    def test_cleanup_diagnostic_base_exception_does_not_mask_primary_or_skip_cleanup(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        class FatalPersistenceError(BaseException):
+            pass
+
+        poll_error = ValueError("poll once failed")
+        diagnostic_error = FatalPersistenceError("cleanup diagnostic persistence failed")
+
+        try:
+            self._run_lifecycle(
+                poll_once_error=poll_error,
+                orchestrator_shutdown_error=RuntimeError("orchestrator shutdown failed"),
+                dashboard_stop_error=RuntimeError("dashboard stop failed"),
+                event_persistence_errors={
+                    "service_cleanup_failed": [diagnostic_error, None],
+                },
+            )
+        except ValueError as raised:
+            propagated_error = raised
+            traceback_frames = traceback.extract_tb(raised.__traceback__)
+        else:
+            self.fail("primary polling failure did not propagate")
+
+        reopened = RuntimeStore(self.logs_root / "runtime.sqlite3")
+        events = list(reversed(reopened.list_events(limit=50)["items"]))
+        cleanup_events = [event for event in events if event["type"] == "service_cleanup_failed"]
+        cleanup_errors = reopened.list_errors(stage="cleanup")["items"]
+
+        self.assertIs(propagated_error, poll_error)
+        self.assertIn("poll_once", [frame.name for frame in traceback_frames])
+        self.assertEqual(
+            self.lifecycle_order,
+            [
+                "orchestrator.startup_cleanup",
+                "dashboard.start",
+                "orchestrator.poll_once",
+                "orchestrator.shutdown",
+                "dashboard.stop",
+            ],
+        )
+        self.assertEqual(self.lifecycle_orchestrator.shutdown_calls, 1)
+        self.dashboard.stop.assert_called_once_with()
+        self.assertEqual(
+            self.event_persistence_attempts[-3:],
+            ["service_cleanup_failed", "service_cleanup_failed", "service_stopped"],
+        )
+        self.assertEqual(
+            [event["data"]["operation"] for event in cleanup_events],
+            ["dashboard.stop"],
+        )
+        self.assertEqual(len(cleanup_errors), 1)
+        self.assertEqual(cleanup_errors[0]["context"]["operation"], "dashboard.stop")
+        self.assertEqual(events[-1]["type"], "service_stopped")
+        self.assertIn("cleanup diagnostic persistence failed", self.lifecycle_stderr)
+
+    def test_service_stopped_persistence_base_exception_does_not_mask_primary(self):
+        class FatalPersistenceError(BaseException):
+            pass
+
+        poll_error = ValueError("poll once failed")
+        stopped_error = FatalPersistenceError("service_stopped persistence failed")
+
+        try:
+            self._run_lifecycle(
+                poll_once_error=poll_error,
+                event_persistence_errors={"service_stopped": [stopped_error]},
+            )
+        except ValueError as raised:
+            propagated_error = raised
+            traceback_frames = traceback.extract_tb(raised.__traceback__)
+        else:
+            self.fail("primary polling failure did not propagate")
+
+        self.assertIs(propagated_error, poll_error)
+        self.assertIn("poll_once", [frame.name for frame in traceback_frames])
+        self.assertEqual(
+            self.lifecycle_order,
+            [
+                "orchestrator.startup_cleanup",
+                "dashboard.start",
+                "orchestrator.poll_once",
+                "orchestrator.shutdown",
+                "dashboard.stop",
+            ],
+        )
+        self.assertEqual(self.lifecycle_orchestrator.shutdown_calls, 1)
+        self.dashboard.stop.assert_called_once_with()
+        self.assertEqual(self.event_persistence_attempts[-1], "service_stopped")
+        self.assertIn("service_stopped persistence failed", self.lifecycle_stderr)
+
+    def test_service_stopped_persistence_base_exception_is_raised_when_it_is_only_failure(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        class FatalPersistenceError(BaseException):
+            pass
+
+        stopped_error = FatalPersistenceError("service_stopped persistence failed")
+
+        try:
+            self._run_lifecycle(
+                event_persistence_errors={"service_stopped": [stopped_error]},
+            )
+        except FatalPersistenceError as raised:
+            propagated_error = raised
+            traceback_frames = traceback.extract_tb(raised.__traceback__)
+        else:
+            self.fail("service_stopped persistence failure did not propagate")
+
+        events = list(
+            reversed(RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"])
+        )
+        self.assertIs(propagated_error, stopped_error)
+        self.assertIn("record_event", [frame.name for frame in traceback_frames])
+        self.assertEqual(
+            self.lifecycle_order,
+            [
+                "orchestrator.startup_cleanup",
+                "dashboard.start",
+                "orchestrator.poll_once",
+                "orchestrator.shutdown",
+                "dashboard.stop",
+            ],
+        )
+        self.assertEqual(self.lifecycle_orchestrator.shutdown_calls, 1)
+        self.dashboard.stop.assert_called_once_with()
+        self.assertEqual(self.event_persistence_attempts[-1], "service_stopped")
+        self.assertNotIn("service_stopped", [event["type"] for event in events])
+        self.assertIn("service_stopped persistence failed", self.lifecycle_stderr)
 
     def test_successful_once_raises_first_cleanup_failure_after_later_cleanup(self):
         from symphonz.service.runtime_store import RuntimeStore
@@ -3970,15 +4140,31 @@ Work on {{ issue.identifier }}.
         orchestrator_shutdown_error=None,
         dashboard_stop_error=None,
         own_publisher=False,
+        event_persistence_errors=None,
     ):
         from symphonz.service import runner
 
         if port is not None:
             self._write_auth()
         self.lifecycle_order = []
+        self.event_persistence_attempts = []
         self.publisher = mock.Mock()
         order = self.lifecycle_order
         publisher = self.publisher
+        persistence_errors = {
+            event_type: list(errors)
+            for event_type, errors in (event_persistence_errors or {}).items()
+        }
+        real_record_event = runner.RuntimeStore.record_event
+
+        def record_event(store, event):
+            self.event_persistence_attempts.append(event.type)
+            queued_errors = persistence_errors.get(event.type, [])
+            if queued_errors:
+                error = queued_errors.pop(0)
+                if error is not None:
+                    raise error
+            return real_record_event(store, event)
 
         class FakeOrchestrator:
             def __init__(inner_self, *args, **kwargs):
@@ -4024,21 +4210,28 @@ Work on {{ issue.identifier }}.
         self.dashboard.start.side_effect = start_dashboard
         self.dashboard.stop.side_effect = stop_dashboard
         workflow_path = self._write_workflow()
-        with (
-            mock.patch("symphonz.service.runner.build_linear_client", return_value=mock.Mock()),
-            mock.patch("symphonz.service.runner.CodexAppServer"),
-            mock.patch("symphonz.service.runner.Orchestrator", FakeOrchestrator),
-            mock.patch("symphonz.service.runner.DashboardServer", return_value=self.dashboard),
-            redirect_stdout(io.StringIO()),
-            redirect_stderr(io.StringIO()),
-        ):
-            return runner.run_service(
-                project_root=self.root,
-                workflow_path=workflow_path,
-                logs_root=self.logs_root,
-                port=port,
-                once=once,
-            )
+        output = io.StringIO()
+        errors = io.StringIO()
+        try:
+            with (
+                mock.patch("symphonz.service.runner.build_linear_client", return_value=mock.Mock()),
+                mock.patch("symphonz.service.runner.CodexAppServer"),
+                mock.patch("symphonz.service.runner.Orchestrator", FakeOrchestrator),
+                mock.patch("symphonz.service.runner.DashboardServer", return_value=self.dashboard),
+                mock.patch.object(runner.RuntimeStore, "record_event", new=record_event),
+                redirect_stdout(output),
+                redirect_stderr(errors),
+            ):
+                return runner.run_service(
+                    project_root=self.root,
+                    workflow_path=workflow_path,
+                    logs_root=self.logs_root,
+                    port=port,
+                    once=once,
+                )
+        finally:
+            self.lifecycle_stdout = output.getvalue()
+            self.lifecycle_stderr = errors.getvalue()
 
     @staticmethod
     def _report_payload(issue):
