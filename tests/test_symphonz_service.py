@@ -89,6 +89,21 @@ class LinearAndWorkspaceTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(publisher.arguments, {"operation": "publish"})
 
+    def test_dynamic_tool_specs_keep_unavailable_report_publishing_explicit(self):
+        from symphonz.service.dynamic_tools import dynamic_tool_specs, execute_dynamic_tool
+
+        specs = dynamic_tool_specs(report_publisher=None)
+        result = execute_dynamic_tool(
+            "symphonz_report",
+            {"operation": "publish"},
+            linear_client=None,
+            report_publisher=None,
+        )
+
+        self.assertEqual([spec["name"] for spec in specs], ["linear_graphql", "symphonz_report"])
+        self.assertFalse(result["success"])
+        self.assertIn("Report publisher is unavailable", result["output"])
+
     def test_linear_client_paginates_candidates_and_normalizes_blockers(self):
         from symphonz.service.linear import LinearClient
 
@@ -674,7 +689,10 @@ class CodexAppServerTests(unittest.TestCase):
                 "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
                 "    elif method == 'turn/start':\n"
                 "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
-                "        print(json.dumps({'id': 950, 'method': 'item/commandExecution/requestApproval', 'params': {}}), flush=True)\n",
+                "        print(json.dumps({'id': 950, 'method': 'item/commandExecution/requestApproval', 'params': {}}), flush=True)\n"
+                "        tail = sys.stdin.read()\n"
+                "        records.write(tail); records.flush()\n"
+                "        break\n",
             )
 
             with self.assertRaisesRegex(RuntimeError, "approval_required"):
@@ -682,6 +700,129 @@ class CodexAppServerTests(unittest.TestCase):
 
             replies = [json.loads(line) for line in records.read_text().splitlines() if json.loads(line).get("id") == 950]
             self.assertEqual(replies[-1]["result"]["decision"], "decline")
+
+    def test_codex_app_server_routes_concurrent_per_run_report_executors(self):
+        from symphonz.service.dynamic_tools import dynamic_tool_specs, linear_graphql_tool_spec
+        from symphonz.service.reporting import report_tool_spec
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = root / "records.jsonl"
+            server, _ = self.write_server(
+                root,
+                "import json, os, sys\n"
+                f"records_path = {str(records)!r}\n"
+                "tool_specs = []\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start':\n"
+                "        tool_specs = msg['params']['dynamicTools']\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': f'thread-{os.getpid()}'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        issue = msg['params']['input'][0]['text']\n"
+                "        with open(records_path, 'a') as output:\n"
+                "            output.write(json.dumps({'issue': issue, 'dynamicTools': tool_specs}) + '\\n')\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        print(json.dumps({'id': 900, 'method': 'item/tool/call', 'params': {'tool': 'symphonz_report', 'arguments': {'issue': issue}}}), flush=True)\n"
+                "    elif msg.get('id') == 900:\n"
+                "        print(json.dumps({'method': 'turn/completed', 'params': {}}), flush=True)\n",
+            )
+            default_specs = [linear_graphql_tool_spec()]
+            default_calls = []
+            client = self.client(
+                server,
+                dynamic_tool_specs=default_specs,
+                dynamic_tool_executor=lambda name, arguments: default_calls.append((name, arguments)),
+            )
+            barrier = threading.Barrier(2)
+            calls = {"SYM-1": [], "SYM-2": []}
+
+            def executor_for(issue):
+                def execute(name, arguments):
+                    barrier.wait(timeout=2)
+                    calls[issue].append((name, arguments))
+                    return {"success": True, "output": issue, "contentItems": []}
+
+                return execute
+
+            def run(issue, specs):
+                kwargs = self.run_kwargs(root)
+                kwargs["prompt"] = issue
+                return client.run_turns(
+                    **kwargs,
+                    max_turns=1,
+                    should_continue=lambda: False,
+                    continuation_prompt=lambda _turn: "unused",
+                    dynamic_tool_specs=specs,
+                    dynamic_tool_executor=executor_for(issue),
+                )
+
+            specs_by_issue = {
+                "SYM-1": [report_tool_spec()],
+                "SYM-2": dynamic_tool_specs(report_publisher=None),
+            }
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(run, issue, specs) for issue, specs in specs_by_issue.items()]
+                results = [future.result(timeout=5) for future in futures]
+
+            advertised = {
+                record["issue"]: record["dynamicTools"]
+                for record in map(json.loads, records.read_text().splitlines())
+            }
+            self.assertEqual([result["turn_count"] for result in results], [1, 1])
+            self.assertEqual(advertised, specs_by_issue)
+            self.assertEqual(calls["SYM-1"], [("symphonz_report", {"issue": "SYM-1"})])
+            self.assertEqual(calls["SYM-2"], [("symphonz_report", {"issue": "SYM-2"})])
+            self.assertEqual(default_specs, [linear_graphql_tool_spec()])
+            self.assertEqual(default_calls, [])
+
+    def test_codex_app_server_rejects_unadvertised_tool_without_executor_call(self):
+        from symphonz.service.dynamic_tools import linear_graphql_tool_spec
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = root / "records.jsonl"
+            server, _ = self.write_server(
+                root,
+                "import json, sys\n"
+                f"records = open({str(records)!r}, 'a')\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); records.write(json.dumps(msg) + '\\n'); records.flush(); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        print(json.dumps({'id': 903, 'method': 'item/tool/call', 'params': {'tool': 'symphonz_report', 'arguments': {'operation': 'publish'}}}), flush=True)\n"
+                "    elif msg.get('id') == 903: print(json.dumps({'method': 'turn/completed', 'params': {}}), flush=True)\n",
+            )
+            executor_calls = []
+            events = []
+
+            result = self.client(server).run_turn(
+                **self.run_kwargs(root),
+                dynamic_tool_specs=[linear_graphql_tool_spec()],
+                dynamic_tool_executor=lambda name, arguments: executor_calls.append((name, arguments)),
+                on_event=events.append,
+            )
+
+            messages = [json.loads(line) for line in records.read_text().splitlines()]
+            thread_start = next(message for message in messages if message.get("method") == "thread/start")
+            tool_reply = next(message for message in messages if message.get("id") == 903 and "result" in message)
+            self.assertEqual(result["turn_id"], "turn-1")
+            self.assertEqual(thread_start["params"]["dynamicTools"], [linear_graphql_tool_spec()])
+            self.assertEqual(executor_calls, [])
+            self.assertEqual(
+                tool_reply["result"],
+                {
+                    "success": False,
+                    "output": "Unsupported dynamic tool: symphonz_report",
+                    "contentItems": [
+                        {"type": "inputText", "text": "Unsupported dynamic tool: symphonz_report"}
+                    ],
+                },
+            )
+            self.assertTrue(any(event["type"] == "unsupported_tool_call" for event in events))
 
     def test_codex_app_server_reuses_thread_and_executes_dynamic_tool(self):
         with tempfile.TemporaryDirectory() as tmp:

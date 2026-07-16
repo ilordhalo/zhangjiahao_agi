@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from copy import deepcopy
+from itertools import count
 from pathlib import Path
 import json
 import os
@@ -17,22 +19,29 @@ from symphonz.service.dynamic_tools import linear_graphql_tool_spec
 _STREAM_CLOSED = object()
 
 
+class _ApprovalDeclined(RuntimeError):
+    pass
+
+
 class CodexAppServer:
     def __init__(
         self,
         command: str,
         *,
+        dynamic_tool_specs: list[dict] | None = None,
         dynamic_tool_executor: Callable[[str, object], dict] | None = None,
         read_timeout_ms: int = 5000,
         turn_timeout_ms: int = 3_600_000,
         stall_timeout_ms: int = 300_000,
     ):
         self.command = command
+        if dynamic_tool_specs is None:
+            dynamic_tool_specs = [linear_graphql_tool_spec()] if dynamic_tool_executor else []
+        self.dynamic_tool_specs = deepcopy(dynamic_tool_specs)
         self.dynamic_tool_executor = dynamic_tool_executor
         self.read_timeout_ms = read_timeout_ms
         self.turn_timeout_ms = turn_timeout_ms
         self.stall_timeout_ms = stall_timeout_ms
-        self._next_id = 1
 
     def run_turn(
         self,
@@ -44,6 +53,8 @@ class CodexAppServer:
         turn_sandbox_policy: dict,
         on_event: Callable[[dict], None] | None = None,
         cancel_event: threading.Event | None = None,
+        dynamic_tool_specs: list[dict] | None = None,
+        dynamic_tool_executor: Callable[[str, object], dict] | None = None,
     ) -> dict:
         return self.run_turns(
             workspace=workspace,
@@ -57,6 +68,8 @@ class CodexAppServer:
             continuation_prompt=lambda _turn: "Continue working from the current thread context.",
             on_event=on_event,
             cancel_event=cancel_event,
+            dynamic_tool_specs=dynamic_tool_specs,
+            dynamic_tool_executor=dynamic_tool_executor,
         )
 
     def run_turns(
@@ -72,9 +85,23 @@ class CodexAppServer:
         continuation_prompt: Callable[[int], str],
         on_event: Callable[[dict], None] | None = None,
         cancel_event: threading.Event | None = None,
+        dynamic_tool_specs: list[dict] | None = None,
+        dynamic_tool_executor: Callable[[str, object], dict] | None = None,
     ) -> dict:
         on_event = on_event or (lambda event: None)
         cancel_event = cancel_event or threading.Event()
+        run_tool_specs = deepcopy(
+            self.dynamic_tool_specs if dynamic_tool_specs is None else dynamic_tool_specs
+        )
+        run_tool_names = frozenset(
+            spec["name"]
+            for spec in run_tool_specs
+            if isinstance(spec, dict) and isinstance(spec.get("name"), str)
+        )
+        run_tool_executor = (
+            self.dynamic_tool_executor if dynamic_tool_executor is None else dynamic_tool_executor
+        )
+        request_ids = count(1)
         process = subprocess.Popen(
             self.command,
             cwd=workspace,
@@ -89,6 +116,7 @@ class CodexAppServer:
         stream = _JsonLineStream(process.stdout)
         stderr_lines: queue.Queue[object] = queue.Queue()
         _start_line_reader(process.stderr, stderr_lines, decode_json=False)
+        graceful_shutdown = False
         try:
             self._request(
                 process,
@@ -99,6 +127,7 @@ class CodexAppServer:
                     "capabilities": {"experimentalApi": True},
                 },
                 cancel_event,
+                request_ids,
             )
             self._notify(process, "initialized", {})
             thread_response = self._request(
@@ -109,9 +138,10 @@ class CodexAppServer:
                     "approvalPolicy": approval_policy,
                     "sandbox": thread_sandbox,
                     "cwd": str(workspace),
-                    "dynamicTools": [linear_graphql_tool_spec()] if self.dynamic_tool_executor else [],
+                    "dynamicTools": run_tool_specs,
                 },
                 cancel_event,
+                request_ids,
             )
             thread_id = thread_response.get("thread", {}).get("id")
             if not thread_id:
@@ -135,8 +165,14 @@ class CodexAppServer:
                         "sandboxPolicy": turn_sandbox_policy,
                     },
                     cancel_event,
+                    request_ids,
                     on_message=lambda message: self._handle_pre_response_message(
-                        process, message, on_event, approval_policy
+                        process,
+                        message,
+                        on_event,
+                        approval_policy,
+                        run_tool_names,
+                        run_tool_executor,
                     ),
                 )
                 last_turn_id = turn_response.get("turn", {}).get("id") or turn_response.get("turnId") or "turn"
@@ -152,7 +188,15 @@ class CodexAppServer:
                         "process_id": process.pid,
                     }
                 )
-                last_result = self._await_completion(process, stream, on_event, cancel_event, approval_policy)
+                last_result = self._await_completion(
+                    process,
+                    stream,
+                    on_event,
+                    cancel_event,
+                    approval_policy,
+                    run_tool_names,
+                    run_tool_executor,
+                )
                 if turn_count >= max(1, int(max_turns)) or not should_continue():
                     break
                 current_prompt = continuation_prompt(turn_count + 1)
@@ -165,8 +209,11 @@ class CodexAppServer:
                 "result": last_result,
                 "stderr": _drain_text_queue(stderr_lines),
             }
+        except _ApprovalDeclined:
+            graceful_shutdown = True
+            raise
         finally:
-            _stop_process(process)
+            _stop_process(process, graceful=graceful_shutdown)
 
     def _request(
         self,
@@ -175,10 +222,10 @@ class CodexAppServer:
         method: str,
         params: dict,
         cancel_event: threading.Event,
+        request_ids: Iterator[int],
         on_message: Callable[[dict], bool] | None = None,
     ) -> dict:
-        request_id = self._next_id
-        self._next_id += 1
+        request_id = next(request_ids)
         self._send(process, {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
         deadline = time.monotonic() + max(self.read_timeout_ms, 1) / 1000
         while True:
@@ -202,20 +249,23 @@ class CodexAppServer:
         message: dict,
         on_event: Callable[[dict], None],
         approval_policy: str | dict,
+        advertised_tool_names: frozenset[str],
+        dynamic_tool_executor: Callable[[str, object], dict] | None,
     ) -> bool:
         method = message.get("method", "")
         params = message.get("params") or {}
         if method == "item/tool/call" and "id" in message:
-            on_event(self._handle_tool_call(process, message))
+            on_event(
+                self._handle_tool_call(
+                    process, message, advertised_tool_names, dynamic_tool_executor
+                )
+            )
             return True
         if method in {"item/tool/requestUserInput", "mcpServer/elicitation/request"} or _needs_input(method, message):
             on_event({"type": "turn_input_required", "method": method, "params": params})
             raise RuntimeError("turn_input_required")
         if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"} and "id" in message:
-            if approval_policy == "never":
-                self._send(process, {"jsonrpc": "2.0", "id": message["id"], "result": {"decision": "decline"}})
-                on_event({"type": "approval_rejected", "method": method, "params": params})
-            raise RuntimeError("approval_required")
+            self._handle_approval_request(process, message, on_event, approval_policy)
         return False
 
     def _await_completion(
@@ -225,6 +275,8 @@ class CodexAppServer:
         on_event: Callable[[dict], None],
         cancel_event: threading.Event,
         approval_policy: str | dict,
+        advertised_tool_names: frozenset[str],
+        dynamic_tool_executor: Callable[[str, object], dict] | None,
     ) -> dict:
         started = time.monotonic()
         last_activity = started
@@ -249,17 +301,16 @@ class CodexAppServer:
             method = message.get("method", "")
             params = message.get("params") or {}
             if method == "item/tool/call" and "id" in message:
-                event = self._handle_tool_call(process, message)
+                event = self._handle_tool_call(
+                    process, message, advertised_tool_names, dynamic_tool_executor
+                )
                 on_event(event)
                 continue
             if method in {"item/tool/requestUserInput", "mcpServer/elicitation/request"} or _needs_input(method, message):
                 on_event({"type": "turn_input_required", "method": method, "params": params})
                 raise RuntimeError("turn_input_required")
             if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"} and "id" in message:
-                if approval_policy == "never":
-                    self._send(process, {"jsonrpc": "2.0", "id": message["id"], "result": {"decision": "decline"}})
-                    on_event({"type": "approval_rejected", "method": method, "params": params})
-                raise RuntimeError("approval_required")
+                self._handle_approval_request(process, message, on_event, approval_policy)
             if method:
                 event = {"type": normalize_event_type(method), "method": method, "params": params}
                 on_event(event)
@@ -272,19 +323,46 @@ class CodexAppServer:
             elif "error" in message:
                 raise RuntimeError(f"stream_error: {message['error']!r}")
 
-    def _handle_tool_call(self, process: subprocess.Popen, message: dict) -> dict:
+    def _handle_approval_request(
+        self,
+        process: subprocess.Popen,
+        message: dict,
+        on_event: Callable[[dict], None],
+        approval_policy: str | dict,
+    ) -> None:
+        method = message.get("method", "")
+        params = message.get("params") or {}
+        if approval_policy == "never":
+            self._send(
+                process,
+                {"jsonrpc": "2.0", "id": message["id"], "result": {"decision": "decline"}},
+            )
+            on_event({"type": "approval_rejected", "method": method, "params": params})
+            raise _ApprovalDeclined("approval_required")
+        raise RuntimeError("approval_required")
+
+    def _handle_tool_call(
+        self,
+        process: subprocess.Popen,
+        message: dict,
+        advertised_tool_names: frozenset[str],
+        dynamic_tool_executor: Callable[[str, object], dict] | None,
+    ) -> dict:
         params = message.get("params") or {}
         tool_name = params.get("tool") or params.get("name")
         arguments = params.get("arguments") or {}
-        if tool_name == "linear_graphql" and self.dynamic_tool_executor is not None:
+        if tool_name not in advertised_tool_names:
+            result = _tool_failure(f"Unsupported dynamic tool: {tool_name or '<missing>'}")
+            event_type = "unsupported_tool_call"
+        elif dynamic_tool_executor is None:
+            result = _tool_failure(f"Dynamic tool executor is unavailable: {tool_name}")
+            event_type = "tool_call_failed"
+        else:
             try:
-                result = _normalize_tool_result(self.dynamic_tool_executor(tool_name, arguments))
+                result = _normalize_tool_result(dynamic_tool_executor(tool_name, arguments))
             except Exception as error:
                 result = _tool_failure(str(error))
             event_type = "tool_call_completed" if result["success"] else "tool_call_failed"
-        else:
-            result = _tool_failure(f"Unsupported dynamic tool: {tool_name or '<missing>'}")
-            event_type = "unsupported_tool_call"
         self._send(process, {"jsonrpc": "2.0", "id": message["id"], "result": result})
         return {"type": event_type, "method": "item/tool/call", "tool": tool_name, "result": result}
 
@@ -400,7 +478,13 @@ def _drain_text_queue(lines: queue.Queue[object]) -> list[str]:
             result.append(item)
 
 
-def _stop_process(process: subprocess.Popen) -> None:
+def _stop_process(process: subprocess.Popen, *, graceful: bool = False) -> None:
+    if graceful and process.poll() is None and process.stdin is not None:
+        try:
+            process.stdin.close()
+            process.wait(timeout=2)
+        except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+            pass
     if process.poll() is None:
         if os.name == "posix":
             try:
