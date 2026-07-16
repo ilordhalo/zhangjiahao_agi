@@ -57,7 +57,7 @@ Codex app-server                    Dashboard / API
     |                                      |
     +--> linear_graphql                    +--> task detail and timeline
     |
-    +--> symphonz_report --> ReportPublisher --> report.json + rendered report.html
+    +--> symphonz_report --> ReportPublisher --> versioned JSON + rendered HTML bundle
                                   |
                                   +--> pending Linear report comment synchronization
 ```
@@ -73,8 +73,8 @@ The runtime owns report storage, rendering, URL generation, and Linear synchroni
   auth.toml
   artifacts/
     ZHA-9/
-      report.json
-      report.html
+      report-<generation>.json
+      report-<generation>.html
   logs/
     attempts.sqlite3
     runtime.sqlite3
@@ -151,7 +151,7 @@ The `symphonz_report` tool accepts one `publish` operation with these required f
 
 All strings have explicit length limits, collections have item limits, issue identifiers must match the active issue, and URLs allow only `http` or `https`. Unknown fields are rejected. Text is escaped during rendering. Architecture nodes and edges render as responsive HTML/CSS rather than executable Mermaid.
 
-Publishing is idempotent for an issue. A later publish atomically replaces `report.json` and `report.html`, updates the task row, and retains the same URL:
+Publishing is idempotent for an issue. The publisher pins non-symlink artifact-root and issue-directory file descriptors, writes a new `report-<generation>.json` and `report-<generation>.html` bundle through relative `dir_fd` operations, and fsyncs both files and the directory. Only after both files exist does RuntimeStore atomically switch its authoritative JSON/HTML paths. A failed second write leaves the previous paths unchanged; a successful commit removes the superseded generation. The dashboard resolves the stable route from the current RuntimeStore HTML path rather than a fixed filename:
 
 ```text
 {public_base_url}/issues/{issue_identifier}/report
@@ -169,7 +169,7 @@ Publishing creates or updates one runtime-owned Linear comment headed:
 
 The comment contains the report URL, review request URL, branch, commit, last publication time, and a one-paragraph summary. It is separate from the agent-owned `## Symphonz Workpad`, so retries cannot corrupt the workpad checklist.
 
-The report row is first committed locally with `linear_sync_status = pending`. The publisher then attempts Linear synchronization. Failed synchronization records an error and remains pending. `Orchestrator.tick()` retries pending report synchronization with bounded exponential backoff. The publish tool returns the report URL even when Linear is temporarily unavailable and clearly reports the pending synchronization state.
+The report row is first committed locally with `linear_sync_status = pending` and bounded index metadata only. Synchronization claims an issue-scoped transactional SQLite lease, reloads and validates the full report from the authoritative JSON artifact, paginates Linear comments until the runtime-owned heading is found, and requires mutation `success` plus a valid comment ID. Failed or corrupt/missing-artifact synchronization emits to the dedicated error sink and remains pending with bounded exponential backoff; later success resolves prior report-sync database errors. `Orchestrator.tick()` retries the concrete publisher in Task 5. The publish tool returns the report URL even when Linear is temporarily unavailable and clearly reports the pending synchronization state.
 
 The workflow requires report publication after the review request exists and before moving the issue to `Human Review`. A missing report is a publication blocker.
 
@@ -279,7 +279,7 @@ HTML routes render complete first content for resilience. JavaScript progressive
 ## Failure Handling
 
 - Invalid report payload: reject without changing the previous report.
-- Interrupted report write: write temporary files, `fsync`, then atomically replace.
+- Interrupted report write: retain authoritative RuntimeStore paths until both versioned files and the issue directory are fsynced, then clean the superseded generation after commit.
 - Report rendering failure: retain the previous report and record an error.
 - Linear synchronization failure: keep the report available, mark pending, retry, and show the failure in Errors.
 - SQLite lock: honor the busy timeout, record a JSONL fallback error, and keep the service alive when possible.
@@ -299,7 +299,7 @@ HTML routes render complete first content for resilience. JavaScript progressive
 ## Verification Strategy
 
 - Unit tests for versioned scrypt/PBKDF2 verification, bounded random-username rate limiting, unique concurrent attempt reservation and expiry, success/failure overlap, session-generation rotation, expiration, logout, parent-directory-safe auth-file handling, cookie flags, and safe redirects including all ASCII controls.
-- Unit tests for report schema limits, escaping, architecture rendering, atomic replacement, and stable URLs.
+- Unit tests for strict report schema limits, escaping, pinned `dir_fd` artifact I/O, versioned bundle commit, stable URLs, SQLite sync leases, comment pagination, Markdown neutralization, and report-sync error recovery.
 - Unit tests for RuntimeStore migrations, pagination, filtering, redaction, error resolution, and concurrent access.
 - HTTP tests for login gates, authenticated APIs, task pages, report pages, logout, and missing resources.
 - Orchestrator tests for structured lifecycle persistence and pending Linear report synchronization retries.

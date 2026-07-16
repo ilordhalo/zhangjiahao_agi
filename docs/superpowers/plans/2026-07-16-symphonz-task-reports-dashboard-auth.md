@@ -150,10 +150,10 @@ git commit -m "feat(auth): add persistent LAN dashboard sessions"
 
 **Interfaces:**
 - Produces: `report_tool_spec() -> dict`, `ReportPublisher.publish(arguments) -> dict`, `validate_report(payload) -> ReportDocument`, `render_report(document) -> str`, `sync_pending(linear_client, now) -> int`.
-- Consumes: RuntimeStore report rows, artifact root, public base URL, and Linear client.
+- Consumes: RuntimeStore report rows, transactional report-sync leases, authoritative artifact paths, artifact root, public base URL, dedicated error sink, and Linear client.
 - Extends dynamic tool routing so `linear_graphql` and `symphonz_report` are both advertised and executed.
 
-- [ ] **Step 1: Write failing schema, escaping, stable URL, atomic replacement, and idempotent Linear-comment tests**
+- [ ] **Step 1: Write failing strict-schema, escaping, stable URL, versioned-bundle, safe artifact reload, SQLite lease, and idempotent Linear-comment tests**
 
 ```python
 def test_report_renderer_escapes_agent_text_and_contains_required_sections(self):
@@ -176,15 +176,16 @@ class ReportPublisher:
     def publish(self, arguments: dict) -> dict:
         document = validate_report(arguments)
         html = render_report(document)
-        self._atomic_write(document, html)
+        json_path, html_path = self._write_fsynced_generation(document, html)
         self.store.save_report(..., linear_sync_status="pending")
+        self._cleanup_superseded_generation(json_path, html_path)
         return {"success": True, "report_url": self.report_url(document.issue_identifier)}
 ```
 
-- [ ] **Step 4: Implement dedicated `## Symphonz Implementation Report` comment upsert and pending retry state**
+- [ ] **Step 4: Implement leased, paginated `## Symphonz Implementation Report` upsert, artifact-backed retry state, business-success validation, and error resolution**
 
 Run: `python3 -m unittest tests.test_symphonz_reporting -v`
-Expected: PASS for create, update, temporary Linear failure, and retry.
+Expected: PASS for create, update, cross-process contention, temporary Linear failure, missing/corrupt artifacts, and restart retry.
 
 - [ ] **Step 5: Commit the report slice**
 

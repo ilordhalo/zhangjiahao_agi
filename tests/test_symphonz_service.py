@@ -1586,6 +1586,68 @@ class RuntimeStoreTests(unittest.TestCase):
         self.assertEqual(report["linear_sync_status"], "synced")
         self.assertNotIn("sync_status", report)
 
+    def test_report_sync_lease_is_atomic_across_store_instances_and_reclaimable_after_expiry(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        first = RuntimeStore(self.path)
+        second = RuntimeStore(self.path)
+        first.save_report(
+            {
+                "issue_identifier": "SYM-1",
+                "report_version": 1,
+                "linear_sync_status": "pending",
+                "next_retry_at": 10.0,
+            }
+        )
+
+        claimed = first.claim_report_sync("SYM-1", owner="worker-1", now=10.0, lease_seconds=30.0)
+        contended = second.claim_report_sync("SYM-1", owner="worker-2", now=10.0, lease_seconds=30.0)
+        reclaimed = second.claim_report_sync("SYM-1", owner="worker-2", now=40.0, lease_seconds=30.0)
+
+        self.assertIsNotNone(claimed)
+        self.assertIsNone(contended)
+        self.assertIsNotNone(reclaimed)
+        self.assertEqual(reclaimed["sync_lease_owner"], "worker-2")
+
+    def test_report_sync_lease_release_requires_owner(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.save_report({"issue_identifier": "SYM-1", "linear_sync_status": "pending"})
+        store.claim_report_sync("SYM-1", owner="worker-1", now=10.0, lease_seconds=30.0)
+
+        self.assertFalse(store.release_report_sync("SYM-1", owner="worker-2"))
+        self.assertTrue(store.release_report_sync("SYM-1", owner="worker-1"))
+        self.assertIsNotNone(store.claim_report_sync("SYM-1", owner="worker-2", now=11.0, lease_seconds=30.0))
+
+    def test_report_sync_state_update_cannot_replace_a_newer_authoritative_bundle(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.save_report(
+            {
+                "issue_identifier": "SYM-1",
+                "json_path": "/artifacts/SYM-1/report-new.json",
+                "html_path": "/artifacts/SYM-1/report-new.html",
+                "linear_sync_status": "pending",
+            }
+        )
+
+        stale = store.update_report_sync_state(
+            "SYM-1",
+            expected_json_path="/artifacts/SYM-1/report-old.json",
+            linear_sync_status="synced",
+            linear_comment_id="comment-old",
+            retry_count=0,
+            next_retry_at=None,
+            updated_at=20.0,
+        )
+        current = store.get_report("SYM-1")
+
+        self.assertFalse(stale)
+        self.assertEqual(current["json_path"], "/artifacts/SYM-1/report-new.json")
+        self.assertEqual(current["linear_sync_status"], "pending")
+
     def test_failed_login_attempts_increment_and_lock_atomically_under_concurrency(self):
         from symphonz.service.runtime_store import RuntimeStore
 

@@ -115,6 +115,28 @@ class RuntimeStore:
             )
         )
 
+    def resolve_report_sync_errors(
+        self,
+        issue_identifier: str,
+        *,
+        resolving_event: str = "report_sync_succeeded",
+        resolved_at: float | None = None,
+    ) -> int:
+        timestamp = time.time() if resolved_at is None else float(resolved_at)
+
+        def write(connection: sqlite3.Connection) -> int:
+            cursor = connection.execute(
+                """
+                UPDATE runtime_errors
+                SET resolved_at = ?, resolving_event = ?
+                WHERE issue_identifier = ? AND stage = 'report_sync' AND resolved_at IS NULL
+                """,
+                (timestamp, resolving_event, issue_identifier),
+            )
+            return int(cursor.rowcount)
+
+        return self._write(write)
+
     def list_tasks(
         self,
         *,
@@ -317,6 +339,112 @@ class RuntimeStore:
                 values["report_version"],
             ),
         )
+
+    def claim_report_sync(
+        self,
+        issue_identifier: str,
+        *,
+        owner: str,
+        now: float,
+        lease_seconds: float,
+    ) -> dict | None:
+        if not isinstance(owner, str) or not owner:
+            raise ValueError("Report sync lease owner must be a non-empty string")
+        current = float(now)
+        duration = float(lease_seconds)
+        if duration <= 0:
+            raise ValueError("Report sync lease duration must be positive")
+
+        def write(connection: sqlite3.Connection) -> dict | None:
+            report = connection.execute(
+                """
+                SELECT * FROM reports
+                WHERE issue_identifier = ?
+                  AND linear_sync_status = 'pending'
+                  AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                ORDER BY report_version DESC
+                LIMIT 1
+                """,
+                (issue_identifier, current),
+            ).fetchone()
+            if report is None:
+                return None
+            lease = connection.execute(
+                "SELECT owner, expires_at FROM report_sync_leases WHERE issue_identifier = ?",
+                (issue_identifier,),
+            ).fetchone()
+            if lease is not None and float(lease["expires_at"]) > current and lease["owner"] != owner:
+                return None
+            expires_at = current + duration
+            connection.execute(
+                """
+                INSERT INTO report_sync_leases (issue_identifier, owner, expires_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(issue_identifier) DO UPDATE SET
+                    owner = excluded.owner,
+                    expires_at = excluded.expires_at
+                """,
+                (issue_identifier, owner, expires_at),
+            )
+            claimed = self._report_from_row(report)
+            claimed["sync_lease_owner"] = owner
+            claimed["sync_lease_expires_at"] = expires_at
+            return claimed
+
+        return self._write(write)
+
+    def release_report_sync(self, issue_identifier: str, *, owner: str) -> bool:
+        def write(connection: sqlite3.Connection) -> bool:
+            cursor = connection.execute(
+                "DELETE FROM report_sync_leases WHERE issue_identifier = ? AND owner = ?",
+                (issue_identifier, owner),
+            )
+            return cursor.rowcount == 1
+
+        return self._write(write)
+
+    def update_report_sync_state(
+        self,
+        issue_identifier: str,
+        *,
+        expected_json_path: str,
+        linear_sync_status: str,
+        linear_comment_id: str | None,
+        retry_count: int,
+        next_retry_at: float | None,
+        updated_at: float,
+    ) -> bool:
+        assignments = [
+            "linear_sync_status = ?",
+            "linear_comment_id = ?",
+            "retry_count = ?",
+            "next_retry_at = ?",
+            "updated_at = ?",
+        ]
+        parameters: list[object] = [
+            linear_sync_status,
+            linear_comment_id,
+            int(retry_count),
+            next_retry_at,
+            float(updated_at),
+        ]
+        if self._legacy_report_sync_status:
+            assignments.append("sync_status = ?")
+            parameters.append(linear_sync_status)
+        parameters.extend([issue_identifier, expected_json_path])
+
+        def write(connection: sqlite3.Connection) -> bool:
+            cursor = connection.execute(
+                f"""
+                UPDATE reports
+                SET {', '.join(assignments)}
+                WHERE issue_identifier = ? AND json_path = ?
+                """,
+                parameters,
+            )
+            return cursor.rowcount == 1
+
+        return self._write(write)
 
     def save_session(
         self, token_hash: str, *, expires_at: float, metadata: dict | None = None, created_at: float | None = None
@@ -655,6 +783,12 @@ class RuntimeStore:
                     details_json TEXT NOT NULL DEFAULT '{}',
                     PRIMARY KEY (issue_identifier, report_version)
                 );
+                CREATE TABLE IF NOT EXISTS report_sync_leases (
+                    issue_identifier TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    expires_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS report_sync_leases_expiry ON report_sync_leases(expires_at);
                 CREATE TABLE IF NOT EXISTS dashboard_sessions (
                     token_hash TEXT PRIMARY KEY,
                     expires_at REAL NOT NULL,
