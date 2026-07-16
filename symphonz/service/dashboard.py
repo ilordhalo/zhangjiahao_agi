@@ -120,15 +120,44 @@ class DashboardServer:
                 if path == "/login":
                     self._login()
                     return
+                if path == "/healthz":
+                    self._method_not_allowed(path, "GET")
+                    return
                 if not self._authenticated(path):
                     return
                 if path == "/logout":
                     self._logout()
                     return
-                if _is_known_get_route(path):
-                    self._method_not_allowed(path, "GET")
+                allow = _allowed_methods(path)
+                if allow is not None:
+                    self._method_not_allowed(path, allow)
                     return
                 self._not_found(path)
+
+            def do_HEAD(self) -> None:
+                self._unsupported_method()
+
+            def do_PUT(self) -> None:
+                self._unsupported_method()
+
+            def do_PATCH(self) -> None:
+                self._unsupported_method()
+
+            def do_DELETE(self) -> None:
+                self._unsupported_method()
+
+            def _unsupported_method(self) -> None:
+                target = self._parse_target()
+                if target is None:
+                    return
+                path, _query = target
+                if path not in {"/healthz", "/login"} and not self._authenticated(path):
+                    return
+                allow = _allowed_methods(path)
+                if allow is None:
+                    self._not_found(path)
+                    return
+                self._method_not_allowed(path, allow)
 
             def _dispatch_get(self, path: str, query: dict[str, list[str]]) -> None:
                 if path == "/logout":
@@ -226,23 +255,28 @@ class DashboardServer:
                     selected_tab = "overview"
                 event_filters = _event_filters(query)
                 error_filters = _error_filters(query, default_issue=identifier)
-                events = _significant_events_page(
-                    dashboard.store,
-                    issue_identifier=identifier,
-                    category=event_filters["category"],
-                    event_type=event_filters["event_type"],
-                    cursor=event_filters["cursor"],
-                    limit=event_filters["limit"],
-                )
-                errors = dashboard.store.list_errors(
-                    issue_identifier=identifier,
-                    stage=error_filters["stage"],
-                    error_type=error_filters["error_type"],
-                    resolved=error_filters["resolved"],
-                    cursor=error_filters["cursor"],
-                    limit=error_filters["limit"],
-                )
-                errors = _with_nearby_events(dashboard.store, errors)
+                events = {"items": [], "next_cursor": None}
+                errors = {"items": [], "next_cursor": None}
+                if selected_tab == "timeline":
+                    events = _significant_events_page(
+                        dashboard.store,
+                        issue_identifier=identifier,
+                        severity=event_filters["severity"],
+                        category=event_filters["category"],
+                        event_type=event_filters["event_type"],
+                        cursor=event_filters["cursor"],
+                        limit=event_filters["limit"],
+                    )
+                elif selected_tab == "errors":
+                    errors = dashboard.store.list_errors(
+                        issue_identifier=identifier,
+                        stage=error_filters["stage"],
+                        error_type=error_filters["error_type"],
+                        resolved=error_filters["resolved"],
+                        cursor=error_filters["cursor"],
+                        limit=error_filters["limit"],
+                    )
+                    errors = _with_nearby_events(dashboard.store, errors)
                 self._respond_html(
                     render_issue_page(
                         task,
@@ -251,6 +285,7 @@ class DashboardServer:
                         errors,
                         selected_tab=selected_tab,
                         filters=event_filters,
+                        error_filters=error_filters,
                         insecure_warning=dashboard.insecure_warning,
                     )
                 )
@@ -594,9 +629,19 @@ class DashboardServer:
             self.thread = Thread(target=self.httpd.serve_forever, daemon=True)
             self.thread.start()
         except Exception:
-            report_reader.close()
+            httpd = self.httpd
             self.httpd = None
+            self.thread = None
             self.report_reader = None
+            if httpd is not None:
+                try:
+                    httpd.server_close()
+                except Exception:
+                    pass
+            try:
+                report_reader.close()
+            except Exception:
+                pass
             raise
 
     def stop(self) -> None:
@@ -674,6 +719,7 @@ def _significant_events_page(
     store,
     *,
     issue_identifier: str | None = None,
+    severity: str | None = None,
     category: str | None = None,
     event_type: str | None = None,
     cursor: str | None = None,
@@ -685,6 +731,7 @@ def _significant_events_page(
     while len(items) < limit:
         page = store.list_events(
             issue_identifier=issue_identifier,
+            severity=severity,
             category=category,
             event_type=event_type,
             cursor=current_cursor,
@@ -832,13 +879,23 @@ def _is_api_path(path: str) -> bool:
     return path == "/api" or path.startswith("/api/")
 
 
-def _is_known_get_route(path: str) -> bool:
-    if path in {"/", "/tasks", "/errors", "/healthz", "/login", "/api/overview", "/api/tasks", "/api/errors"}:
-        return True
+def _allowed_methods(path: str) -> str | None:
+    if path == "/login":
+        return "GET, POST"
+    if path == "/logout":
+        return "POST"
+    if path in {"/", "/tasks", "/errors", "/healthz", "/api/overview", "/api/tasks", "/api/errors"}:
+        return "GET"
     try:
-        return _parse_issue_route(path) is not None or _parse_api_issue_route(path) is not None
+        issue_route = _parse_issue_route(path)
+        if issue_route is not None and issue_route[1] in {None, "report"}:
+            return "GET"
+        api_route = _parse_api_issue_route(path)
+        if api_route is not None and api_route[1] in {None, "events", "errors"}:
+            return "GET"
     except (_RequestInputError, UnicodeDecodeError):
-        return False
+        pass
+    return None
 
 
 def find_issue(snapshot: dict, issue_identifier: str) -> dict | None:

@@ -1,18 +1,283 @@
 from __future__ import annotations
 
 import base64
+from html.parser import HTMLParser
 from http.client import HTTPConnection
 import json
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
-from urllib.parse import urlencode
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from symphonz.service.auth import AuthService, hash_password
 from symphonz.service.dashboard import DashboardServer
 from symphonz.service.models import RuntimeErrorRecord, RuntimeEvent
 from symphonz.service.runtime_store import RuntimeStore
+from symphonz.service.web_templates import render_errors_page, render_issue_page
+
+
+class _CursorLinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.hrefs = []
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        href = attributes.get("href")
+        if tag == "a" and href and "cursor=" in href:
+            self.hrefs.append(href)
+
+
+def _cursor_link(page_html):
+    parser = _CursorLinkParser()
+    parser.feed(page_html)
+    if len(parser.hrefs) != 1:
+        raise AssertionError(f"expected one cursor link, found {parser.hrefs!r}")
+    return parser.hrefs[0]
+
+
+class _FakeHTTPServer:
+    def __init__(self, address, handler_class):
+        self.server_address = (address[0], 43210)
+        self.RequestHandlerClass = handler_class
+        self.closed = False
+        self.shutdown_called = False
+
+    def serve_forever(self):
+        pass
+
+    def shutdown(self):
+        self.shutdown_called = True
+
+    def server_close(self):
+        self.closed = True
+
+
+class _FakeThread:
+    def __init__(self, *, target, daemon):
+        self.target = target
+        self.daemon = daemon
+
+    def start(self):
+        pass
+
+    def join(self, timeout=None):
+        pass
+
+
+class DashboardHandlerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        artifacts = Path(self.tmp.name) / "artifacts"
+        artifacts.mkdir()
+        auth = SimpleNamespace(
+            authenticate_cookie=lambda cookie: object() if cookie == "session=valid" else None
+        )
+        self.server = DashboardServer("127.0.0.1", 0, object(), auth, artifacts, False)
+        with (
+            patch("symphonz.service.dashboard.ThreadingHTTPServer", _FakeHTTPServer),
+            patch("symphonz.service.dashboard.Thread", _FakeThread),
+        ):
+            self.server.start()
+        self.addCleanup(self.server.stop)
+
+    def _request(self, method, path, *, authenticated):
+        handler_class = self.server.httpd.RequestHandlerClass
+        handler = handler_class.__new__(handler_class)
+        handler.path = path
+        handler.command = method
+        handler.headers = {"Cookie": "session=valid"} if authenticated else {}
+        responses = []
+        handler._respond_json = lambda payload, *, status=200, headers=None: responses.append(
+            ("json", status, headers or {}, payload)
+        )
+        handler._respond_html = lambda page, *, status=200, headers=None: responses.append(
+            ("html", status, headers or {}, page)
+        )
+        handler._redirect = lambda location, *, set_cookie=None: responses.append(
+            ("redirect", 303, {"Location": location}, "")
+        )
+
+        getattr(handler, f"do_{method}")()
+
+        self.assertEqual(len(responses), 1)
+        return responses[0]
+
+    def test_unsupported_methods_on_known_routes_return_route_aware_405(self):
+        cases = (
+            ("HEAD", "/api/tasks", "json", "GET"),
+            ("PUT", "/tasks", "html", "GET"),
+            ("PATCH", "/login", "html", "GET, POST"),
+            ("DELETE", "/logout", "html", "POST"),
+        )
+
+        for method, path, response_type, allow in cases:
+            with self.subTest(method=method, path=path):
+                response = self._request(method, path, authenticated=True)
+                self.assertEqual(response[:3], (response_type, 405, {"Allow": allow}))
+                if response_type == "json":
+                    self.assertEqual(response[3]["error"]["code"], "method_not_allowed")
+
+    def test_unsupported_methods_authenticate_before_revealing_data_routes(self):
+        for method in ("HEAD", "PUT", "PATCH", "DELETE"):
+            with self.subTest(method=method, route="known"):
+                known = self._request(method, "/api/tasks", authenticated=False)
+                self.assertEqual(known[0:2], ("json", 401))
+                self.assertEqual(known[3]["error"]["code"], "authentication_required")
+            with self.subTest(method=method, route="unknown"):
+                unknown = self._request(method, "/api/not-a-route", authenticated=False)
+                self.assertEqual(unknown[0:2], ("json", 401))
+                self.assertEqual(unknown[3], known[3])
+
+
+class DashboardStartupTests(unittest.TestCase):
+    def test_thread_start_failure_closes_bound_server_and_report_reader(self):
+        class FakeReader:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class FailingThread(_FakeThread):
+            def start(self):
+                raise RuntimeError("thread start failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            artifacts = Path(tmp) / "artifacts"
+            artifacts.mkdir()
+            httpd = _FakeHTTPServer(("127.0.0.1", 0), object())
+            reader = FakeReader()
+            thread = FailingThread(target=httpd.serve_forever, daemon=True)
+            server = DashboardServer(
+                "127.0.0.1",
+                0,
+                object(),
+                object(),
+                artifacts,
+                False,
+            )
+
+            with (
+                patch("symphonz.service.dashboard.ThreadingHTTPServer", return_value=httpd),
+                patch("symphonz.service.dashboard.ReportArtifactReader", return_value=reader),
+                patch("symphonz.service.dashboard.Thread", return_value=thread),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "thread start failed"):
+                    server.start()
+
+            self.assertTrue(httpd.closed)
+            self.assertTrue(reader.closed)
+            self.assertIsNone(server.httpd)
+            self.assertIsNone(server.thread)
+            self.assertIsNone(server.report_reader)
+
+
+class DashboardTemplateTests(unittest.TestCase):
+    def test_issue_overview_renders_runtime_store_commit_hash(self):
+        rendered = render_issue_page(
+            {
+                "commit_hash": "abc1234",
+                "issue_identifier": "SYM-1",
+                "title": "Task",
+            },
+            {"available": False},
+            {"items": [], "next_cursor": None},
+            {"items": [], "next_cursor": None},
+        )
+
+        self.assertIn('<span class="mono">abc1234</span>', rendered)
+
+    def test_global_error_next_link_preserves_all_active_filters(self):
+        page = {"items": [], "next_cursor": "error-next"}
+        filters = {
+            "error_type": "TurnTimeout",
+            "issue": "SYM-1",
+            "limit": 1,
+            "resolved": False,
+            "stage": "codex",
+        }
+
+        link = urlsplit(_cursor_link(render_errors_page(page, filters)))
+
+        self.assertEqual(link.path, "/errors")
+        self.assertEqual(
+            parse_qs(link.query),
+            {
+                "cursor": ["error-next"],
+                "issue": ["SYM-1"],
+                "limit": ["1"],
+                "resolved": ["false"],
+                "stage": ["codex"],
+                "type": ["TurnTimeout"],
+            },
+        )
+
+    def test_issue_error_next_link_preserves_all_active_filters(self):
+        page = {"items": [], "next_cursor": "issue-error-next"}
+        filters = {
+            "error_type": "TurnTimeout",
+            "issue": "SYM-1",
+            "limit": 1,
+            "resolved": False,
+            "stage": "codex",
+        }
+
+        rendered = render_issue_page(
+            {"issue_identifier": "SYM-1", "title": "Task"},
+            {"available": False},
+            {"items": [], "next_cursor": None},
+            page,
+            selected_tab="errors",
+            filters={},
+            error_filters=filters,
+        )
+        link = urlsplit(_cursor_link(rendered))
+
+        self.assertEqual(link.path, "/issues/SYM-1")
+        self.assertEqual(
+            parse_qs(link.query),
+            {
+                "cursor": ["issue-error-next"],
+                "limit": ["1"],
+                "resolved": ["false"],
+                "stage": ["codex"],
+                "tab": ["errors"],
+                "type": ["TurnTimeout"],
+            },
+        )
+
+    def test_timeline_next_link_preserves_severity_with_other_active_filters(self):
+        rendered = render_issue_page(
+            {"issue_identifier": "SYM-1", "title": "Task"},
+            {"available": False},
+            {"items": [], "next_cursor": "event-next"},
+            {"items": [], "next_cursor": None},
+            selected_tab="timeline",
+            filters={
+                "category": "codex",
+                "event_type": "turn_completed",
+                "limit": 1,
+                "severity": "warning",
+            },
+        )
+        link = urlsplit(_cursor_link(rendered))
+
+        self.assertEqual(link.path, "/issues/SYM-1")
+        self.assertEqual(
+            parse_qs(link.query),
+            {
+                "category": ["codex"],
+                "cursor": ["event-next"],
+                "limit": ["1"],
+                "severity": ["warning"],
+                "tab": ["timeline"],
+                "type": ["turn_completed"],
+            },
+        )
 
 
 class DashboardTests(unittest.TestCase):
@@ -268,10 +533,11 @@ class DashboardTests(unittest.TestCase):
 
         overview = self.get("/", cookie=cookie)
         tasks = self.get("/tasks?status=running&q=SYM", cookie=cookie)
+        task_overview = self.get("/issues/SYM-1", cookie=cookie)
         detail = self.get("/issues/SYM-1?tab=timeline&category=codex", cookie=cookie)
         errors = self.get("/errors?resolved=false", cookie=cookie)
 
-        for response in (overview, tasks, detail, errors):
+        for response in (overview, tasks, task_overview, detail, errors):
             self.assertEqual(response.status, 200)
             self.assertIn("未加密连接", response.text)
             self.assertIn("@media (max-width: 760px)", response.text)
@@ -287,6 +553,7 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("时间线", detail.text)
         self.assertIn("报告", detail.text)
         self.assertIn("错误", detail.text)
+        self.assertIn('<span class="mono">abc1234</span>', task_overview.text)
         self.assertIn("Codex 会话已启动", detail.text)
         self.assertNotIn("private streaming delta", detail.text)
         self.assertIn("错误中心", errors.text)
@@ -325,6 +592,128 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("报告已发布", response.text)
         self.assertNotIn("分支已推送", response.text)
         self.assertIn("下一页", response.text)
+
+    def test_global_error_page_follows_cursor_without_losing_filters(self):
+        for timestamp, message in ((204.0, "第二个超时"), (205.0, "最新超时")):
+            self.store.record_error(
+                RuntimeErrorRecord(
+                    issue_identifier="SYM-1",
+                    session_id="session-1",
+                    stage="codex",
+                    error_type="TurnTimeout",
+                    message=message,
+                    retryable=True,
+                    attempt=2,
+                    timestamp=timestamp,
+                    context={},
+                )
+            )
+        first = self.get(
+            "/errors?issue=SYM-1&stage=codex&type=TurnTimeout&resolved=false&limit=1",
+            cookie=self.authenticated_cookie(),
+        )
+        next_link = _cursor_link(first.text)
+        second = self.get(next_link, cookie=self.authenticated_cookie())
+
+        self.assertEqual(first.status, 200)
+        self.assertIn("最新超时", first.text)
+        self.assertNotIn("第二个超时", first.text)
+        self.assertEqual(second.status, 200)
+        self.assertIn("第二个超时", second.text)
+        self.assertNotIn("最新超时", second.text)
+        self.assertEqual(
+            parse_qs(urlsplit(next_link).query) | {"cursor": ["present"]},
+            {
+                "cursor": ["present"],
+                "issue": ["SYM-1"],
+                "limit": ["1"],
+                "resolved": ["false"],
+                "stage": ["codex"],
+                "type": ["TurnTimeout"],
+            },
+        )
+
+    def test_issue_error_page_follows_cursor_without_losing_filters(self):
+        for timestamp, message in ((204.0, "任务第二个超时"), (205.0, "任务最新超时")):
+            self.store.record_error(
+                RuntimeErrorRecord(
+                    issue_identifier="SYM-1",
+                    session_id="session-1",
+                    stage="codex",
+                    error_type="TurnTimeout",
+                    message=message,
+                    retryable=True,
+                    attempt=2,
+                    timestamp=timestamp,
+                    context={},
+                )
+            )
+        first = self.get(
+            "/issues/SYM-1?tab=errors&stage=codex&type=TurnTimeout&resolved=false&limit=1",
+            cookie=self.authenticated_cookie(),
+        )
+        next_link = _cursor_link(first.text)
+        second = self.get(next_link, cookie=self.authenticated_cookie())
+
+        self.assertEqual(first.status, 200)
+        self.assertIn("任务最新超时", first.text)
+        self.assertNotIn("任务第二个超时", first.text)
+        self.assertEqual(second.status, 200)
+        self.assertIn("任务第二个超时", second.text)
+        self.assertNotIn("任务最新超时", second.text)
+        query = parse_qs(urlsplit(next_link).query)
+        self.assertTrue(query.pop("cursor")[0])
+        self.assertEqual(
+            query,
+            {
+                "limit": ["1"],
+                "resolved": ["false"],
+                "stage": ["codex"],
+                "tab": ["errors"],
+                "type": ["TurnTimeout"],
+            },
+        )
+
+    def test_timeline_page_follows_cursor_without_losing_severity(self):
+        for timestamp, severity, message in (
+            (204.0, "warning", "较早警告"),
+            (205.0, "warning", "最新警告"),
+            (206.0, "info", "不应出现的信息事件"),
+        ):
+            self.store.record_event(
+                RuntimeEvent(
+                    "turn_completed",
+                    message,
+                    "SYM-1",
+                    timestamp=timestamp,
+                    data={"category": "codex", "severity": severity},
+                )
+            )
+        first = self.get(
+            "/issues/SYM-1?tab=timeline&category=codex&type=turn_completed&severity=warning&limit=1",
+            cookie=self.authenticated_cookie(),
+        )
+        next_link = _cursor_link(first.text)
+        second = self.get(next_link, cookie=self.authenticated_cookie())
+
+        self.assertEqual(first.status, 200)
+        self.assertIn("最新警告", first.text)
+        self.assertNotIn("不应出现的信息事件", first.text)
+        self.assertEqual(second.status, 200)
+        self.assertIn("较早警告", second.text)
+        self.assertNotIn("不应出现的信息事件", second.text)
+        query = parse_qs(urlsplit(next_link).query)
+        self.assertTrue(query.pop("cursor")[0])
+        self.assertEqual(
+            query,
+            {
+                "category": ["codex"],
+                "limit": ["1"],
+                "severity": ["warning"],
+                "tab": ["timeline"],
+                "type": ["turn_completed"],
+            },
+        )
 
     def test_overview_api_returns_deterministic_operational_summary(self):
         response = self.get("/api/overview", cookie=self.authenticated_cookie())
@@ -424,6 +813,32 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(self.json_body(bad_limit)["error"]["code"], "invalid_request")
         self.assertEqual(wrong_method.status, 405)
         self.assertEqual(wrong_method.headers["Allow"], "GET")
+
+    def test_known_routes_reject_head_put_patch_and_delete_with_authenticated_405(self):
+        cookie = self.authenticated_cookie()
+        cases = (
+            ("HEAD", "/api/tasks", "GET"),
+            ("PUT", "/tasks", "GET"),
+            ("PATCH", "/login", "GET, POST"),
+            ("DELETE", "/logout", "POST"),
+        )
+
+        for method, path, allow in cases:
+            with self.subTest(method=method, path=path):
+                response = self.request(method, path, body=b"", headers={"Cookie": cookie})
+                self.assertEqual(response.status, 405)
+                self.assertEqual(response.headers["Allow"], allow)
+
+    def test_unsupported_methods_do_not_reveal_data_route_existence_before_authentication(self):
+        for method in ("HEAD", "PUT", "PATCH", "DELETE"):
+            with self.subTest(method=method):
+                known = self.request(method, "/api/tasks", body=b"")
+                unknown = self.request(method, "/api/not-a-route", body=b"")
+                self.assertEqual(known.status, 401)
+                self.assertEqual(unknown.status, 401)
+                if method != "HEAD":
+                    self.assertEqual(self.json_body(known), self.json_body(unknown))
+                    self.assertEqual(self.json_body(known)["error"]["code"], "authentication_required")
 
 
 if __name__ == "__main__":

@@ -275,9 +275,11 @@ def render_issue_page(
     *,
     selected_tab: str = "overview",
     filters: dict | None = None,
+    error_filters: dict | None = None,
     insecure_warning: bool = False,
 ) -> str:
     filters = filters or {}
+    error_filters = error_filters or {}
     identifier = str(task.get("issue_identifier") or "")
     encoded_identifier = quote(identifier, safe="")
     tabs = (("overview", "概览"), ("timeline", "时间线"), ("report", "报告"), ("errors", "错误"))
@@ -295,7 +297,7 @@ def render_issue_page(
     elif selected_tab == "report":
         content = _report_tab(identifier, report)
     elif selected_tab == "errors":
-        content = _errors_list(errors.get("items", ()))
+        content = _issue_errors_tab(identifier, errors, error_filters)
     else:
         content = _overview_tab(task, report)
     return _shell(f"{identifier} 任务详情", "tasks", header + content, insecure_warning)
@@ -308,6 +310,7 @@ def render_errors_page(page: dict, filters: dict, *, insecure_warning: bool = Fa
         f'<option value="{value}"{" selected" if value == resolved_value else ""}>{label}</option>'
         for value, label in (("false", "未解决"), ("true", "已解决"), ("all", "全部"))
     )
+    next_link = _error_next_link("/errors", page, filters, include_issue=True)
     body = f"""
 <header class="page-header"><div><p class="eyebrow">Errors</p><h1>错误中心</h1><p class="subtle">优先处理未解决错误并查看已脱敏上下文</p></div></header>
 <form class="filters" method="get" action="/errors">
@@ -317,7 +320,7 @@ def render_errors_page(page: dict, filters: dict, *, insecure_warning: bool = Fa
   <div class="field"><label for="error-resolved">处理状态</label><select id="error-resolved" name="resolved">{options}</select></div>
   <button type="submit">筛选</button>
 </form>
-<section class="panel list">{_errors_list(page.get('items', ()))}</section>"""
+<section class="panel list">{_errors_list(page.get('items', ()))}</section>{next_link}"""
     return _shell("错误中心", "errors", body, insecure_warning)
 
 
@@ -388,7 +391,7 @@ def _overview_tab(task: dict, report: dict) -> str:
         ("Linear 状态", _escape(task.get("linear_state") or "—")),
         ("尝试次数", _escape(task.get("attempt") if task.get("attempt") is not None else "—")),
         ("分支", f'<span class="mono">{_escape(task.get("branch") or "—")}</span>'),
-        ("提交", f'<span class="mono">{_escape(task.get("commit") or "—")}</span>'),
+        ("提交", f'<span class="mono">{_escape(task.get("commit_hash") or task.get("commit") or "—")}</span>'),
         ("Codex 会话", f'<span class="mono">{_escape(task.get("codex_session_id") or "—")}</span>'),
         ("工作区", f'<span class="mono">{_escape(task.get("workspace") or "—")}</span>'),
         ("评审请求", _external_link(task.get("review_url"), "打开评审")),
@@ -414,6 +417,8 @@ def _timeline_tab(identifier: str, events: dict, filters: dict) -> str:
             values["category"] = category
         if filters.get("event_type"):
             values["type"] = filters["event_type"]
+        if filters.get("severity"):
+            values["severity"] = filters["severity"]
         next_link = f'<div class="pagination"><a class="button" href="/issues/{quote(identifier, safe="")}?{html.escape(urlencode(values), quote=True)}">下一页</a></div>'
     return f"""<form class="filters" method="get" action="/issues/{quote(identifier, safe='')}"><input type="hidden" name="tab" value="timeline"><div class="field"><label for="timeline-category">事件类别</label><select id="timeline-category" name="category">{choices}</select></div><div class="field field-grow"><label for="timeline-type">事件类型</label><input id="timeline-type" name="type" value="{_escape(filters.get('event_type') or '')}" placeholder="例如 report_published"></div><button type="submit">筛选</button></form><section class="panel list">{rows or _empty('暂无匹配事件')}</section>{next_link}"""
 
@@ -429,6 +434,38 @@ def _errors_list(errors) -> str:
     if not errors:
         return _empty("暂无匹配错误")
     return "".join(_error_row(error) for error in errors)
+
+
+def _issue_errors_tab(identifier: str, errors: dict, filters: dict) -> str:
+    path = f'/issues/{quote(identifier, safe="")}'
+    next_link = _error_next_link(path, errors, filters, tab="errors")
+    return f'<section class="panel list">{_errors_list(errors.get("items", ()))}</section>{next_link}'
+
+
+def _error_next_link(
+    path: str,
+    page: dict,
+    filters: dict,
+    *,
+    include_issue: bool = False,
+    tab: str | None = None,
+) -> str:
+    cursor = page.get("next_cursor")
+    if not cursor:
+        return ""
+    values = {"cursor": cursor, "limit": filters.get("limit", 50)}
+    if tab:
+        values["tab"] = tab
+    if include_issue and filters.get("issue"):
+        values["issue"] = filters["issue"]
+    if filters.get("stage"):
+        values["stage"] = filters["stage"]
+    if filters.get("error_type"):
+        values["type"] = filters["error_type"]
+    if filters.get("resolved") is not None:
+        values["resolved"] = str(filters["resolved"]).lower()
+    query = html.escape(urlencode(values), quote=True)
+    return f'<div class="pagination"><a class="button" href="{path}?{query}">下一页</a></div>'
 
 
 def _error_row(error: dict) -> str:
