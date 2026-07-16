@@ -188,6 +188,42 @@ class ReportingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "active issue"):
             publisher.publish(valid_report(issue_identifier="SYM-999"))
 
+    def test_artifact_reader_serves_authoritative_reports_for_multiple_issues(self):
+        from symphonz.service.reporting import ReportArtifactReader
+
+        first = self.publisher()
+        first.publish(valid_report(summary="First issue report."))
+        second = self.publisher(
+            active_issue_id="issue-456",
+            active_issue_identifier="SYM-456",
+        )
+        second.publish(
+            valid_report(
+                issue_id="issue-456",
+                issue_identifier="SYM-456",
+                summary="Historical issue report.",
+            )
+        )
+
+        reader = ReportArtifactReader(self.store, self.root / "artifacts")
+        self.addCleanup(reader.close)
+
+        self.assertIn("First issue report.", reader.read_current_html("SYM-123"))
+        self.assertIn("Historical issue report.", reader.read_current_html("SYM-456"))
+        self.assertEqual(
+            json.loads(reader.read_current_json("SYM-456"))["summary"],
+            "Historical issue report.",
+        )
+
+        current = self.store.get_report("SYM-456")
+        self.store.save_report({**current, "html_path": "../report-escape.html"})
+        with self.assertRaisesRegex(RuntimeError, "relative"):
+            reader.read_current_html("SYM-456")
+
+        reader.close()
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            reader.read_current_html("SYM-123")
+
     def test_second_bundle_write_failure_keeps_previous_database_paths_authoritative(self):
         publisher = self.publisher()
         publisher.publish(valid_report(summary="Authoritative report."))

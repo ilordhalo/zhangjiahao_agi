@@ -376,7 +376,135 @@ nav a {{ color: #1c5a99; white-space: nowrap; }} section {{ border-top: 1px soli
     )
 
 
-class ReportPublisher:
+class ReportArtifactReader:
+    """Read RuntimeStore-authoritative report bundles through a pinned root."""
+
+    def __init__(self, store, artifact_root: Path):
+        self.store = store
+        self.artifact_root = Path(os.path.abspath(os.fspath(artifact_root)))
+        self._artifact_root_fd = _open_pinned_directory(self.artifact_root)
+        root_metadata = os.fstat(self._artifact_root_fd)
+        self._artifact_root_identity = (root_metadata.st_dev, root_metadata.st_ino)
+
+    def close(self) -> None:
+        descriptor = getattr(self, "_artifact_root_fd", -1)
+        if descriptor >= 0:
+            self._artifact_root_fd = -1
+            os.close(descriptor)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def read_current_json(self, issue_identifier: str) -> str:
+        entry = self._current_report_entry(issue_identifier)
+        return self._read_artifact(entry, "json_path", ".json")
+
+    def read_current_html(self, issue_identifier: str) -> str:
+        entry = self._current_report_entry(issue_identifier)
+        return self._read_artifact(entry, "html_path", ".html")
+
+    def _current_report_entry(self, issue_identifier: str) -> dict:
+        if _ISSUE_IDENTIFIER.fullmatch(issue_identifier) is None:
+            raise RuntimeError("Report issue identifier is invalid.")
+        entry = self.store.get_report(issue_identifier)
+        if entry is None:
+            raise RuntimeError("Report artifact is missing from RuntimeStore.")
+        return entry
+
+    def _load_report_document(self, entry: dict) -> ReportDocument:
+        content = self._read_artifact(entry, "json_path", ".json")
+        try:
+            payload = json.loads(content)
+        except (json.JSONDecodeError, UnicodeError) as error:
+            raise RuntimeError("Report JSON artifact is corrupt.") from error
+        return validate_report(payload)
+
+    def _assert_root_unchanged(self) -> None:
+        descriptor = _open_existing_directory(self.artifact_root, self._artifact_root_identity)
+        os.close(descriptor)
+
+    def _borrow_root_fd(self) -> int:
+        self._assert_root_unchanged()
+        if self._artifact_root_fd < 0:
+            raise RuntimeError("Report artifact reader has been closed.")
+        return os.dup(self._artifact_root_fd)
+
+    def _open_issue_directory(self, issue_identifier: str, *, create: bool) -> int:
+        if _ISSUE_IDENTIFIER.fullmatch(issue_identifier) is None:
+            raise RuntimeError("Report issue directory is outside the artifact root.")
+        root_fd = self._borrow_root_fd()
+        try:
+            if create:
+                try:
+                    os.mkdir(issue_identifier, 0o700, dir_fd=root_fd)
+                except FileExistsError:
+                    pass
+            try:
+                metadata = os.stat(issue_identifier, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError as error:
+                raise RuntimeError("Report artifact issue directory is missing.") from error
+            if stat.S_ISLNK(metadata.st_mode):
+                raise RuntimeError("Report artifact issue directory must not be a symbolic link.")
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise RuntimeError("Report artifact issue path must be a directory.")
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(issue_identifier, flags, dir_fd=root_fd)
+            except OSError as error:
+                raise RuntimeError("Report artifact issue directory must not be a symbolic link.") from error
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                os.close(descriptor)
+                raise RuntimeError("Report artifact issue directory changed while opening.")
+            return descriptor
+        finally:
+            os.close(root_fd)
+
+    def _read_artifact(self, entry: dict, key: str, suffix: str) -> str:
+        issue_identifier = str(entry.get("issue_identifier") or "")
+        filename = self._artifact_filename(entry.get(key), issue_identifier, suffix)
+        directory_fd = self._open_issue_directory(issue_identifier, create=False)
+        descriptor = -1
+        try:
+            try:
+                descriptor = os.open(
+                    filename,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError as error:
+                raise RuntimeError("Report artifact is missing.") from error
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError("Report artifact must be a regular file.")
+            source = os.fdopen(descriptor, "r", encoding="utf-8")
+            descriptor = -1
+            with source:
+                content = source.read(_MAX_ARTIFACT_BYTES + 1)
+            if len(content.encode("utf-8")) > _MAX_ARTIFACT_BYTES:
+                raise RuntimeError("Report artifact exceeds the safe size limit.")
+            return content
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(directory_fd)
+
+    @staticmethod
+    def _artifact_filename(value: object, issue_identifier: str, suffix: str) -> str:
+        if not isinstance(value, str):
+            raise RuntimeError("Report artifact path is missing from RuntimeStore.")
+        candidate = Path(value)
+        if candidate.is_absolute() or candidate.name != value:
+            raise RuntimeError("Report artifact name must be relative to the pinned artifact root.")
+        if candidate.suffix != suffix or _BUNDLE_NAME.fullmatch(candidate.name) is None:
+            raise RuntimeError("Report artifact path is not a versioned report bundle.")
+        return candidate.name
+
+
+class ReportPublisher(ReportArtifactReader):
     """Persist an issue report and maintain one runtime-owned Linear comment."""
 
     def __init__(
@@ -390,8 +518,7 @@ class ReportPublisher:
         error_sink=None,
         sync_lease_seconds: float = _SYNC_LEASE_SECONDS,
     ):
-        self.store = store
-        self.artifact_root = Path(os.path.abspath(os.fspath(artifact_root)))
+        super().__init__(store, artifact_root)
         self.public_base_url = _public_base_url(public_base_url)
         self.linear_client = linear_client
         self.error_sink = error_sink
@@ -402,23 +529,7 @@ class ReportPublisher:
         self.active_issue_identifier = _text(active_issue_identifier, "active_issue_identifier", 64)
         if _ISSUE_IDENTIFIER.fullmatch(self.active_issue_identifier) is None:
             raise ValueError("active_issue_identifier must be a safe Linear-style identifier.")
-        self._artifact_root_fd = _open_pinned_directory(self.artifact_root)
-        root_metadata = os.fstat(self._artifact_root_fd)
-        self._artifact_root_identity = (root_metadata.st_dev, root_metadata.st_ino)
         _register_publisher(linear_client, self)
-
-    def close(self) -> None:
-        """Release the pinned artifact-root descriptor when the publisher is retired."""
-        descriptor = getattr(self, "_artifact_root_fd", -1)
-        if descriptor >= 0:
-            self._artifact_root_fd = -1
-            os.close(descriptor)
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
 
     def report_url(self, issue_identifier: str) -> str:
         if issue_identifier != self.active_issue_identifier:
@@ -510,10 +621,6 @@ class ReportPublisher:
         if document.issue_id != self.active_issue_id or document.issue_identifier != self.active_issue_identifier:
             raise ValueError("Report issue identity does not match the active issue.")
 
-    def _assert_root_unchanged(self) -> None:
-        descriptor = _open_existing_directory(self.artifact_root, self._artifact_root_identity)
-        os.close(descriptor)
-
     @contextmanager
     def _issue_publish_lock(self, issue_identifier: str):
         if _ISSUE_IDENTIFIER.fullmatch(issue_identifier) is None:
@@ -533,43 +640,6 @@ class ReportPublisher:
                 if locked:
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 os.close(lock_fd)
-            os.close(root_fd)
-
-    def _borrow_root_fd(self) -> int:
-        self._assert_root_unchanged()
-        if self._artifact_root_fd < 0:
-            raise RuntimeError("Report publisher has been closed.")
-        return os.dup(self._artifact_root_fd)
-
-    def _open_issue_directory(self, issue_identifier: str, *, create: bool) -> int:
-        if _ISSUE_IDENTIFIER.fullmatch(issue_identifier) is None:
-            raise RuntimeError("Report issue directory is outside the artifact root.")
-        root_fd = self._borrow_root_fd()
-        try:
-            if create:
-                try:
-                    os.mkdir(issue_identifier, 0o700, dir_fd=root_fd)
-                except FileExistsError:
-                    pass
-            try:
-                metadata = os.stat(issue_identifier, dir_fd=root_fd, follow_symlinks=False)
-            except FileNotFoundError as error:
-                raise RuntimeError("Report artifact issue directory is missing.") from error
-            if stat.S_ISLNK(metadata.st_mode):
-                raise RuntimeError("Report artifact issue directory must not be a symbolic link.")
-            if not stat.S_ISDIR(metadata.st_mode):
-                raise RuntimeError("Report artifact issue path must be a directory.")
-            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-            try:
-                descriptor = os.open(issue_identifier, flags, dir_fd=root_fd)
-            except OSError as error:
-                raise RuntimeError("Report artifact issue directory must not be a symbolic link.") from error
-            opened = os.fstat(descriptor)
-            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
-                os.close(descriptor)
-                raise RuntimeError("Report artifact issue directory changed while opening.")
-            return descriptor
-        finally:
             os.close(root_fd)
 
     @staticmethod
@@ -662,72 +732,10 @@ class ReportPublisher:
             heartbeat.stop()
             self.store.release_report_sync(entry["issue_identifier"], owner=owner)
 
-    def read_current_json(self, issue_identifier: str) -> str:
-        """Safely read the RuntimeStore-authoritative JSON generation for Task 4."""
-        entry = self._current_report_entry(issue_identifier)
-        return self._read_artifact(entry, "json_path", ".json")
-
-    def read_current_html(self, issue_identifier: str) -> str:
-        """Safely read the RuntimeStore-authoritative HTML generation for Task 4."""
-        entry = self._current_report_entry(issue_identifier)
-        return self._read_artifact(entry, "html_path", ".html")
-
     def _current_report_entry(self, issue_identifier: str) -> dict:
         if issue_identifier != self.active_issue_identifier:
             raise ValueError("Report issue identifier does not match the active issue.")
-        entry = self.store.get_report(issue_identifier)
-        if entry is None:
-            raise RuntimeError("Report artifact is missing from RuntimeStore.")
-        return entry
-
-    def _load_report_document(self, entry: dict) -> ReportDocument:
-        content = self._read_artifact(entry, "json_path", ".json")
-        if len(content.encode("utf-8")) > _MAX_ARTIFACT_BYTES:
-            raise RuntimeError("Report JSON artifact exceeds the safe size limit.")
-        try:
-            payload = json.loads(content)
-        except (json.JSONDecodeError, UnicodeError) as error:
-            raise RuntimeError("Report JSON artifact is corrupt.") from error
-        return validate_report(payload)
-
-    def _read_artifact(self, entry: dict, key: str, suffix: str) -> str:
-        issue_identifier = str(entry.get("issue_identifier") or "")
-        filename = self._artifact_filename(entry.get(key), issue_identifier, suffix)
-        directory_fd = self._open_issue_directory(issue_identifier, create=False)
-        descriptor = -1
-        try:
-            try:
-                descriptor = os.open(
-                    filename,
-                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                    dir_fd=directory_fd,
-                )
-            except FileNotFoundError as error:
-                raise RuntimeError("Report artifact is missing.") from error
-            metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise RuntimeError("Report artifact must be a regular file.")
-            source = os.fdopen(descriptor, "r", encoding="utf-8")
-            descriptor = -1
-            with source:
-                content = source.read(_MAX_ARTIFACT_BYTES + 1)
-            if len(content.encode("utf-8")) > _MAX_ARTIFACT_BYTES:
-                raise RuntimeError("Report artifact exceeds the safe size limit.")
-            return content
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            os.close(directory_fd)
-
-    def _artifact_filename(self, value: object, issue_identifier: str, suffix: str) -> str:
-        if not isinstance(value, str):
-            raise RuntimeError("Report artifact path is missing from RuntimeStore.")
-        candidate = Path(value)
-        if candidate.is_absolute() or candidate.name != value:
-            raise RuntimeError("Report artifact name must be relative to the pinned artifact root.")
-        if candidate.suffix != suffix or _BUNDLE_NAME.fullmatch(candidate.name) is None:
-            raise RuntimeError("Report artifact path is not a versioned report bundle.")
-        return candidate.name
+        return super()._current_report_entry(issue_identifier)
 
     def _sync(self, document: ReportDocument, entry: dict, now: float, heartbeat) -> None:
         heartbeat.require_owned(now)
