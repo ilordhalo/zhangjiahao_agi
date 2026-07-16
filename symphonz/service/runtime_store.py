@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 from pathlib import Path
 import sqlite3
@@ -20,6 +21,7 @@ class RuntimeStore:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._legacy_report_sync_status = False
         self._initialize()
 
     def upsert_issue(self, entry: dict) -> None:
@@ -123,18 +125,7 @@ class RuntimeStore:
             conditions.append("(issue_identifier LIKE ? OR title LIKE ?)")
             needle = f"%{query}%"
             parameters.extend([needle, needle])
-        return self._list_keyset_rows(
-            "issue_runs",
-            conditions,
-            parameters,
-            cursor,
-            limit,
-            self._task_from_row,
-            order_by="updated_at DESC, issue_identifier ASC",
-            cursor_fields=("updated_at", "issue_identifier"),
-            after_clause="updated_at < ? OR (updated_at = ? AND issue_identifier > ?)",
-            after_parameters=lambda values: (values["updated_at"], values["updated_at"], values["issue_identifier"]),
-        )
+        return self._list_task_snapshot(conditions, parameters, cursor, limit)
 
     def get_task(self, issue_identifier: str) -> dict | None:
         with self._connect() as connection:
@@ -236,9 +227,33 @@ class RuntimeStore:
             "updated_at": float(entry.get("updated_at") or time.time()),
             "details_json": self._dump(safe_entry),
         }
-        self._write(
-            lambda connection: connection.execute(
-                """
+        if self._legacy_report_sync_status:
+            values["sync_status"] = values["linear_sync_status"]
+            statement = """
+                INSERT INTO reports (
+                    issue_identifier, report_version, json_path, html_path, url, review_metadata_json,
+                    linear_comment_id, sync_status, linear_sync_status, retry_count, next_retry_at, created_at, updated_at,
+                    details_json
+                ) VALUES (
+                    :issue_identifier, :report_version, :json_path, :html_path, :url, :review_metadata_json,
+                    :linear_comment_id, :sync_status, :linear_sync_status, :retry_count, :next_retry_at, :created_at,
+                    :updated_at, :details_json
+                )
+                ON CONFLICT(issue_identifier, report_version) DO UPDATE SET
+                    json_path = excluded.json_path,
+                    html_path = excluded.html_path,
+                    url = excluded.url,
+                    review_metadata_json = excluded.review_metadata_json,
+                    linear_comment_id = excluded.linear_comment_id,
+                    sync_status = excluded.sync_status,
+                    linear_sync_status = excluded.linear_sync_status,
+                    retry_count = excluded.retry_count,
+                    next_retry_at = excluded.next_retry_at,
+                    updated_at = excluded.updated_at,
+                    details_json = excluded.details_json
+            """
+        else:
+            statement = """
                 INSERT INTO reports (
                     issue_identifier, report_version, json_path, html_path, url, review_metadata_json,
                     linear_comment_id, linear_sync_status, retry_count, next_retry_at, created_at, updated_at, details_json
@@ -257,10 +272,8 @@ class RuntimeStore:
                     next_retry_at = excluded.next_retry_at,
                     updated_at = excluded.updated_at,
                     details_json = excluded.details_json
-                """,
-                values,
-            )
-        )
+            """
+        self._write(lambda connection: connection.execute(statement, values))
 
     def get_report(self, issue_identifier: str, report_version: int | None = None) -> dict | None:
         query = "SELECT * FROM reports WHERE issue_identifier = ?"
@@ -524,6 +537,17 @@ class RuntimeStore:
                     locked_until REAL,
                     updated_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS task_page_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS task_page_snapshot_entries (
+                    snapshot_id INTEGER NOT NULL,
+                    position INTEGER NOT NULL,
+                    issue_identifier TEXT NOT NULL,
+                    PRIMARY KEY (snapshot_id, position),
+                    FOREIGN KEY (snapshot_id) REFERENCES task_page_snapshots(id) ON DELETE CASCADE
+                );
                 """
             )
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(reports)")}
@@ -533,6 +557,7 @@ class RuntimeStore:
                     connection.execute(
                         "UPDATE reports SET linear_sync_status = sync_status WHERE sync_status IS NOT NULL"
                     )
+            self._legacy_report_sync_status = "sync_status" in columns
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
@@ -666,6 +691,63 @@ class RuntimeStore:
             next_cursor = self._encode_cursor({field: page_rows[-1][field] for field in cursor_fields})
         return {"items": [converter(row) for row in page_rows], "next_cursor": next_cursor}
 
+    def _list_task_snapshot(
+        self,
+        conditions: list[str],
+        parameters: list[object],
+        cursor: str | None,
+        limit: int,
+    ) -> dict:
+        page_limit = self._limit(limit)
+        if cursor is None:
+            where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+            def write(connection: sqlite3.Connection) -> dict:
+                rows = connection.execute(
+                    f"SELECT * FROM issue_runs {where} ORDER BY updated_at DESC, issue_identifier ASC",
+                    parameters,
+                ).fetchall()
+                page_rows = rows[:page_limit]
+                if len(rows) <= page_limit:
+                    return {"items": [self._task_from_row(row) for row in page_rows], "next_cursor": None}
+                snapshot_id = connection.execute(
+                    "INSERT INTO task_page_snapshots (created_at) VALUES (?)", (time.time(),)
+                ).lastrowid
+                connection.executemany(
+                    """
+                    INSERT INTO task_page_snapshot_entries (snapshot_id, position, issue_identifier)
+                    VALUES (?, ?, ?)
+                    """,
+                    ((snapshot_id, position, row["issue_identifier"]) for position, row in enumerate(rows)),
+                )
+                return {
+                    "items": [self._task_from_row(row) for row in page_rows],
+                    "next_cursor": self._encode_cursor({"snapshot_id": snapshot_id, "position": page_limit - 1}),
+                }
+
+            return self._write(write)
+
+        values = self._decode_cursor(cursor, ("snapshot_id", "position"))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT task_page_snapshot_entries.position AS snapshot_position, issue_runs.*
+                FROM task_page_snapshot_entries
+                JOIN issue_runs ON issue_runs.issue_identifier = task_page_snapshot_entries.issue_identifier
+                WHERE task_page_snapshot_entries.snapshot_id = ? AND task_page_snapshot_entries.position > ?
+                ORDER BY task_page_snapshot_entries.position ASC
+                LIMIT ?
+                """,
+                (values["snapshot_id"], values["position"], page_limit + 1),
+            ).fetchall()
+        page_rows = rows[:page_limit]
+        next_cursor = None
+        if len(rows) > page_limit and page_rows:
+            next_cursor = self._encode_cursor(
+                {"snapshot_id": values["snapshot_id"], "position": page_rows[-1]["snapshot_position"]}
+            )
+        return {"items": [self._task_from_row(row) for row in page_rows], "next_cursor": next_cursor}
+
     @staticmethod
     def _decode_cursor(cursor: str | None, fields: tuple[str, ...]) -> dict | None:
         if cursor is None:
@@ -684,7 +766,7 @@ class RuntimeStore:
                 elif isinstance(value, bool) or not isinstance(value, (int, float)):
                     raise ValueError("invalid ordering value")
             return payload
-        except (UnicodeDecodeError, ValueError, TypeError) as error:
+        except (binascii.Error, UnicodeDecodeError, ValueError, TypeError) as error:
             raise RuntimeStoreInputError("Invalid pagination cursor") from error
 
     @staticmethod
@@ -700,7 +782,7 @@ class RuntimeStore:
 
     def _task_from_row(self, row: sqlite3.Row) -> dict:
         result = self._load(row["details_json"])
-        result.update({key: row[key] for key in row.keys() if key != "details_json"})
+        result.update({key: row[key] for key in row.keys() if key not in {"details_json", "snapshot_position"}})
         result["commit"] = result.get("commit_hash")
         return result
 

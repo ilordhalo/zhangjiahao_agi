@@ -5,6 +5,7 @@ import io
 import json
 import os
 import shlex
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -1620,6 +1621,66 @@ class RuntimeStoreTests(unittest.TestCase):
             store.list_events(cursor="not-a-cursor")
         with self.assertRaisesRegex(ValueError, "Invalid pagination limit"):
             store.list_errors(limit=0)
+
+    def test_legacy_not_null_sync_status_reports_table_accepts_new_writes(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        self.path.parent.mkdir(parents=True)
+        with sqlite3.connect(self.path) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE reports (
+                    issue_identifier TEXT NOT NULL,
+                    report_version INTEGER NOT NULL,
+                    json_path TEXT,
+                    html_path TEXT,
+                    url TEXT,
+                    review_metadata_json TEXT NOT NULL DEFAULT '{}',
+                    linear_comment_id TEXT,
+                    sync_status TEXT NOT NULL,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at REAL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (issue_identifier, report_version)
+                );
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO reports (issue_identifier, report_version, sync_status, created_at, updated_at)
+                VALUES ('SYM-OLD', 1, 'failed', 1, 1)
+                """
+            )
+
+        store = RuntimeStore(self.path)
+        store.save_report({"issue_identifier": "SYM-NEW", "linear_sync_status": "synced"})
+
+        self.assertEqual(store.get_report("SYM-OLD")["linear_sync_status"], "failed")
+        self.assertEqual(store.get_report("SYM-NEW")["linear_sync_status"], "synced")
+
+    def test_task_cursor_keeps_an_unread_task_after_its_activity_changes(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        for identifier, updated_at in (("SYM-1", 30.0), ("SYM-2", 20.0), ("SYM-3", 10.0)):
+            store.upsert_issue({"issue_identifier": identifier, "status": "running", "updated_at": updated_at})
+
+        first_page = store.list_tasks(limit=1)
+        store.upsert_issue({"issue_identifier": "SYM-2", "status": "running", "updated_at": 40.0})
+        second_page = store.list_tasks(cursor=first_page["next_cursor"], limit=1)
+        third_page = store.list_tasks(cursor=second_page["next_cursor"], limit=1)
+
+        self.assertEqual(first_page["items"][0]["issue_identifier"], "SYM-1")
+        self.assertEqual(second_page["items"][0]["issue_identifier"], "SYM-2")
+        self.assertEqual(third_page["items"][0]["issue_identifier"], "SYM-3")
+
+    def test_malformed_base64_cursor_raises_runtime_store_input_error(self):
+        from symphonz.service.runtime_store import RuntimeStore, RuntimeStoreInputError
+
+        with self.assertRaisesRegex(RuntimeStoreInputError, "Invalid pagination cursor"):
+            RuntimeStore(self.path).list_tasks(cursor="a")
 
 
 class OrchestratorAndDashboardTests(unittest.TestCase):
