@@ -1503,6 +1503,120 @@ class RuntimeStoreTests(unittest.TestCase):
         self.assertEqual(error["message"], "permission denied")
         self.assertEqual(payload["error_type"], "tool_call_failed")
 
+    def test_runtime_event_router_keeps_jsonl_complete_and_filters_quiet_codex_events(self):
+        from symphonz.service.event_log import ErrorJsonlLog, JsonlEventLog, RuntimeEventRouter
+        from symphonz.service.models import RuntimeEvent
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        runtime_path = self.path.parent / "runtime.jsonl"
+        errors_path = self.path.parent / "errors.jsonl"
+        router = RuntimeEventRouter(
+            JsonlEventLog(runtime_path),
+            store,
+            ErrorJsonlLog(errors_path),
+        )
+        events = [
+            RuntimeEvent("service_started", "started", "SYM-1"),
+            RuntimeEvent(
+                "codex_event",
+                "text delta",
+                "SYM-1",
+                data={"event": {"type": "item_agent_message_delta", "text": "hello"}},
+            ),
+            RuntimeEvent(
+                "codex_event",
+                "token usage",
+                "SYM-1",
+                data={"event": {"type": "turn_token_usage", "usage": {"total": 1}}},
+            ),
+            RuntimeEvent(
+                "codex_event",
+                "session started",
+                "SYM-1",
+                data={"event": {"type": "session_started", "session_id": "session-1"}},
+            ),
+            RuntimeEvent("report_published", "published", "SYM-1"),
+            RuntimeEvent("issue_retrying", "retrying", "SYM-1"),
+            RuntimeEvent("workspace_cleanup_failed", "cleanup failed", "SYM-1"),
+        ]
+
+        for event in events:
+            router(event)
+
+        runtime_lines = runtime_path.read_text().splitlines()
+        stored_types = [item["type"] for item in store.list_events(issue_identifier="SYM-1")["items"]]
+        self.assertEqual(len(runtime_lines), len(events))
+        self.assertEqual(stored_types, [
+            "workspace_cleanup_failed",
+            "issue_retrying",
+            "report_published",
+            "codex_event",
+            "service_started",
+        ])
+
+    def test_runtime_event_router_records_nested_codex_failure_once_and_mirrors_redacted_error(self):
+        from symphonz.service.event_log import ErrorJsonlLog, JsonlEventLog, RuntimeEventRouter
+        from symphonz.service.models import RuntimeEvent
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        errors_path = self.path.parent / "errors.jsonl"
+        router = RuntimeEventRouter(
+            JsonlEventLog(self.path.parent / "runtime.jsonl"),
+            store,
+            ErrorJsonlLog(errors_path),
+        )
+        event = RuntimeEvent(
+            "codex_event",
+            "tool_call_failed",
+            "SYM-1",
+            data={
+                "event": {
+                    "type": "tool_call_failed",
+                    "tool": "linear_graphql",
+                    "result": {"success": False, "output": "permission denied"},
+                    "session_id": "session-1",
+                },
+                "api_key": "top-secret",
+            },
+        )
+
+        router.write(event)
+
+        errors = store.list_errors(issue_identifier="SYM-1")["items"]
+        error_lines = errors_path.read_text().splitlines()
+        payload = json.loads(error_lines[0])
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(len(error_lines), 1)
+        self.assertEqual(errors[0]["message"], "permission denied")
+        self.assertEqual(payload["context"]["api_key"], "[REDACTED]")
+
+    def test_runtime_event_router_isolates_sink_failures(self):
+        from symphonz.service.event_log import RuntimeEventRouter
+        from symphonz.service.models import RuntimeEvent
+
+        calls = []
+
+        def failing_runtime_log(event):
+            calls.append("runtime")
+            raise OSError("runtime log unavailable")
+
+        class Store:
+            def record_event(self, event):
+                calls.append("store")
+                raise RuntimeError("sqlite unavailable")
+
+        class ErrorLog:
+            def write(self, record):
+                calls.append("error")
+
+        RuntimeEventRouter(failing_runtime_log, Store(), ErrorLog()).write(
+            RuntimeEvent("tool_failed", "failed", "SYM-1")
+        )
+
+        self.assertEqual(calls, ["runtime", "store", "error"])
+
     def test_keyset_pagination_has_no_duplicates_when_rows_change_between_pages(self):
         from symphonz.service.models import RuntimeErrorRecord, RuntimeEvent
         from symphonz.service.runtime_store import RuntimeStore

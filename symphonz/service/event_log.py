@@ -26,6 +26,7 @@ _EXACT_SECRET_KEYS = {
     "session_token",
     "set_cookie",
 }
+_QUIET_CODEX_EVENT_MARKERS = ("text", "token", "delta", "usage")
 
 
 def redact_sensitive_data(value: object) -> object:
@@ -122,3 +123,51 @@ class CompositeEventSink:
                 writer(event)
             except Exception as error:
                 print(f"Symphonz event sink failed: {error}", file=sys.stderr)
+
+
+class RuntimeEventRouter:
+    """Route complete diagnostics and significant milestones to their sinks."""
+
+    def __init__(self, event_log, runtime_store, error_log):
+        self._event_log = _sink_writer(event_log, "write")
+        self._record_event = _sink_writer(runtime_store, "record_event")
+        self._error_log = _sink_writer(error_log, "write")
+
+    def __call__(self, event: RuntimeEvent) -> None:
+        self.write(event)
+
+    def write(self, event: RuntimeEvent) -> None:
+        self._write_isolated(self._event_log, event)
+
+        derived_error = None
+        try:
+            derived_error = runtime_error_from_event(event)
+        except Exception as error:
+            print(f"Symphonz runtime error normalization failed: {error}", file=sys.stderr)
+
+        if _is_significant_event(event) or derived_error is not None:
+            self._write_isolated(self._record_event, event)
+        if derived_error is not None:
+            self._write_isolated(self._error_log, derived_error)
+
+    @staticmethod
+    def _write_isolated(writer, payload) -> None:
+        try:
+            writer(payload)
+        except Exception as error:
+            print(f"Symphonz event sink failed: {error}", file=sys.stderr)
+
+
+def _sink_writer(sink, method_name: str):
+    writer = getattr(sink, method_name, None)
+    return writer if writer is not None else sink
+
+
+def _is_significant_event(event: RuntimeEvent) -> bool:
+    outer_type = str(event.type or "").lower()
+    if not (outer_type == "codex_event" or outer_type.startswith("codex_")):
+        return True
+    nested_event = event.data.get("event")
+    nested_type = nested_event.get("type") if isinstance(nested_event, dict) else None
+    event_type = str(nested_type or outer_type).lower()
+    return not any(marker in event_type for marker in _QUIET_CODEX_EVENT_MARKERS)
