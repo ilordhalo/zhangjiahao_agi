@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ import threading
 import time
 import unittest
 from unittest import mock
+import weakref
 
 
 def valid_report(**overrides):
@@ -128,6 +130,40 @@ class ReportingTests(unittest.TestCase):
         return ReportPublisher(
             **arguments
         )
+
+    def synchronizer(self, **overrides):
+        from symphonz.service.reporting import PendingReportSynchronizer
+
+        arguments = {
+            "store": self.store,
+            "artifact_root": self.root / "artifacts",
+            "public_base_url": "https://reports.example.test/base/",
+            "linear_client": self.linear,
+        }
+        arguments.update(overrides)
+        return PendingReportSynchronizer(**arguments)
+
+    def pending_report(self, issue_number, *, next_retry_at):
+        issue_id = f"issue-{issue_number}"
+        issue_identifier = f"SYM-{issue_number}"
+        publisher = self.publisher(
+            linear_client=None,
+            active_issue_id=issue_id,
+            active_issue_identifier=issue_identifier,
+        )
+        try:
+            publisher.publish(
+                valid_report(
+                    issue_id=issue_id,
+                    issue_identifier=issue_identifier,
+                    title=f"Report {issue_number}",
+                )
+            )
+        finally:
+            publisher.close()
+        entry = self.store.get_report(issue_identifier)
+        self.store.save_report({**entry, "next_retry_at": next_retry_at})
+        return self.store.get_report(issue_identifier)
 
     def artifact_path(self, entry, key):
         return self.root / "artifacts" / entry["issue_identifier"] / entry[key]
@@ -427,6 +463,125 @@ class ReportingTests(unittest.TestCase):
         restarted = self.publisher()
         self.assertEqual(restarted.sync_pending(now=pending["next_retry_at"]), 1)
         self.assertEqual(self.store.get_report("SYM-123")["linear_sync_status"], "synced")
+
+    def test_due_report_query_is_indexed_bounded_and_oldest_first(self):
+        for issue_number, due_at in ((1, 30.0), (2, 10.0), (3, 20.0), (4, 5.0)):
+            self.store.save_report(
+                {
+                    "issue_identifier": f"SYM-{issue_number}",
+                    "issue_id": f"issue-{issue_number}",
+                    "linear_sync_status": "synced" if issue_number == 4 else "pending",
+                    "next_retry_at": due_at,
+                    "created_at": due_at,
+                    "updated_at": due_at,
+                }
+            )
+
+        due = self.store.list_due_reports(now=30.0, limit=2)
+
+        self.assertEqual([entry["issue_identifier"] for entry in due], ["SYM-2", "SYM-3"])
+        with self.store._connect() as connection:
+            indexes = {row["name"] for row in connection.execute("PRAGMA index_list(reports)")}
+        self.assertIn("reports_due_sync", indexes)
+
+    def test_explicit_synchronizer_restarts_without_global_publisher_registry(self):
+        import symphonz.service.reporting as reporting
+        from symphonz.service.runtime_store import RuntimeStore
+
+        self.linear.fail = True
+        publisher = self.publisher()
+        publisher.publish(valid_report())
+        pending = self.store.get_report("SYM-123")
+        database_path = self.store.path
+        publisher_reference = weakref.ref(publisher)
+        publisher.close()
+        del publisher
+        del self.store
+        gc.collect()
+        self.assertIsNone(publisher_reference())
+
+        self.store = RuntimeStore(database_path)
+        self.linear.fail = False
+        synchronizer = self.synchronizer()
+
+        self.assertEqual(synchronizer.sync_pending(now=pending["next_retry_at"]), 1)
+        self.assertEqual(self.store.get_report("SYM-123")["linear_sync_status"], "synced")
+        for removed_name in ("_PUBLISHERS", "_PUBLISHERS_BY_ID", "_register_publisher", "sync_pending"):
+            self.assertFalse(hasattr(reporting, removed_name), removed_name)
+
+    def test_explicit_synchronizer_bounds_each_batch_without_starving_old_reports(self):
+        self.pending_report(1, next_retry_at=1.0)
+        self.pending_report(2, next_retry_at=2.0)
+        self.pending_report(3, next_retry_at=3.0)
+
+        synced = self.synchronizer(batch_size=2).sync_pending(now=10.0)
+
+        self.assertEqual(synced, 2)
+        self.assertEqual(self.store.get_report("SYM-1")["linear_sync_status"], "synced")
+        self.assertEqual(self.store.get_report("SYM-2")["linear_sync_status"], "synced")
+        self.assertEqual(self.store.get_report("SYM-3")["linear_sync_status"], "pending")
+
+    def test_explicit_synchronizer_isolates_bad_rows_and_closes_temporary_publishers(self):
+        import symphonz.service.reporting as reporting
+
+        malformed = self.pending_report(1, next_retry_at=1.0)
+        missing_artifact = self.pending_report(2, next_retry_at=2.0)
+        self.pending_report(3, next_retry_at=3.0)
+        self.store.save_report({**malformed, "issue_id": None})
+        self.artifact_path(missing_artifact, "json_path").unlink()
+        errors = []
+        closed_publishers = []
+        original_close = reporting.ReportPublisher.close
+
+        def tracked_close(publisher):
+            closed_publishers.append(publisher)
+            original_close(publisher)
+
+        with mock.patch.object(reporting.ReportPublisher, "close", tracked_close):
+            synced = self.synchronizer(error_sink=errors.append, batch_size=3).sync_pending(now=10.0)
+
+        self.assertEqual(synced, 1)
+        self.assertEqual(self.store.get_report("SYM-1")["linear_sync_status"], "pending")
+        self.assertEqual(self.store.get_report("SYM-2")["linear_sync_status"], "pending")
+        self.assertEqual(self.store.get_report("SYM-3")["linear_sync_status"], "synced")
+        self.assertEqual({error.issue_identifier for error in errors}, {"SYM-1", "SYM-2"})
+        self.assertEqual(len(closed_publishers), 2)
+        self.assertTrue(all(publisher._artifact_root_fd == -1 for publisher in closed_publishers))
+
+    def test_concurrent_explicit_synchronizers_share_sqlite_lease(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        lookup_started = threading.Event()
+        release_lookup = threading.Event()
+
+        class BlockingLinearClient(FakeLinearClient):
+            def graphql(self, query, variables):
+                if "SymphonzFindReportComment" in query and not lookup_started.is_set():
+                    lookup_started.set()
+                    release_lookup.wait(timeout=2)
+                return super().graphql(query, variables)
+
+        linear = BlockingLinearClient()
+        self.pending_report(1, next_retry_at=1.0)
+        first = self.synchronizer(linear_client=linear, batch_size=1)
+        second = self.synchronizer(
+            store=RuntimeStore(self.root / "runtime.sqlite3"),
+            linear_client=linear,
+            batch_size=1,
+        )
+        results = []
+
+        worker = threading.Thread(target=lambda: results.append(first.sync_pending(now=1.0)))
+        worker.start()
+        self.assertTrue(lookup_started.wait(timeout=2))
+        results.append(second.sync_pending(now=1.0))
+        release_lookup.set()
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(sorted(results), [0, 1])
+        creates = [query for query, _ in linear.calls if "SymphonzCreateReportComment" in query]
+        self.assertEqual(len(creates), 1)
 
     def test_missing_retry_artifact_records_failure_emits_error_and_advances_backoff(self):
         errors = []

@@ -340,6 +340,31 @@ class RuntimeStore:
             ),
         )
 
+    def list_due_reports(self, *, now: float, limit: int = 50) -> list[dict]:
+        """Return the oldest bounded set of latest reports due for synchronization."""
+        current = float(now)
+        batch_limit = self._limit(limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT reports.*
+                FROM reports
+                WHERE reports.linear_sync_status = 'pending'
+                  AND (reports.next_retry_at IS NULL OR reports.next_retry_at <= ?)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM reports AS newer
+                      WHERE newer.issue_identifier = reports.issue_identifier
+                        AND newer.report_version > reports.report_version
+                  )
+                ORDER BY reports.next_retry_at ASC, reports.created_at ASC,
+                         reports.issue_identifier ASC, reports.report_version DESC
+                LIMIT ?
+                """,
+                (current, batch_limit),
+            ).fetchall()
+        return [self._report_from_row(row) for row in rows]
+
     def claim_report_sync(
         self,
         issue_identifier: str,
@@ -487,7 +512,7 @@ class RuntimeStore:
                 f"""
                 UPDATE reports
                 SET {', '.join(assignments)}
-                WHERE issue_identifier = ? AND json_path = ?
+                WHERE issue_identifier = ? AND json_path IS ?
                   AND EXISTS (
                       SELECT 1 FROM report_sync_leases
                       WHERE report_sync_leases.issue_identifier = reports.issue_identifier
@@ -891,6 +916,13 @@ class RuntimeStore:
                         "UPDATE reports SET linear_sync_status = sync_status WHERE sync_status IS NOT NULL"
                     )
             self._legacy_report_sync_status = "sync_status" in columns
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS reports_due_sync
+                ON reports(linear_sync_status, next_retry_at, created_at,
+                           issue_identifier, report_version DESC)
+                """
+            )
 
     def _cleanup_expired_login_attempt_state(
         self,

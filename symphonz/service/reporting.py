@@ -13,7 +13,6 @@ import stat
 import threading
 import time
 from urllib.parse import unquote, urlsplit, urlunsplit
-import weakref
 
 from symphonz.service.models import RuntimeErrorRecord
 
@@ -32,10 +31,6 @@ _HTTP_URL_SCHEMA_PATTERN = (
     r"^https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?"
     r"(?::[0-9]{1,5})?(?:/[^\s?#\x00-\x1f\x7f]*)?$"
 )
-_PUBLISHERS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-_PUBLISHERS_BY_ID: dict[int, "ReportPublisher"] = {}
-
-
 class ReportValidationError(ValueError):
     """Raised when a report payload cannot be safely persisted or rendered."""
 
@@ -539,10 +534,10 @@ class ReportPublisher(ReportArtifactReader):
         validated_lease_seconds = float(sync_lease_seconds)
         if validated_lease_seconds <= 0:
             raise ValueError("sync_lease_seconds must be positive")
-        validated_issue_id = _text(active_issue_id, "active_issue_id", _MAX_SHORT_TEXT_LENGTH)
-        validated_issue_identifier = _text(active_issue_identifier, "active_issue_identifier", 64)
-        if _ISSUE_IDENTIFIER.fullmatch(validated_issue_identifier) is None:
-            raise ValueError("active_issue_identifier must be a safe Linear-style identifier.")
+        validated_issue_id, validated_issue_identifier = _active_issue_identity(
+            active_issue_id,
+            active_issue_identifier,
+        )
         super().__init__(store, artifact_root)
         self.public_base_url = validated_base_url
         self.linear_client = linear_client
@@ -550,7 +545,6 @@ class ReportPublisher(ReportArtifactReader):
         self.sync_lease_seconds = validated_lease_seconds
         self.active_issue_id = validated_issue_id
         self.active_issue_identifier = validated_issue_identifier
-        _register_publisher(linear_client, self)
 
     def report_url(self, issue_identifier: str) -> str:
         if issue_identifier != self.active_issue_identifier:
@@ -618,25 +612,14 @@ class ReportPublisher(ReportArtifactReader):
 
     def sync_pending(self, now: float | None = None) -> int:
         current = time.time() if now is None else float(now)
-        synced = 0
-        cursor = None
-        while True:
-            page = self.store.list_reports(cursor=cursor, limit=50)
-            for entry in page["items"]:
-                if entry.get("issue_identifier") != self.active_issue_identifier:
-                    continue
-                owner = f"retry-{secrets.token_hex(16)}"
-                claimed = self.store.claim_report_sync(
-                    entry["issue_identifier"],
-                    owner=owner,
-                    now=current,
-                    lease_seconds=self.sync_lease_seconds,
-                )
-                if claimed is not None and self._sync_claimed(claimed, owner, current):
-                    synced += 1
-            cursor = page.get("next_cursor")
-            if not cursor:
-                return synced
+        owner = f"retry-{secrets.token_hex(16)}"
+        claimed = self.store.claim_report_sync(
+            self.active_issue_identifier,
+            owner=owner,
+            now=current,
+            lease_seconds=self.sync_lease_seconds,
+        )
+        return int(claimed is not None and self._sync_claimed(claimed, owner, current))
 
     def _validate_active_issue(self, document: ReportDocument) -> None:
         if document.issue_id != self.active_issue_id or document.issue_identifier != self.active_issue_identifier:
@@ -810,31 +793,14 @@ class ReportPublisher(ReportArtifactReader):
         return comment_id
 
     def _pending_after_failure(self, entry: dict, error: Exception, now: float, owner: str) -> dict | None:
-        retries = int(entry.get("retry_count") or 0) + 1
-        retry_at = now + min(300.0, float(2 ** min(retries - 1, 8)))
-        pending = self._save_sync_state(
+        return _pending_after_sync_failure(
+            self.store,
             entry,
-            status="pending",
-            retry_count=retries,
-            next_retry_at=retry_at,
-            now=now,
-            comment_id=entry.get("linear_comment_id"),
-            owner=owner,
+            error,
+            now,
+            owner,
+            self.error_sink,
         )
-        if pending is None:
-            return None
-        record = RuntimeErrorRecord(
-            issue_identifier=entry["issue_identifier"],
-            stage="report_sync",
-            error_type=type(error).__name__,
-            message=str(error),
-            retryable=True,
-            timestamp=now,
-            context={"linear_sync_status": "pending", "retry_count": retries},
-        )
-        self.store.record_error(record)
-        self._emit_error(record)
-        return pending
 
     def _save_sync_state(
         self,
@@ -858,15 +824,6 @@ class ReportPublisher(ReportArtifactReader):
             updated_at=now,
         )
         return self.store.get_report(entry["issue_identifier"]) if updated else None
-
-    def _emit_error(self, record: RuntimeErrorRecord) -> None:
-        if self.error_sink is None:
-            return
-        writer = self.error_sink.write if hasattr(self.error_sink, "write") else self.error_sink
-        try:
-            writer(record)
-        except Exception:
-            return
 
     def _find_comment_id(self, issue_id: str) -> str | None:
         after = None
@@ -926,21 +883,134 @@ class ReportPublisher(ReportArtifactReader):
         )
 
 
-def sync_pending(linear_client, now: float) -> int:
-    """Retry due report synchronization for the publisher associated with this client."""
-    publisher = _PUBLISHERS.get(linear_client) if linear_client is not None else None
-    if publisher is None and linear_client is not None:
-        publisher = _PUBLISHERS_BY_ID.get(id(linear_client))
-    return publisher.sync_pending(now) if publisher is not None else 0
+class PendingReportSynchronizer:
+    """Synchronize a bounded batch of persisted reports without process globals."""
+
+    def __init__(
+        self,
+        store,
+        artifact_root: Path,
+        public_base_url: str,
+        linear_client,
+        error_sink=None,
+        sync_lease_seconds: float = _SYNC_LEASE_SECONDS,
+        batch_size: int = 50,
+    ):
+        validated_lease_seconds = float(sync_lease_seconds)
+        if validated_lease_seconds <= 0:
+            raise ValueError("sync_lease_seconds must be positive")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 200:
+            raise ValueError("batch_size must be an integer from 1 to 200")
+        self.store = store
+        self.artifact_root = Path(os.path.abspath(os.fspath(artifact_root)))
+        self.public_base_url = _public_base_url(public_base_url)
+        self.linear_client = linear_client
+        self.error_sink = error_sink
+        self.sync_lease_seconds = validated_lease_seconds
+        self.batch_size = batch_size
+
+    def sync_pending(self, now: float | None = None) -> int:
+        current = time.time() if now is None else float(now)
+        synced = 0
+        for entry in self.store.list_due_reports(now=current, limit=self.batch_size):
+            owner = f"retry-{secrets.token_hex(16)}"
+            claimed = self.store.claim_report_sync(
+                entry["issue_identifier"],
+                owner=owner,
+                now=current,
+                lease_seconds=self.sync_lease_seconds,
+            )
+            if claimed is None:
+                continue
+            try:
+                issue_id, issue_identifier = _active_issue_identity(
+                    claimed.get("issue_id"),
+                    claimed.get("issue_identifier"),
+                )
+                publisher = ReportPublisher(
+                    store=self.store,
+                    artifact_root=self.artifact_root,
+                    public_base_url=self.public_base_url,
+                    linear_client=self.linear_client,
+                    active_issue_id=issue_id,
+                    active_issue_identifier=issue_identifier,
+                    error_sink=self.error_sink,
+                    sync_lease_seconds=self.sync_lease_seconds,
+                )
+            except Exception as error:
+                try:
+                    _pending_after_sync_failure(
+                        self.store,
+                        claimed,
+                        error,
+                        current,
+                        owner,
+                        self.error_sink,
+                    )
+                finally:
+                    self.store.release_report_sync(claimed["issue_identifier"], owner=owner)
+                continue
+            try:
+                if publisher._sync_claimed(claimed, owner, current):
+                    synced += 1
+            finally:
+                publisher.close()
+        return synced
 
 
-def _register_publisher(linear_client, publisher: ReportPublisher) -> None:
-    if linear_client is None:
+def _pending_after_sync_failure(
+    store,
+    entry: dict,
+    error: Exception,
+    now: float,
+    owner: str,
+    error_sink,
+) -> dict | None:
+    retries = int(entry.get("retry_count") or 0) + 1
+    retry_at = now + min(300.0, float(2 ** min(retries - 1, 8)))
+    updated = store.update_report_sync_state(
+        entry["issue_identifier"],
+        expected_json_path=entry.get("json_path"),
+        owner=owner,
+        linear_sync_status="pending",
+        linear_comment_id=entry.get("linear_comment_id"),
+        retry_count=retries,
+        next_retry_at=retry_at,
+        updated_at=now,
+    )
+    if not updated:
+        return None
+    pending = store.get_report(entry["issue_identifier"])
+    record = RuntimeErrorRecord(
+        issue_identifier=entry["issue_identifier"],
+        stage="report_sync",
+        error_type=type(error).__name__,
+        message=str(error),
+        retryable=True,
+        timestamp=now,
+        context={"linear_sync_status": "pending", "retry_count": retries},
+    )
+    store.record_error(record)
+    _emit_report_sync_error(error_sink, record)
+    return pending
+
+
+def _emit_report_sync_error(error_sink, record: RuntimeErrorRecord) -> None:
+    if error_sink is None:
         return
+    writer = error_sink.write if hasattr(error_sink, "write") else error_sink
     try:
-        _PUBLISHERS[linear_client] = publisher
-    except TypeError:
-        _PUBLISHERS_BY_ID[id(linear_client)] = publisher
+        writer(record)
+    except Exception:
+        return
+
+
+def _active_issue_identity(issue_id: object, issue_identifier: object) -> tuple[str, str]:
+    validated_issue_id = _text(issue_id, "active_issue_id", _MAX_SHORT_TEXT_LENGTH)
+    validated_issue_identifier = _text(issue_identifier, "active_issue_identifier", 64)
+    if _ISSUE_IDENTIFIER.fullmatch(validated_issue_identifier) is None:
+        raise ValueError("active_issue_identifier must be a safe Linear-style identifier.")
+    return validated_issue_id, validated_issue_identifier
 
 
 def _object(value: object, name: str) -> dict:
