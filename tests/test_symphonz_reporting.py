@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import re
 import tempfile
@@ -432,9 +433,15 @@ class ReportingTests(unittest.TestCase):
             def graphql(self, query, variables):
                 if self.steal and "SymphonzFindReportComment" in query:
                     self.steal = False
-                    self.publisher.store.claim_report_sync(
-                        "SYM-123", owner="replacement", now=time.time() + 60, lease_seconds=30,
-                    )
+                    connection = self.publisher.store._connect()
+                    try:
+                        connection.execute(
+                            "UPDATE report_sync_leases SET owner = ?, expires_at = ? "
+                            "WHERE issue_identifier = ?",
+                            ("replacement", time.time() + 60, "SYM-123"),
+                        )
+                    finally:
+                        connection.close()
                 return super().graphql(query, variables)
 
         linear = LeaseStealingLinearClient()
@@ -459,6 +466,29 @@ class ReportingTests(unittest.TestCase):
             [],
         )
 
+    def test_expired_heartbeat_checks_the_current_wall_clock_before_mutation(self):
+        from symphonz.service.reporting import _SyncLeaseHeartbeat, _SyncLeaseLost
+
+        publisher = self.publisher(linear_client=None, sync_lease_seconds=0.05)
+        publisher.store.save_report(
+            {
+                "issue_identifier": "SYM-123",
+                "json_path": "report-current.json",
+                "linear_sync_status": "pending",
+                "next_retry_at": time.time(),
+            }
+        )
+        lease_started_at = time.time()
+        publisher.store.claim_report_sync(
+            "SYM-123", owner="old-owner", now=lease_started_at, lease_seconds=0.05,
+        )
+        heartbeat = _SyncLeaseHeartbeat(publisher.store, "SYM-123", "old-owner", 0.05)
+
+        time.sleep(0.1)
+
+        with self.assertRaises(_SyncLeaseLost):
+            heartbeat.require_owned(lease_started_at)
+
     def test_graphql_business_failure_or_missing_comment_id_remains_pending(self):
         self.linear.create_success = False
         created = self.publisher().publish(valid_report())
@@ -482,7 +512,10 @@ class ReportingTests(unittest.TestCase):
     def test_linear_markdown_neutralizes_ai_controlled_fields(self):
         publisher = self.publisher()
         report = valid_report(
-            summary="@all\n## forged heading\n[click](https://evil.test)\n```owned``` http://evil.test/x https://evil.test/y",
+            summary=(
+                "@all\n## forged heading\n[click](https://evil.test)\n```owned``` "
+                "http://evil.test/x https://evil.test/y HTTP://evil.test/z HtTpS://evil.test/q"
+            ),
             review={
                 **valid_report()["review"],
                 "branch": "topic`\n@team",
@@ -500,6 +533,8 @@ class ReportingTests(unittest.TestCase):
         self.assertNotIn("`topic`", body)
         self.assertNotIn("http://evil.test", body)
         self.assertNotIn("https://evil.test", body)
+        self.assertNotIn("HTTP://evil.test", body)
+        self.assertNotIn("HtTpS://evil.test", body)
         self.assertEqual(body.count("## Symphonz Implementation Report"), 1)
 
     def test_report_sync_failure_uses_error_sink_and_later_success_resolves_database_error(self):
@@ -568,4 +603,43 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("pattern", url_schema)
         self.assertIsNone(re.fullmatch(url_schema["pattern"], "https://user:secret@reviews.example.test/1"))
         self.assertIsNone(re.fullmatch(url_schema["pattern"], "ftp://reviews.example.test/1"))
-        self.assertIsNotNone(re.fullmatch(url_schema["pattern"], "https://reviews.example.test/1?view=full"))
+        for invalid in (
+            "https:///1",
+            "https://reviews.example.test/1?view=full",
+            "https://reviews.example.test/1#fragment",
+            "https://reviews.example.test/1/\x01",
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(re.fullmatch(url_schema["pattern"], invalid))
+        self.assertIsNotNone(re.fullmatch(url_schema["pattern"], "https://reviews.example.test/1"))
+
+    def test_issue_publish_lock_serializes_cross_process_publication(self):
+        publisher = self.publisher(linear_client=None)
+        publisher.publish(valid_report(summary="Initial generation."))
+        read_fd, write_fd = os.pipe()
+        try:
+            with publisher._issue_publish_lock("SYM-123"):
+                child_pid = os.fork()
+                if child_pid == 0:
+                    os.close(read_fd)
+                    try:
+                        publisher.publish(valid_report(summary="Child generation."))
+                        os.write(write_fd, b"done")
+                    except BaseException:
+                        os.write(write_fd, b"error")
+                    finally:
+                        os.close(write_fd)
+                        os._exit(0)
+                os.close(write_fd)
+                time.sleep(0.1)
+                self.assertEqual(os.waitpid(child_pid, os.WNOHANG), (0, 0))
+
+            _, status = os.waitpid(child_pid, 0)
+            self.assertTrue(os.WIFEXITED(status))
+            self.assertEqual(os.read(read_fd, 5), b"done")
+            self.assertEqual(
+                json.loads(publisher.read_current_json("SYM-123"))["summary"],
+                "Child generation.",
+            )
+        finally:
+            os.close(read_fd)

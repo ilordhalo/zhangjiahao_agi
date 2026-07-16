@@ -1600,9 +1600,17 @@ class RuntimeStoreTests(unittest.TestCase):
             }
         )
 
-        claimed = first.claim_report_sync("SYM-1", owner="worker-1", now=10.0, lease_seconds=30.0)
-        contended = second.claim_report_sync("SYM-1", owner="worker-2", now=10.0, lease_seconds=30.0)
-        reclaimed = second.claim_report_sync("SYM-1", owner="worker-2", now=40.0, lease_seconds=30.0)
+        lease_started_at = time.time()
+        claimed = first.claim_report_sync(
+            "SYM-1", owner="worker-1", now=lease_started_at, lease_seconds=0.05,
+        )
+        contended = second.claim_report_sync(
+            "SYM-1", owner="worker-2", now=lease_started_at, lease_seconds=0.05,
+        )
+        time.sleep(0.1)
+        reclaimed = second.claim_report_sync(
+            "SYM-1", owner="worker-2", now=time.time(), lease_seconds=30.0,
+        )
 
         self.assertIsNotNone(claimed)
         self.assertIsNone(contended)
@@ -1657,6 +1665,39 @@ class RuntimeStoreTests(unittest.TestCase):
                 retry_count=0,
                 next_retry_at=None,
                 updated_at=12.0,
+            )
+        )
+
+    def test_report_sync_lease_checks_and_fenced_writes_use_current_wall_clock(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.save_report(
+            {
+                "issue_identifier": "SYM-1",
+                "json_path": "report-current.json",
+                "linear_sync_status": "pending",
+            }
+        )
+        lease_started_at = time.time()
+        store.claim_report_sync("SYM-1", owner="old-owner", now=lease_started_at, lease_seconds=0.05)
+
+        time.sleep(0.1)
+
+        self.assertFalse(
+            store.owns_report_sync_lease("SYM-1", owner="old-owner", now=lease_started_at)
+        )
+        self.assertFalse(
+            store.update_report_sync_state(
+                "SYM-1",
+                expected_json_path="report-current.json",
+                owner="old-owner",
+                linear_sync_status="synced",
+                linear_comment_id="comment-1",
+                retry_count=0,
+                next_retry_at=None,
+                updated_at=lease_started_at,
+                lease_checked_at=lease_started_at,
             )
         )
 

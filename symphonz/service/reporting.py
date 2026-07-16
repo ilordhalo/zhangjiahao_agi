@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 import html
 import json
 import os
@@ -26,7 +28,10 @@ _MAX_EDGES = 48
 _MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
 _SYNC_LEASE_SECONDS = 30.0
 _BUNDLE_NAME = re.compile(r"report-[a-z0-9]+\.(?:json|html)$")
-_HTTP_URL_SCHEMA_PATTERN = r"^https?://[^/@\s]+(?:[/?#][^\s]*)?$"
+_HTTP_URL_SCHEMA_PATTERN = (
+    r"^https?://(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])"
+    r"(?::[0-9]{1,5})?(?:/[^\s?#\x00-\x1f\x7f]*)?$"
+)
 _PUBLISHERS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _PUBLISHERS_BY_ID: dict[int, "ReportPublisher"] = {}
 
@@ -49,7 +54,6 @@ class _SyncLeaseHeartbeat:
         self.lease_seconds = lease_seconds
         self._stop = threading.Event()
         self._lost = threading.Event()
-        self._last_renewed_at: float | None = None
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -59,16 +63,12 @@ class _SyncLeaseHeartbeat:
         self._stop.set()
         self._thread.join(timeout=max(1.0, self.lease_seconds * 2))
 
-    def require_owned(self, now: float) -> None:
-        checked_at = self.lease_checked_at(now)
+    def require_owned(self, now: float | None = None) -> None:
         if self._lost.is_set() or not self.store.owns_report_sync_lease(
-            self.issue_identifier, owner=self.owner, now=checked_at,
+            self.issue_identifier, owner=self.owner, now=time.time(),
         ):
             self._lost.set()
             raise _SyncLeaseLost("Report synchronization lease was lost.")
-
-    def lease_checked_at(self, fallback: float) -> float:
-        return self._last_renewed_at if self._last_renewed_at is not None else fallback
 
     def _run(self) -> None:
         interval = max(0.01, self.lease_seconds / 3)
@@ -87,7 +87,6 @@ class _SyncLeaseHeartbeat:
             if not renewed:
                 self._lost.set()
                 return
-            self._last_renewed_at = renewed_at
 
 
 @dataclass(frozen=True)
@@ -431,46 +430,47 @@ class ReportPublisher:
         self._validate_active_issue(document)
         now = time.time()
         html_page = render_report(document)
-        existing = self.store.get_report(document.issue_identifier)
         generation = secrets.token_hex(12)
         json_name = f"report-{generation}.json"
         html_name = f"report-{generation}.html"
-        directory_fd = self._open_issue_directory(document.issue_identifier, create=True)
-        try:
+        with self._issue_publish_lock(document.issue_identifier):
+            existing = self.store.get_report(document.issue_identifier)
+            directory_fd = self._open_issue_directory(document.issue_identifier, create=True)
             try:
-                self._write_bundle_file(
-                    directory_fd,
-                    json_name,
-                    json.dumps(document.to_payload(), indent=2, sort_keys=True) + "\n",
-                )
-                self._write_bundle_file(directory_fd, html_name, html_page)
-                os.fsync(directory_fd)
-                self._assert_root_unchanged()
-                self.store.save_report(
-                    {
-                        "issue_identifier": document.issue_identifier,
-                        "report_version": 1,
-                        "json_path": json_name,
-                        "html_path": html_name,
-                        "url": self.report_url(document.issue_identifier),
-                        "review_metadata": document.to_payload()["review"],
-                        "linear_comment_id": (existing or {}).get("linear_comment_id"),
-                        "linear_sync_status": "pending",
-                        "retry_count": 0,
-                        "next_retry_at": now,
-                        "created_at": (existing or {}).get("created_at") or now,
-                        "updated_at": now,
-                        "issue_id": document.issue_id,
-                        "summary": document.summary,
-                    }
-                )
-            except Exception:
-                self._unlink_bundle_files(directory_fd, json_name, html_name)
-                raise
-            entry = self.store.get_report(document.issue_identifier)
-            self._cleanup_unreferenced_generations(directory_fd, entry)
-        finally:
-            os.close(directory_fd)
+                try:
+                    self._write_bundle_file(
+                        directory_fd,
+                        json_name,
+                        json.dumps(document.to_payload(), indent=2, sort_keys=True) + "\n",
+                    )
+                    self._write_bundle_file(directory_fd, html_name, html_page)
+                    os.fsync(directory_fd)
+                    self._assert_root_unchanged()
+                    self.store.save_report(
+                        {
+                            "issue_identifier": document.issue_identifier,
+                            "report_version": 1,
+                            "json_path": json_name,
+                            "html_path": html_name,
+                            "url": self.report_url(document.issue_identifier),
+                            "review_metadata": document.to_payload()["review"],
+                            "linear_comment_id": (existing or {}).get("linear_comment_id"),
+                            "linear_sync_status": "pending",
+                            "retry_count": 0,
+                            "next_retry_at": now,
+                            "created_at": (existing or {}).get("created_at") or now,
+                            "updated_at": now,
+                            "issue_id": document.issue_id,
+                            "summary": document.summary,
+                        }
+                    )
+                except Exception:
+                    self._unlink_bundle_files(directory_fd, json_name, html_name)
+                    raise
+                entry = self.store.get_report(document.issue_identifier)
+                self._cleanup_unreferenced_generations(directory_fd, entry)
+            finally:
+                os.close(directory_fd)
         self._update_task(document, now)
         owner = f"publish-{secrets.token_hex(16)}"
         claimed = self.store.claim_report_sync(
@@ -513,6 +513,27 @@ class ReportPublisher:
     def _assert_root_unchanged(self) -> None:
         descriptor = _open_existing_directory(self.artifact_root, self._artifact_root_identity)
         os.close(descriptor)
+
+    @contextmanager
+    def _issue_publish_lock(self, issue_identifier: str):
+        if _ISSUE_IDENTIFIER.fullmatch(issue_identifier) is None:
+            raise RuntimeError("Report issue lock is outside the artifact root.")
+        root_fd = self._borrow_root_fd()
+        lock_fd = -1
+        locked = False
+        try:
+            lock_name = f".{issue_identifier}.publish.lock"
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+            lock_fd = os.open(lock_name, flags, 0o600, dir_fd=root_fd)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            locked = True
+            yield
+        finally:
+            if lock_fd >= 0:
+                if locked:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            os.close(root_fd)
 
     def _borrow_root_fd(self) -> int:
         self._assert_root_unchanged()
@@ -738,7 +759,6 @@ class ReportPublisher:
             now=now,
             comment_id=comment_id,
             owner=heartbeat.owner,
-            lease_checked_at=heartbeat.lease_checked_at(now),
         )
         if updated is None:
             raise _SyncLeaseLost("Report synchronization lease was lost before state persistence.")
@@ -797,7 +817,6 @@ class ReportPublisher:
         now: float,
         comment_id: str | None,
         owner: str,
-        lease_checked_at: float | None = None,
     ) -> dict | None:
         updated = self.store.update_report_sync_state(
             entry["issue_identifier"],
@@ -808,7 +827,6 @@ class ReportPublisher:
             retry_count=retry_count,
             next_retry_at=next_retry_at,
             updated_at=now,
-            lease_checked_at=lease_checked_at,
         )
         return self.store.get_report(entry["issue_identifier"]) if updated else None
 
@@ -1009,6 +1027,8 @@ def _url(value: object, name: str) -> str:
         or parsed.netloc.endswith(":")
         or parsed.username is not None
         or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
         or has_control
     ):
         raise ReportValidationError(f"{name} must use an http or https URL.")
@@ -1057,7 +1077,12 @@ def _neutralize_markdown(value: str) -> str:
             ord("\\"): "\uFF3C",
         }
     )
-    return neutralized.replace("https://", "https\uFF1A\uFF0F\uFF0F").replace("http://", "http\uFF1A\uFF0F\uFF0F")
+    return re.sub(
+        r"https?://",
+        lambda match: match.group(0).replace(":", "\uFF1A").replace("/", "\uFF0F"),
+        neutralized,
+        flags=re.IGNORECASE,
+    )
 
 
 def _open_pinned_directory(path: Path) -> int:

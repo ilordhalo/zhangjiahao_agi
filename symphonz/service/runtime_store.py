@@ -350,7 +350,8 @@ class RuntimeStore:
     ) -> dict | None:
         if not isinstance(owner, str) or not owner:
             raise ValueError("Report sync lease owner must be a non-empty string")
-        current = float(now)
+        due_at = float(now)
+        current = time.time()
         duration = float(lease_seconds)
         if duration <= 0:
             raise ValueError("Report sync lease duration must be positive")
@@ -365,7 +366,7 @@ class RuntimeStore:
                 ORDER BY report_version DESC
                 LIMIT 1
                 """,
-                (issue_identifier, current),
+                (issue_identifier, due_at),
             ).fetchone()
             if report is None:
                 return None
@@ -414,7 +415,7 @@ class RuntimeStore:
         """Extend an unexpired report-sync lease held by exactly ``owner``."""
         if not isinstance(owner, str) or not owner:
             raise ValueError("Report sync lease owner must be a non-empty string")
-        current = float(now)
+        current = time.time()
         duration = float(lease_seconds)
         if duration <= 0:
             raise ValueError("Report sync lease duration must be positive")
@@ -434,7 +435,7 @@ class RuntimeStore:
 
     def owns_report_sync_lease(self, issue_identifier: str, *, owner: str, now: float) -> bool:
         """Return whether ``owner`` still holds an unexpired report-sync lease."""
-        current = float(now)
+        current = time.time()
         with self._connect() as connection:
             return connection.execute(
                 """
@@ -478,7 +479,7 @@ class RuntimeStore:
             issue_identifier,
             expected_json_path,
             owner,
-            float(updated_at if lease_checked_at is None else lease_checked_at),
+            time.time(),
         ])
 
         def write(connection: sqlite3.Connection) -> bool:

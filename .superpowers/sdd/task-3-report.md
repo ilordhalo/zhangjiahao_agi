@@ -146,3 +146,30 @@ full-suite retry. No runner, orchestrator, or app-server code changed.
   symphonz/service/reporting.py symphonz/service/runtime_store.py
   tests/test_symphonz_reporting.py tests/test_symphonz_service.py`: passed.
 - `git diff --check`: passed.
+
+## Final Re-review Fixes 18-21
+
+- Lease ownership checks and owner-conditional RuntimeStore writes now use a
+  fresh wall-clock read. A stale renewal timestamp can no longer keep an
+  expired worker eligible to mutate Linear or mark synchronization complete.
+- Publication now holds a standard-library POSIX issue lock across paired
+  generation writes, the authoritative RuntimeStore path switch, and the
+  complete orphan-generation cleanup scan.
+- Linear Markdown neutralization treats `http://` and `https://` schemes
+  case-insensitively, including mixed-case AI-controlled text.
+- The advertised review URL schema now requires a real host and rejects
+  query strings, fragments, and C0/control characters; runtime URL validation
+  applies the same request-component restriction.
+
+## Final Re-review Verification
+
+- RED: focused tests failed on the old heartbeat timestamp, missing issue
+  lock, case-sensitive scheme replacement, permissive URL schema, and stale
+  RuntimeStore lease condition.
+- `python3 -m unittest tests.test_symphonz_reporting tests.test_symphonz_service
+  -v`: 103 passed.
+- `python3 -m unittest discover -v`: 170 passed.
+- `env PYTHONPYCACHEPREFIX=/private/tmp/symphonz-pycache python3 -m py_compile
+  symphonz/service/reporting.py symphonz/service/runtime_store.py
+  tests/test_symphonz_reporting.py tests/test_symphonz_service.py`: passed.
+- `git diff --check`: passed.
