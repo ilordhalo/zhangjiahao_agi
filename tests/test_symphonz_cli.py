@@ -137,6 +137,24 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(target.read_text(), original)
 
+    @unittest.skipUnless(hasattr(os, "symlink"), "symbolic links are unavailable")
+    def test_auth_config_read_and_write_reject_symlinked_parent_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside"
+            outside.mkdir()
+            (root / ".symphonz").symlink_to(outside, target_is_directory=True)
+            path = root / ".symphonz" / "auth.toml"
+
+            with self.assertRaisesRegex(RuntimeError, "parent directory.*symbolic link"):
+                write_auth_config(path, "replacement")
+            self.assertFalse((outside / "auth.toml").exists())
+
+            (outside / "auth.toml").write_text("not-safe")
+            os.chmod(outside / "auth.toml", 0o600)
+            with self.assertRaisesRegex(RuntimeError, "parent directory.*symbolic link"):
+                read_dashboard_auth(root)
+
     def test_auth_config_read_and_write_reject_non_regular_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -157,12 +175,23 @@ class ConfigTests(unittest.TestCase):
             real_replace = os.replace
             observed = {}
 
-            def inspect_replace(source, destination):
-                source_path = Path(source)
-                observed["same_directory"] = source_path.parent == path.parent
-                observed["temporary_mode"] = source_path.stat().st_mode & 0o777
-                observed["destination_before_replace"] = Path(destination).read_text()
-                real_replace(source, destination)
+            def inspect_replace(source, destination, **kwargs):
+                source_dir_fd = kwargs.get("src_dir_fd")
+                destination_dir_fd = kwargs.get("dst_dir_fd")
+                if source_dir_fd is None:
+                    source_path = Path(source)
+                    observed["same_directory"] = source_path.parent == path.parent
+                    observed["temporary_mode"] = source_path.stat().st_mode & 0o777
+                    observed["destination_before_replace"] = Path(destination).read_text()
+                else:
+                    observed["same_directory"] = source_dir_fd == destination_dir_fd
+                    observed["temporary_mode"] = os.stat(source, dir_fd=source_dir_fd).st_mode & 0o777
+                    destination_descriptor = os.open(destination, os.O_RDONLY, dir_fd=destination_dir_fd)
+                    try:
+                        observed["destination_before_replace"] = os.read(destination_descriptor, 100).decode()
+                    finally:
+                        os.close(destination_descriptor)
+                real_replace(source, destination, **kwargs)
 
             with (
                 patch("symphonz.install.os.replace", side_effect=inspect_replace) as replace,
@@ -176,6 +205,37 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(observed["temporary_mode"], 0o600)
             self.assertEqual(observed["destination_before_replace"], "old-config")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    @unittest.skipUnless(hasattr(os, "O_DIRECTORY") and hasattr(os, "symlink"), "dir_fd APIs unavailable")
+    def test_write_auth_config_stays_in_pinned_parent_when_parent_path_is_replaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / ".symphonz" / "auth.toml"
+            write_auth_config(path, "original")
+            original = path.read_text()
+            pinned_parent = root / ".symphonz-pinned"
+            outside = root / "outside"
+            outside.mkdir()
+            real_replace = os.replace
+            swapped = False
+
+            def swap_parent_then_replace(source, destination, **kwargs):
+                nonlocal swapped
+                if not swapped:
+                    os.rename(path.parent, pinned_parent)
+                    path.parent.symlink_to(outside, target_is_directory=True)
+                    swapped = True
+                return real_replace(source, destination, **kwargs)
+
+            with patch("symphonz.install.os.replace", side_effect=swap_parent_then_replace):
+                try:
+                    write_auth_config(path, "replacement")
+                except OSError as error:
+                    self.fail(f"pinned parent replacement failed: {error}")
+
+            self.assertTrue(swapped)
+            self.assertNotEqual((pinned_parent / "auth.toml").read_text(), original)
+            self.assertFalse((outside / "auth.toml").exists())
 
     def test_write_auth_config_replace_failure_preserves_destination(self):
         with tempfile.TemporaryDirectory() as tmp:

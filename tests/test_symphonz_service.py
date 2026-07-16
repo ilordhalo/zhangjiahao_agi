@@ -1616,8 +1616,62 @@ class RuntimeStoreTests(unittest.TestCase):
 
         attempt = store.get_login_attempt("admin:127.0.0.1")
         self.assertEqual(sum(result["reserved"] for result in results), 5)
+        self.assertTrue(all("reservation_id" in result for result in results if result["reserved"]))
+        self.assertEqual(len({result["reservation_id"] for result in results if result["reserved"]}), 5)
         self.assertEqual(attempt["failures"], 5)
         self.assertEqual(attempt["locked_until"], now + 900)
+
+    def test_login_attempt_completion_is_conditional_on_unique_reservation(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        reservations = [store.reserve_login_attempt("account:client:1", now=100.0) for _ in range(5)]
+
+        self.assertTrue(all("reservation_id" in reservation for reservation in reservations))
+        self.assertTrue(hasattr(store, "complete_login_attempt"))
+        self.assertTrue(store.complete_login_attempt(reservations[0]["reservation_id"], succeeded=True, now=101.0))
+        self.assertFalse(store.complete_login_attempt(reservations[0]["reservation_id"], succeeded=True, now=101.0))
+        replacement = store.reserve_login_attempt("account:client:1", now=101.0)
+        blocked = store.reserve_login_attempt("account:client:1", now=101.0)
+
+        self.assertTrue(replacement["reserved"])
+        self.assertFalse(blocked["reserved"])
+        self.assertEqual(store.get_login_attempt("account:client:1")["failures"], 5)
+
+    def test_expired_login_reservations_and_buckets_are_cleaned(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        expired = store.reserve_login_attempt("expired-bucket", now=100.0)
+        self.assertIn("reservation_id", expired)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "UPDATE login_attempts SET window_started_at = 0, locked_until = 1, updated_at = 0 "
+                "WHERE rate_limit_key = ?",
+                ("expired-bucket",),
+            )
+            connection.execute(
+                "UPDATE login_attempt_reservations SET expires_at = 1 WHERE reservation_id = ?",
+                (expired["reservation_id"],),
+            )
+
+        current = store.reserve_login_attempt("current-bucket", now=2_000.0)
+
+        self.assertTrue(current["reserved"])
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM login_attempt_reservations WHERE reservation_id = ?",
+                    (expired["reservation_id"],),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM login_attempts WHERE rate_limit_key = 'expired-bucket'"
+                ).fetchone()[0],
+                0,
+            )
 
     def test_composite_event_sink_continues_after_a_sink_fails(self):
         from symphonz.service.event_log import CompositeEventSink, JsonlEventLog

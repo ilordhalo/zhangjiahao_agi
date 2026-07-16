@@ -21,6 +21,7 @@ SALT_BYTES = 16
 PASSWORD_HASH_BYTES = 32
 SESSION_SECRET_BYTES = 32
 TOKEN_BYTES = 32
+LOGIN_CLIENT_BUCKETS = 64
 SESSION_COOKIE_NAME = "symphonz_session"
 SCRYPT_ALGORITHM = "scrypt-v1"
 PBKDF2_ALGORITHM = "pbkdf2-sha256-v1"
@@ -178,9 +179,10 @@ class AuthService:
         )
         password_matches = verify_password(password, self.password_record)
         if not username_matches or not password_matches:
+            self.store.complete_login_attempt(reservation["reservation_id"], succeeded=False, now=now)
             raise AuthenticationError("Invalid username or password")
 
-        self.store.clear_login_attempt(rate_limit_key)
+        self.store.complete_login_attempt(reservation["reservation_id"], succeeded=True, now=now)
         token = secrets.token_urlsafe(TOKEN_BYTES)
         expires_at = now + self._session_seconds
         self.store.save_session(
@@ -239,8 +241,10 @@ class AuthService:
     def _normalize_username(username: str) -> str:
         return username.strip().casefold()
 
-    def _rate_limit_key(self, username: str, client_key: str) -> str:
-        return f"{self._normalize_username(username)}:{client_key.strip()}"
+    def _rate_limit_key(self, _username: str, client_key: str) -> str:
+        client_digest = hashlib.sha256(client_key.strip().encode("utf-8")).digest()
+        client_bucket = int.from_bytes(client_digest[:4], "big") % LOGIN_CLIENT_BUCKETS
+        return f"dashboard-account:client-{client_bucket:02d}"
 
     @property
     def _session_seconds(self) -> int:

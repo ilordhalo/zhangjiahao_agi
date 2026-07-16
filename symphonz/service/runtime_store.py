@@ -4,6 +4,7 @@ import base64
 import binascii
 import json
 from pathlib import Path
+import secrets
 import sqlite3
 import time
 
@@ -20,6 +21,8 @@ class RuntimeStore:
 
     TASK_PAGE_SNAPSHOT_TTL_SECONDS = 300.0
     TASK_PAGE_SNAPSHOT_CLEANUP_BATCH_SIZE = 100
+    LOGIN_RESERVATION_TTL_SECONDS = 120.0
+    LOGIN_ATTEMPT_CLEANUP_BATCH_SIZE = 100
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -410,6 +413,8 @@ class RuntimeStore:
             window_seconds=window_seconds,
             lock_seconds=lock_seconds,
         )
+        if reservation["reserved"]:
+            self.complete_login_attempt(reservation["reservation_id"], succeeded=False, now=now)
         return {
             "failures": reservation["failures"],
             "locked_until": reservation["locked_until"],
@@ -430,12 +435,18 @@ class RuntimeStore:
         current_time = time.time() if now is None else float(now)
 
         def write(connection: sqlite3.Connection) -> dict:
+            self._cleanup_expired_login_attempt_state(
+                connection,
+                now=current_time,
+                retention_seconds=max(window_seconds, lock_seconds),
+            )
             row = connection.execute(
                 "SELECT * FROM login_attempts WHERE rate_limit_key = ?", (rate_limit_key,)
             ).fetchone()
             if row is not None and row["locked_until"] is not None and float(row["locked_until"]) > current_time:
                 return {
                     "reserved": False,
+                    "reservation_id": None,
                     "failures": int(row["failures"]),
                     "locked_until": row["locked_until"],
                 }
@@ -451,7 +462,12 @@ class RuntimeStore:
                     "UPDATE login_attempts SET locked_until = ?, updated_at = ? WHERE rate_limit_key = ?",
                     (locked_until, current_time, rate_limit_key),
                 )
-                return {"reserved": False, "failures": failures, "locked_until": locked_until}
+                return {
+                    "reserved": False,
+                    "reservation_id": None,
+                    "failures": failures,
+                    "locked_until": locked_until,
+                }
             failures += 1
             locked_until = current_time + lock_seconds if failures >= max_attempts else None
             connection.execute(
@@ -466,7 +482,76 @@ class RuntimeStore:
                 """,
                 (rate_limit_key, failures, window_started_at, locked_until, current_time),
             )
-            return {"reserved": True, "failures": failures, "locked_until": locked_until}
+            reservation_id = secrets.token_urlsafe(24)
+            connection.execute(
+                """
+                INSERT INTO login_attempt_reservations (
+                    reservation_id, rate_limit_key, reserved_at, expires_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    reservation_id,
+                    rate_limit_key,
+                    current_time,
+                    current_time + self.LOGIN_RESERVATION_TTL_SECONDS,
+                ),
+            )
+            return {
+                "reserved": True,
+                "reservation_id": reservation_id,
+                "failures": failures,
+                "locked_until": locked_until,
+            }
+
+        return self._write(write)
+
+    def complete_login_attempt(
+        self, reservation_id: str, *, succeeded: bool, now: float | None = None
+    ) -> bool:
+        current_time = time.time() if now is None else float(now)
+
+        def write(connection: sqlite3.Connection) -> bool:
+            self._cleanup_expired_login_attempt_state(connection, now=current_time)
+            reservation = connection.execute(
+                "SELECT rate_limit_key FROM login_attempt_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+            if reservation is None:
+                return False
+            deleted = connection.execute(
+                "DELETE FROM login_attempt_reservations WHERE reservation_id = ?",
+                (reservation_id,),
+            ).rowcount
+            if deleted != 1:
+                return False
+            rate_limit_key = reservation["rate_limit_key"]
+            if succeeded:
+                active_reservations = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM login_attempt_reservations "
+                        "WHERE rate_limit_key = ? AND expires_at > ?",
+                        (rate_limit_key, current_time),
+                    ).fetchone()[0]
+                )
+                if active_reservations:
+                    connection.execute(
+                        """
+                        UPDATE login_attempts
+                        SET failures = ?, window_started_at = ?, locked_until = NULL, updated_at = ?
+                        WHERE rate_limit_key = ?
+                        """,
+                        (active_reservations, current_time, current_time, rate_limit_key),
+                    )
+                else:
+                    connection.execute(
+                        "DELETE FROM login_attempts WHERE rate_limit_key = ?", (rate_limit_key,)
+                    )
+            else:
+                connection.execute(
+                    "UPDATE login_attempts SET updated_at = ? WHERE rate_limit_key = ?",
+                    (current_time, rate_limit_key),
+                )
+            return True
 
         return self._write(write)
 
@@ -569,6 +654,17 @@ class RuntimeStore:
                     locked_until REAL,
                     updated_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS login_attempt_reservations (
+                    reservation_id TEXT PRIMARY KEY,
+                    rate_limit_key TEXT NOT NULL,
+                    reserved_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    FOREIGN KEY (rate_limit_key) REFERENCES login_attempts(rate_limit_key) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS login_attempt_reservations_expiry
+                    ON login_attempt_reservations(expires_at);
+                CREATE INDEX IF NOT EXISTS login_attempt_reservations_key
+                    ON login_attempt_reservations(rate_limit_key);
                 CREATE TABLE IF NOT EXISTS task_page_snapshots (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at REAL NOT NULL
@@ -592,6 +688,46 @@ class RuntimeStore:
                         "UPDATE reports SET linear_sync_status = sync_status WHERE sync_status IS NOT NULL"
                     )
             self._legacy_report_sync_status = "sync_status" in columns
+
+    def _cleanup_expired_login_attempt_state(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        now: float,
+        retention_seconds: float = 900.0,
+    ) -> None:
+        connection.execute(
+            """
+            DELETE FROM login_attempt_reservations
+            WHERE reservation_id IN (
+                SELECT reservation_id
+                FROM login_attempt_reservations
+                WHERE expires_at <= ?
+                ORDER BY expires_at, reservation_id
+                LIMIT ?
+            )
+            """,
+            (now, self.LOGIN_ATTEMPT_CLEANUP_BATCH_SIZE),
+        )
+        connection.execute(
+            """
+            DELETE FROM login_attempts
+            WHERE rate_limit_key IN (
+                SELECT attempts.rate_limit_key
+                FROM login_attempts AS attempts
+                WHERE attempts.updated_at <= ?
+                  AND (attempts.locked_until IS NULL OR attempts.locked_until <= ?)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM login_attempt_reservations AS reservations
+                      WHERE reservations.rate_limit_key = attempts.rate_limit_key
+                  )
+                ORDER BY attempts.updated_at, attempts.rate_limit_key
+                LIMIT ?
+            )
+            """,
+            (now - retention_seconds, now, self.LOGIN_ATTEMPT_CLEANUP_BATCH_SIZE),
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)

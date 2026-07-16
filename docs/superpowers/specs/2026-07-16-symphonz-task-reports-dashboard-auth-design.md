@@ -84,7 +84,7 @@ The runtime owns report storage, rendering, URL generation, and Linear synchroni
     ZHA-9/
 ```
 
-`.symphonz/auth.toml`, `.symphonz/artifacts/`, `.symphonz/logs/`, and `.symphonz/workspace/` are ignored by Git. `auth.toml` is atomically replaced from an exclusive same-directory `0600` temporary file after file and directory sync. Reads require a regular non-symlink file with exact mode `0600`; malformed or unsupported records fail closed with a configuration-regeneration error. Reports survive terminal workspace cleanup.
+`.symphonz/auth.toml`, `.symphonz/artifacts/`, `.symphonz/logs/`, and `.symphonz/workspace/` are ignored by Git. Auth I/O first pins `.symphonz` as a non-symlink directory file descriptor. Temporary creation, destination checks, reads, replacement, cleanup, and directory sync then use relative `dir_fd` operations so a parent-path swap cannot redirect them. `auth.toml` is atomically replaced from an exclusive same-directory `0600` temporary file after file and directory sync. Reads require a regular non-symlink file with exact mode `0600`; malformed or unsupported records fail closed with a configuration-regeneration error. Reports survive terminal workspace cleanup.
 
 ## Configuration
 
@@ -127,9 +127,9 @@ The dashboard has one configured user. Password records are versioned and use on
 
 Successful login creates a random 32-byte token. Only its SHA-256 digest is stored in the `dashboard_sessions` SQLite table. The browser receives the raw token in a `symphonz_session` cookie with `HttpOnly`, `SameSite=Lax`, `Path=/`, and `Max-Age` matching `session_days`. `Secure` is set automatically when `public_base_url` is HTTPS.
 
-Sessions store an irreversible configuration generation derived from `session_secret` plus the normalized configured username. They survive restarts only while that generation and username remain unchanged; credential-secret or username rotation invalidates existing sessions. Sessions expire after the configured duration and are deleted on logout.
+Sessions store an irreversible SHA-256 configuration generation derived only from the decoded 32-byte `session_secret`. The normalized configured username is stored as separate session metadata and checked independently with `hmac.compare_digest`. Sessions survive restarts only while both values remain unchanged; session-secret or username rotation invalidates existing sessions. Sessions expire after the configured duration and are deleted on logout.
 
-Login attempts are stored by normalized username and client address. Each request must atomically reserve one of five slots before password KDF work begins. Requests without a reservation are rejected without executing the KDF, and the SQLite write transaction ends before KDF work. The fifth reservation locks that key for fifteen minutes within the five-minute attempt window; a successful permitted login clears the reservation record.
+The single configured account uses exactly 64 stable client buckets derived from the submitted client address; submitted usernames never create bucket keys. Each request must atomically create a uniquely identified reservation for one of five slots before password KDF work begins. Requests without a reservation are rejected without executing the KDF, and the SQLite write transaction ends before KDF work. Completion is conditional on that reservation identity: success clears completed failures but preserves other in-flight reservations, while failure releases only its own reservation. The fifth reservation locks the bucket for fifteen minutes within the five-minute attempt window. Bounded transactional cleanup removes expired reservations and stale bucket rows.
 
 Every route except `GET /login`, `POST /login`, and `GET /healthz` requires authentication. The login handler accepts only form-encoded bodies within a small size limit. A validated `next` value may contain only an absolute path beginning with one `/` and must reject every character below U+0020 plus U+007F; this prevents open redirects and control-character response splitting. Logout is a POST operation.
 
@@ -298,7 +298,7 @@ HTML routes render complete first content for resilience. JavaScript progressive
 
 ## Verification Strategy
 
-- Unit tests for versioned scrypt/PBKDF2 verification, concurrent attempt reservation, session-generation rotation, expiration, logout, strict auth-file handling, cookie flags, and safe redirects including all ASCII controls.
+- Unit tests for versioned scrypt/PBKDF2 verification, bounded random-username rate limiting, unique concurrent attempt reservation and expiry, success/failure overlap, session-generation rotation, expiration, logout, parent-directory-safe auth-file handling, cookie flags, and safe redirects including all ASCII controls.
 - Unit tests for report schema limits, escaping, architecture rendering, atomic replacement, and stable URLs.
 - Unit tests for RuntimeStore migrations, pagination, filtering, redaction, error resolution, and concurrent access.
 - HTTP tests for login gates, authenticated APIs, task pages, report pages, logout, and missing resources.

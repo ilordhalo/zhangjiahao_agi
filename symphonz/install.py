@@ -9,7 +9,6 @@ from pathlib import Path
 import secrets
 import stat
 import subprocess
-import tempfile
 
 from symphonz.service.auth import DashboardAuth, PasswordRecord, hash_password, validate_password_record
 
@@ -118,26 +117,24 @@ def parse_toml_string(value: str) -> str:
 def write_auth_config(path: Path, password: str) -> DashboardAuth:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    _validate_auth_destination(path)
-    record = hash_password(password)
-    session_secret = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
-    content = "\n".join(
-        [
-            "[auth]",
-            f"algorithm = {toml_quote(record.algorithm)}",
-            f"salt = {toml_quote(record.salt)}",
-            f"password_hash = {toml_quote(record.password_hash)}",
-            f"session_secret = {toml_quote(session_secret)}",
-            "",
-        ]
-    )
+    directory_descriptor = _open_auth_parent(path)
     descriptor = -1
-    temporary_path: Path | None = None
+    temporary_name: str | None = None
     try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+        _validate_auth_destination(path, directory_descriptor)
+        record = hash_password(password)
+        session_secret = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+        content = "\n".join(
+            [
+                "[auth]",
+                f"algorithm = {toml_quote(record.algorithm)}",
+                f"salt = {toml_quote(record.salt)}",
+                f"password_hash = {toml_quote(record.password_hash)}",
+                f"session_secret = {toml_quote(session_secret)}",
+                "",
+            ]
         )
-        temporary_path = Path(temporary_name)
+        descriptor, temporary_name = _create_auth_temp(path.name, directory_descriptor)
         os.fchmod(descriptor, 0o600)
         auth_file = os.fdopen(descriptor, "w", encoding="utf-8")
         descriptor = -1
@@ -145,23 +142,25 @@ def write_auth_config(path: Path, password: str) -> DashboardAuth:
             auth_file.write(content)
             auth_file.flush()
             os.fsync(auth_file.fileno())
-        _validate_auth_destination(path)
-        os.replace(temporary_path, path)
-        temporary_path = None
-        directory_descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+        _validate_auth_destination(path, directory_descriptor)
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        temporary_name = None
+        os.fsync(directory_descriptor)
+        return DashboardAuth(password_record=record, session_secret=session_secret)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        if temporary_path is not None:
+        if temporary_name is not None:
             try:
-                temporary_path.unlink()
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
             except FileNotFoundError:
                 pass
-    return DashboardAuth(password_record=record, session_secret=session_secret)
+        os.close(directory_descriptor)
 
 
 def read_dashboard_auth(project_root: Path) -> DashboardAuth:
@@ -184,9 +183,25 @@ def read_dashboard_auth(project_root: Path) -> DashboardAuth:
     return DashboardAuth(password_record=record, session_secret=auth_values["session_secret"])
 
 
-def _validate_auth_destination(path: Path) -> None:
+def _open_auth_parent(path: Path) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        metadata = path.lstat()
+        descriptor = os.open(path.parent, flags)
+    except OSError as error:
+        raise RuntimeError(
+            f"Dashboard auth parent directory must be a directory and not a symbolic link: {path.parent}"
+        ) from error
+    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise RuntimeError(
+            f"Dashboard auth parent directory must be a directory and not a symbolic link: {path.parent}"
+        )
+    return descriptor
+
+
+def _validate_auth_destination(path: Path, directory_descriptor: int) -> None:
+    try:
+        metadata = os.stat(path.name, dir_fd=directory_descriptor, follow_symlinks=False)
     except FileNotFoundError:
         return
     if stat.S_ISLNK(metadata.st_mode):
@@ -195,17 +210,39 @@ def _validate_auth_destination(path: Path) -> None:
         raise RuntimeError(f"Dashboard auth configuration destination must be a regular file: {path}")
 
 
+def _create_auth_temp(filename: str, directory_descriptor: int) -> tuple[int, str]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    for _unused in range(100):
+        temporary_name = f".{filename}.{secrets.token_hex(12)}.tmp"
+        try:
+            descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_descriptor)
+            return descriptor, temporary_name
+        except FileExistsError:
+            continue
+    raise RuntimeError("Unable to create an exclusive dashboard auth temporary file")
+
+
 def _read_private_auth_file(path: Path) -> str:
     try:
-        metadata = path.lstat()
+        directory_descriptor = _open_auth_parent(path)
+    except RuntimeError as error:
+        raise _auth_config_error(path, str(error)) from error
+    try:
+        _validate_auth_destination(path, directory_descriptor)
     except FileNotFoundError as error:
+        os.close(directory_descriptor)
         raise _auth_config_error(path, "file does not exist") from error
-    if stat.S_ISLNK(metadata.st_mode):
-        raise _auth_config_error(path, "file must not be a symbolic link")
+    except RuntimeError as error:
+        os.close(directory_descriptor)
+        raise _auth_config_error(path, str(error)) from error
 
     descriptor = -1
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_descriptor,
+        )
         opened_metadata = os.fstat(descriptor)
         if not stat.S_ISREG(opened_metadata.st_mode):
             raise _auth_config_error(path, "file must be a regular file")
@@ -220,6 +257,7 @@ def _read_private_auth_file(path: Path) -> str:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        os.close(directory_descriptor)
 
 
 def _decode_auth_value(value: str, field: str, expected_bytes: int) -> bytes:

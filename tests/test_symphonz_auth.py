@@ -204,6 +204,90 @@ class AuthServiceTests(unittest.TestCase):
         self.assertEqual(first_results, [AuthenticationError] * 5)
         self.assertEqual(extra_results, [LoginLockedError] * 5)
 
+    def test_random_usernames_share_a_bounded_kdf_budget(self):
+        service = self.make_service()
+
+        with patch("symphonz.service.auth.verify_password", return_value=False) as verify:
+            for index in range(5):
+                with self.assertRaises(AuthenticationError):
+                    service.login(f"random-user-{index}", "incorrect", "192.168.1.8")
+            with self.assertRaises(AuthenticationError) as locked:
+                service.login("another-random-user", "incorrect", "192.168.1.8")
+
+        self.assertEqual(verify.call_count, 5)
+        self.assertIsInstance(locked.exception, LoginLockedError)
+        with sqlite3.connect(self.database) as connection:
+            keys = [row[0] for row in connection.execute("SELECT rate_limit_key FROM login_attempts")]
+        self.assertLessEqual(len(keys), 1)
+        self.assertFalse(any("random-user" in key for key in keys))
+
+    def test_success_does_not_release_other_in_flight_reservations(self):
+        service = self.make_service()
+        release_failures = threading.Event()
+        initial_entered = threading.Event()
+        second_entered = threading.Event()
+        four_locked = threading.Event()
+        entered_lock = threading.Lock()
+        initial_count = 0
+        second_count = 0
+        locked_count = 0
+
+        def overlapping_verification(password, _record):
+            nonlocal initial_count, second_count
+            if password == "correct":
+                with entered_lock:
+                    initial_count += 1
+                    if initial_count == 5:
+                        initial_entered.set()
+                initial_entered.wait(timeout=2)
+                return True
+            if password == "first-wave":
+                with entered_lock:
+                    initial_count += 1
+                    if initial_count == 5:
+                        initial_entered.set()
+                release_failures.wait(timeout=3)
+                return False
+            with entered_lock:
+                second_count += 1
+                second_entered.set()
+            release_failures.wait(timeout=3)
+            return False
+
+        def attempt(password):
+            nonlocal locked_count
+            try:
+                return service.login("admin", password, "192.168.1.8")
+            except AuthenticationError as error:
+                if isinstance(error, LoginLockedError):
+                    with entered_lock:
+                        locked_count += 1
+                        if locked_count == 4:
+                            four_locked.set()
+                return type(error)
+
+        with patch("symphonz.service.auth.verify_password", side_effect=overlapping_verification):
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                successful = executor.submit(attempt, "correct")
+                first_failures = [executor.submit(attempt, "first-wave") for _ in range(4)]
+                self.assertTrue(initial_entered.wait(timeout=2))
+                self.assertTrue(successful.result(timeout=2).token)
+
+                second_wave = [executor.submit(attempt, "second-wave") for _ in range(5)]
+                self.assertTrue(second_entered.wait(timeout=2))
+                try:
+                    self.assertTrue(four_locked.wait(timeout=2))
+                    self.assertEqual(second_count, 1)
+                finally:
+                    release_failures.set()
+
+                first_results = [future.result(timeout=2) for future in first_failures]
+                second_results = [future.result(timeout=2) for future in second_wave]
+
+        self.assertEqual(first_results, [AuthenticationError] * 4)
+        self.assertEqual(second_results.count(AuthenticationError), 1)
+        self.assertEqual(second_results.count(LoginLockedError), 4)
+
     def test_five_concurrent_failures_lock_normalized_username_and_client_key(self):
         service = self.make_service()
 
@@ -216,7 +300,9 @@ class AuthServiceTests(unittest.TestCase):
 
         with self.assertRaises(LoginLockedError):
             service.login("admin", "correct", "192.168.1.8")
-        attempt_record = RuntimeStore(self.database).get_login_attempt("admin:192.168.1.8")
+        attempt_record = RuntimeStore(self.database).get_login_attempt(
+            service._rate_limit_key("admin", "192.168.1.8")
+        )
         self.assertEqual(attempt_record["failures"], 5)
         self.assertGreater(attempt_record["locked_until"], self.now)
 
@@ -227,7 +313,9 @@ class AuthServiceTests(unittest.TestCase):
 
         service.login("admin", "correct", "192.168.1.8")
 
-        self.assertIsNone(RuntimeStore(self.database).get_login_attempt("admin:192.168.1.8"))
+        self.assertIsNone(
+            RuntimeStore(self.database).get_login_attempt(service._rate_limit_key("admin", "192.168.1.8"))
+        )
 
 
 if __name__ == "__main__":

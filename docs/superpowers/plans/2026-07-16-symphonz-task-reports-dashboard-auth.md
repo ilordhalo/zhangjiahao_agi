@@ -82,20 +82,24 @@ git commit -m "feat(runtime): persist task history and errors"
 **Files:**
 - Create: `symphonz/service/auth.py`
 - Modify: `symphonz/install.py`
+- Modify: `symphonz/service/runtime_store.py`
 - Test: `tests/test_symphonz_auth.py`
 - Test: `tests/test_symphonz_cli.py`
+- Test: `tests/test_symphonz_service.py`
 
 **Interfaces:**
 - Produces: `hash_password(password) -> PasswordRecord`, `verify_password(...) -> bool`, `AuthService(store, username, password_record, session_secret, session_days, secure_cookie)`, `authenticate_cookie(header)`, `login(username, password, client_key)`, `logout(token)`.
 - Produces: `write_auth_config(path, password)` and `read_dashboard_auth(project_root)`.
-- Consumes: `RuntimeStore` session operations and atomic `reserve_login_attempt(...)` from Task 1.
+- Consumes: `RuntimeStore` session operations plus unique, conditionally completed login-attempt reservations.
 
 - [ ] **Step 1: Write failing versioned KDF, reservation, session-generation, auth-file, redirect, expiry, and logout tests**
 
 ```python
 def test_login_session_survives_auth_service_restart(self):
     token = first.login("admin", "correct", "192.168.1.8").token
-    second = AuthService(RuntimeStore(db), "admin", record, session_days=30)
+    second = AuthService(
+        RuntimeStore(db), "admin", record, session_secret=session_secret, session_days=30
+    )
     self.assertEqual(second.authenticate(token).username, "admin")
 ```
 
@@ -106,7 +110,7 @@ Expected: FAIL because `symphonz.service.auth` does not exist.
 
 - [ ] **Step 3: Implement standard-library versioned KDFs, reservation-first lockout, generation-bound sessions, token hashing, persistent expiry, and logout**
 
-New records use `scrypt-v1` with a 16-byte salt, `n=2**14`, `r=8`, `p=1`, and 32-byte output when `hashlib.scrypt` exists. Otherwise they use `pbkdf2-sha256-v1` with exactly 600,000 iterations and 32-byte output. Verification dispatches by algorithm with `hmac.compare_digest`; a runtime without scrypt rejects loaded `scrypt-v1` records, and no Node/subprocess KDF is allowed. Login reserves one of five attempt slots atomically before KDF work and releases the SQLite transaction before deriving a password hash. Sessions include an irreversible generation derived from `session_secret`, so credential or username rotation invalidates existing tokens.
+New records use `scrypt-v1` with a 16-byte salt, `n=2**14`, `r=8`, `p=1`, and 32-byte output when `hashlib.scrypt` exists. Otherwise they use `pbkdf2-sha256-v1` with exactly 600,000 iterations and 32-byte output. Verification dispatches by algorithm with `hmac.compare_digest`; a runtime without scrypt rejects loaded `scrypt-v1` records, and no Node/subprocess KDF is allowed. Login maps every submitted username into the single configured account's fixed 64 client buckets, atomically creates a unique reservation before KDF work, and conditionally completes only that reservation afterward. Expired reservations and stale buckets are cleaned transactionally. Sessions store an irreversible generation derived only from `session_secret` and separately store the normalized configured username; a mismatch in either value invalidates existing tokens.
 
 ```python
 @dataclass(frozen=True)
@@ -116,6 +120,9 @@ class PasswordRecord:
     password_hash: str
 
 class AuthService:
+    def __init__(
+        self, store, username, password_record, session_secret, session_days, secure_cookie=False
+    ): ...
     def login(self, username: str, password: str, client_key: str) -> LoginResult: ...
     def authenticate(self, token: str) -> Session | None: ...
     def logout(self, token: str) -> None: ...
@@ -124,12 +131,12 @@ class AuthService:
 - [ ] **Step 4: Add strict auth-file, atomic replacement, control-character, and Git-ignore tests**
 
 Run: `python3 -m unittest tests.test_symphonz_auth tests.test_symphonz_cli.ConfigTests -v`
-Expected: PASS, including exact mode `0600`, regular non-symlink validation, strict Base64 and record lengths, exclusive same-directory atomic replacement with file/directory sync, no plaintext password, and rejection of U+0000-U+001F plus U+007F in redirect paths.
+Expected: PASS, including exact mode `0600`, regular non-symlink validation, strict Base64 and record lengths, a pinned non-symlink parent directory fd, exclusive same-directory atomic replacement with file/directory sync through `dir_fd` operations, no plaintext password, and rejection of U+0000-U+001F plus U+007F in redirect paths.
 
 - [ ] **Step 5: Commit the authentication slice**
 
 ```bash
-git add symphonz/service/auth.py symphonz/install.py tests/test_symphonz_auth.py tests/test_symphonz_cli.py
+git add symphonz/service/auth.py symphonz/service/runtime_store.py symphonz/install.py tests/test_symphonz_auth.py tests/test_symphonz_cli.py tests/test_symphonz_service.py
 git commit -m "feat(auth): add persistent LAN dashboard sessions"
 ```
 
