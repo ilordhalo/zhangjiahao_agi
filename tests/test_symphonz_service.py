@@ -3330,6 +3330,221 @@ class RuntimeStoreTests(unittest.TestCase):
             self.assertEqual(remaining_expired, 2)
 
 
+class RunnerCompositionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.logs_root = self.root / "logs"
+
+    def test_runtime_collaborators_persist_direct_report_error_once_per_sink(self):
+        from symphonz.service.models import Issue
+        from symphonz.service.runner import build_runtime_collaborators
+        from symphonz.service.runtime_store import RuntimeStore
+
+        class FailingLinear:
+            def graphql(self, query, variables):
+                raise RuntimeError("Linear is temporarily unavailable")
+
+        issue = Issue(id="issue-1", identifier="SYM-1", title="Publish report", state="Todo")
+        collaborators = build_runtime_collaborators(self.logs_root, FailingLinear())
+        publisher = collaborators.report_publisher_factory(issue)
+        try:
+            result = publisher.publish(self._report_payload(issue))
+        finally:
+            publisher.close()
+
+        reopened = RuntimeStore(self.logs_root / "runtime.sqlite3")
+        errors = reopened.list_errors(issue_identifier=issue.identifier, stage="report_sync")["items"]
+        error_lines = (self.logs_root / "errors.jsonl").read_text().splitlines()
+        report = reopened.get_report(issue.identifier)
+
+        self.assertEqual(result["linear_sync_status"], "pending")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(len(error_lines), 1)
+        self.assertEqual(json.loads(error_lines[0])["message"], "Linear is temporarily unavailable")
+        self.assertEqual(report["url"], "http://127.0.0.1/issues/SYM-1/report")
+        self.assertTrue((collaborators.artifacts_root / "SYM-1" / report["json_path"]).is_file())
+
+    def test_run_service_once_persists_lifecycle_task_and_report_without_dashboard(self):
+        from dataclasses import replace
+        from symphonz.service.models import Issue
+        from symphonz.service.runner import run_service
+        from symphonz.service.runtime_store import RuntimeStore
+
+        issue = Issue(id="issue-1", identifier="SYM-1", title="Run once", state="Todo")
+
+        class FakeLinear:
+            def fetch_candidate_issues(self, active_states):
+                return [issue]
+
+            def fetch_issues_by_ids(self, ids):
+                return [replace(issue, state="Done")]
+
+            def fetch_issues_by_states(self, states):
+                return []
+
+            def graphql(self, query, variables):
+                if "SymphonzFindReportComment" in query:
+                    return {
+                        "data": {
+                            "issue": {
+                                "comments": {
+                                    "nodes": [],
+                                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                }
+                            }
+                        }
+                    }
+                if "SymphonzCreateReportComment" in query:
+                    return {
+                        "data": {
+                            "commentCreate": {
+                                "success": True,
+                                "comment": {"id": "comment-1"},
+                            }
+                        }
+                    }
+                raise AssertionError(query)
+
+        class FakeCodexAppServer:
+            constructor_arguments = None
+            tool_names = None
+
+            def __init__(self, command, **kwargs):
+                type(self).constructor_arguments = {"command": command, **kwargs}
+
+            def run_turns(self, **kwargs):
+                type(self).tool_names = [spec["name"] for spec in kwargs["dynamic_tool_specs"]]
+                report_result = kwargs["dynamic_tool_executor"](
+                    "symphonz_report",
+                    RunnerCompositionTests._report_payload(issue),
+                )
+                if not report_result["success"]:
+                    raise AssertionError(report_result["output"])
+                kwargs["on_event"](
+                    {
+                        "type": "session_started",
+                        "session_id": "session-1",
+                        "thread_id": "thread-1",
+                        "turn_id": "turn-1",
+                        "turn_count": 1,
+                        "process_id": 123,
+                    }
+                )
+                return {
+                    "session_id": "session-1",
+                    "thread_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "turn_count": 1,
+                    "result": {},
+                }
+
+        workflow_path = self._write_workflow()
+        linear = FakeLinear()
+        with (
+            mock.patch("symphonz.service.runner.build_linear_client", return_value=linear),
+            mock.patch("symphonz.service.runner.CodexAppServer", FakeCodexAppServer),
+            mock.patch("symphonz.service.runner.DashboardServer") as dashboard_server,
+        ):
+            result = run_service(
+                project_root=self.root,
+                workflow_path=workflow_path,
+                logs_root=self.logs_root,
+                port=None,
+                once=True,
+                host="localhost",
+                public_base_url="https://reports.example.test/base/",
+                dashboard_username="admin",
+                session_days=30,
+            )
+
+        reopened = RuntimeStore(self.logs_root / "runtime.sqlite3")
+        task = reopened.get_task(issue.identifier)
+        report = reopened.get_report(issue.identifier)
+        event_types = [item["type"] for item in reopened.list_events(limit=50)["items"]]
+        runtime_types = [
+            json.loads(line)["type"]
+            for line in (self.logs_root / "runtime.jsonl").read_text().splitlines()
+        ]
+
+        self.assertEqual(result, 0)
+        dashboard_server.assert_not_called()
+        self.assertNotIn("dynamic_tool_executor", FakeCodexAppServer.constructor_arguments)
+        self.assertEqual(FakeCodexAppServer.tool_names, ["linear_graphql", "symphonz_report"])
+        self.assertEqual(task["status"], "completed")
+        self.assertEqual(task["codex_session_id"], "session-1")
+        self.assertEqual(report["linear_sync_status"], "synced")
+        self.assertEqual(
+            report["url"],
+            "https://reports.example.test/base/issues/SYM-1/report",
+        )
+        self.assertIn("service_started", event_types)
+        self.assertIn("service_stopped", event_types)
+        self.assertEqual(runtime_types.count("service_started"), 1)
+        self.assertEqual(runtime_types.count("service_stopped"), 1)
+
+    def _write_workflow(self):
+        path = self.root / "WORKFLOW.md"
+        path.write_text(
+            """---
+tracker:
+  active_states:
+    - Todo
+  terminal_states:
+    - Done
+  required_labels: []
+workspace:
+  root: workspace
+hooks: {}
+agent:
+  max_concurrent_agents: 1
+  max_turns: 1
+  max_attempts: 1
+codex:
+  command: ignored app-server
+---
+Work on {{ issue.identifier }}.
+"""
+        )
+        return path
+
+    @staticmethod
+    def _report_payload(issue):
+        return {
+            "operation": "publish",
+            "issue_id": issue.id,
+            "issue_identifier": issue.identifier,
+            "title": issue.title,
+            "summary": "The implementation report is ready.",
+            "goal": "Persist a structured implementation report.",
+            "scope": "Runner composition.",
+            "architecture": {
+                "nodes": [{"id": "runner", "label": "Runner"}],
+                "edges": [],
+            },
+            "implementation": ["Compose runtime collaborators."],
+            "decisions": [],
+            "changed_files": ["symphonz/service/runner.py"],
+            "validation": [
+                {
+                    "command": "python3 -m unittest tests.test_symphonz_service",
+                    "result": "passed",
+                    "evidence": "Focused service tests passed.",
+                }
+            ],
+            "risks": [],
+            "follow_ups": [],
+            "review": {
+                "provider": "gitlab",
+                "url": "https://git.example.test/group/project/-/merge_requests/1",
+                "branch": "codex/task-5e1",
+                "commit": "0123456789abcdef",
+                "target": "main",
+            },
+        }
+
+
 class OrchestratorAndDashboardTests(unittest.TestCase):
     def test_orchestrator_one_shot_runs_issue_and_records_state(self):
         from symphonz.service.models import Issue
