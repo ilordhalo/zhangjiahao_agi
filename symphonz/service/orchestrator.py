@@ -52,6 +52,7 @@ class Orchestrator:
             else None
         )
         self._report_sync_future: Future | None = None
+        self._report_sync_lock = threading.Lock()
         self._futures: dict[str, Future] = {}
         self._cancel_events: dict[str, threading.Event] = {}
         self._issues: dict[str, Issue] = {}
@@ -60,8 +61,9 @@ class Orchestrator:
         self._closed = False
 
     def tick(self) -> None:
-        if self._closed:
-            return
+        with self._report_sync_lock:
+            if self._closed:
+                return
         self._collect_report_sync()
         self._schedule_report_sync()
         self._collect_finished()
@@ -94,19 +96,28 @@ class Orchestrator:
             self.state.add_event("startup_cleanup_failed", f"Startup cleanup failed: {error}")
             return
         for issue in terminal_issues:
+            completed = self._entry(issue, status="completed")
+            completed.pop("started_at", None)
+            completed.update({"completed_at": time.time(), "completion_reason": "terminal"})
+            with self.state.lock:
+                self.state.completed[issue.id] = completed
+            self._persist_entry(issue, completed)
             self._cleanup_terminal_workspace(issue)
 
     def shutdown(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._report_sync_lock:
+            if self._closed:
+                return
+            self._closed = True
+            report_sync_executor = self._report_sync_executor
+            self._report_sync_executor = None
         with self.state.lock:
             for event in self._cancel_events.values():
                 event.set()
         self.executor.shutdown(wait=True, cancel_futures=True)
         self._collect_finished()
-        if self._report_sync_executor is not None:
-            self._report_sync_executor.shutdown(wait=True)
+        if report_sync_executor is not None:
+            report_sync_executor.shutdown(wait=True)
             self._collect_report_sync()
 
     def _dispatch_candidates(self) -> None:
@@ -145,13 +156,12 @@ class Orchestrator:
                 self._reschedule_tracker_retry(issue, entry, error)
                 continue
             if not refreshed:
-                self._release(issue_id)
+                self._finish_cancelled(issue, entry, "missing")
                 continue
             issue = refreshed[0]
             if not self._eligible(issue):
-                if self._terminal(issue):
-                    self._cleanup_terminal_workspace(issue)
-                self._release(issue_id)
+                reason = "terminal" if self._terminal(issue) else "ineligible"
+                self._finish_cancelled(issue, entry, reason)
                 continue
             self._dispatch(issue, already_claimed=True)
 
@@ -266,11 +276,9 @@ class Orchestrator:
 
     def _handle_worker_error(self, issue: Issue, entry: dict, error: Exception, cancel_reason: str | None) -> None:
         message = str(error)
-        if self._closed and not cancel_reason:
-            self._finish_cancelled(issue, entry, "shutdown")
-            return
-        if cancel_reason:
-            self._finish_cancelled(issue, entry, cancel_reason)
+        finish_reason = cancel_reason or ("shutdown" if self._closed else None)
+        if finish_reason:
+            self._finish_cancelled(issue, entry, finish_reason)
             return
         if "turn_input_required" in message or "approval_required" in message:
             blocked = dict(entry)
@@ -350,6 +358,7 @@ class Orchestrator:
             self.state.retrying.pop(issue.id, None)
             self._retry_issues.pop(issue.id, None)
             self.state.blocked[issue.id] = blocked
+            self._issues[issue.id] = issue
             self.state.claimed.add(issue.id)
         self._persist_entry(issue, blocked)
         self.state.add_event(
@@ -416,11 +425,15 @@ class Orchestrator:
             if blocked is None:
                 continue
             if issue is None or not self._eligible(issue):
-                with self.state.lock:
-                    self.state.blocked.pop(issue_id, None)
-                if issue is not None and self._terminal(issue):
-                    self._cleanup_terminal_workspace(issue)
-                self._release(issue_id)
+                final_issue = issue
+                if final_issue is None:
+                    with self.state.lock:
+                        final_issue = self._issues.get(issue_id)
+                if final_issue is not None:
+                    reason = "terminal" if issue is not None and self._terminal(issue) else (
+                        "missing" if issue is None else "ineligible"
+                    )
+                    self._finish_cancelled(final_issue, blocked, reason)
             elif issue.state != blocked.get("state"):
                 with self.state.lock:
                     self.state.blocked.pop(issue_id, None)
@@ -516,18 +529,20 @@ class Orchestrator:
         self.state.add_event("codex_event", event.get("type", "codex_event"), issue.identifier, event=event)
 
     def _schedule_report_sync(self) -> None:
-        if self._report_sync_executor is None or self._report_sync_future is not None:
-            return
-        self._report_sync_future = self._report_sync_executor.submit(
-            self.report_synchronizer.sync_pending,
-            time.time(),
-        )
+        with self._report_sync_lock:
+            if self._closed or self._report_sync_executor is None or self._report_sync_future is not None:
+                return
+            self._report_sync_future = self._report_sync_executor.submit(
+                self.report_synchronizer.sync_pending,
+                time.time(),
+            )
 
     def _collect_report_sync(self) -> None:
-        future = self._report_sync_future
-        if future is None or not future.done():
-            return
-        self._report_sync_future = None
+        with self._report_sync_lock:
+            future = self._report_sync_future
+            if future is None or not future.done():
+                return
+            self._report_sync_future = None
         try:
             future.result()
         except Exception as error:

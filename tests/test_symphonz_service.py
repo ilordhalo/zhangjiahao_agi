@@ -1729,6 +1729,44 @@ class OrchestratorHardeningTests(unittest.TestCase):
         self.assertEqual(snapshot["counts"]["claimed"], 0)
         self.assertEqual(snapshot["counts"]["retrying"], 0)
 
+    def test_worker_error_during_shutdown_finishes_cancelled_once(self):
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+
+        class RecordingStore:
+            def __init__(inner_self):
+                inner_self.store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+                inner_self.entries = []
+
+            def upsert_issue(inner_self, entry):
+                inner_self.entries.append(dict(entry))
+                inner_self.store.upsert_issue(entry)
+
+        issue = self.issue(1)
+        codex = self.RecordingCodex(wait_for_cancel=True)
+        store = RecordingStore()
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([issue]),
+            codex,
+            runtime_store=store,
+        )
+        orchestrator.tick()
+        deadline = time.time() + 1
+        while not codex.calls and time.time() < deadline:
+            time.sleep(0.01)
+
+        orchestrator.shutdown()
+
+        cancelled_writes = [entry for entry in store.entries if entry.get("status") == "cancelled"]
+        cancelled_events = [
+            event for event in orchestrator.state.snapshot()["events"] if event["type"] == "issue_cancelled"
+        ]
+        self.assertEqual(len(cancelled_writes), 1)
+        self.assertEqual(len(cancelled_events), 1)
+        self.assertEqual(orchestrator.state.snapshot()["counts"]["completed"], 1)
+
     def test_tick_schedules_pending_report_sync_without_candidate_issues(self):
         from symphonz.service.orchestrator import Orchestrator
 
@@ -1858,6 +1896,146 @@ class OrchestratorHardeningTests(unittest.TestCase):
         self.assertEqual(failures[0]["data"]["stage"], "report_sync")
         self.assertEqual(failures[0]["data"]["error_type"], "RuntimeError")
         self.assertEqual(failures[0]["data"]["error"], "pending sync failed")
+
+    def test_concurrent_ticks_submit_exactly_one_report_sync(self):
+        from concurrent.futures import Future
+        from symphonz.service.orchestrator import Orchestrator
+
+        class ContendedExecutor:
+            def __init__(inner_self):
+                inner_self.calls = 0
+                inner_self.second_submit = threading.Event()
+                inner_self.futures = []
+                inner_self.lock = threading.Lock()
+
+            def submit(inner_self, function, *args):
+                with inner_self.lock:
+                    inner_self.calls += 1
+                    call = inner_self.calls
+                if call == 1:
+                    inner_self.second_submit.wait(timeout=0.2)
+                else:
+                    inner_self.second_submit.set()
+                future = Future()
+                future.set_result(0)
+                inner_self.futures.append(future)
+                return future
+
+            def shutdown(inner_self, wait=True):
+                return None
+
+        class ContendedOrchestrator(Orchestrator):
+            def __init__(inner_self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                inner_self.schedule_barrier = threading.Barrier(2)
+
+            def _schedule_report_sync(inner_self):
+                inner_self.schedule_barrier.wait(timeout=1)
+                return super()._schedule_report_sync()
+
+        orchestrator = ContendedOrchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([]),
+            self.RecordingCodex(),
+            report_synchronizer=mock.Mock(sync_pending=lambda now: 0),
+        )
+        original_executor = orchestrator._report_sync_executor
+        original_executor.shutdown(wait=True)
+        executor = ContendedExecutor()
+        orchestrator._report_sync_executor = executor
+        errors = []
+
+        threads = [threading.Thread(target=lambda: self._run_and_record(orchestrator.tick, errors)) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(executor.calls, 1)
+        orchestrator.shutdown()
+
+    def test_concurrent_report_sync_collection_records_exception_once(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        class ContendedFailureFuture:
+            def __init__(inner_self):
+                inner_self.done_barrier = threading.Barrier(2)
+                inner_self.result_calls = 0
+
+            def done(inner_self):
+                try:
+                    inner_self.done_barrier.wait(timeout=0.2)
+                except threading.BrokenBarrierError:
+                    pass
+                return True
+
+            def result(inner_self):
+                inner_self.result_calls += 1
+                raise RuntimeError("collect once")
+
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([]),
+            self.RecordingCodex(),
+            report_synchronizer=mock.Mock(sync_pending=lambda now: 0),
+        )
+        self.addCleanup(orchestrator.shutdown)
+        future = ContendedFailureFuture()
+        orchestrator._report_sync_future = future
+        threads = [threading.Thread(target=orchestrator._collect_report_sync) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        failures = [
+            event for event in orchestrator.state.snapshot()["events"] if event["type"] == "report_sync_failed"
+        ]
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(future.result_calls, 1)
+        self.assertEqual(len(failures), 1)
+
+    def test_concurrent_tick_and_shutdown_do_not_submit_report_sync_after_shutdown(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        class PausingOrchestrator(Orchestrator):
+            def __init__(inner_self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                inner_self.tick_collecting = threading.Event()
+                inner_self.release_tick = threading.Event()
+
+            def _collect_report_sync(inner_self):
+                if threading.current_thread().name == "contended-tick":
+                    inner_self.tick_collecting.set()
+                    if not inner_self.release_tick.wait(timeout=2):
+                        raise RuntimeError("tick was not released")
+                return super()._collect_report_sync()
+
+        orchestrator = PausingOrchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([]),
+            self.RecordingCodex(),
+            report_synchronizer=mock.Mock(sync_pending=lambda now: 0),
+        )
+        errors = []
+        tick_thread = threading.Thread(
+            name="contended-tick",
+            target=lambda: self._run_and_record(orchestrator.tick, errors),
+        )
+        tick_thread.start()
+        self.assertTrue(orchestrator.tick_collecting.wait(timeout=1))
+
+        orchestrator.shutdown()
+        orchestrator.release_tick.set()
+        tick_thread.join(timeout=2)
+
+        self.assertFalse(tick_thread.is_alive())
+        self.assertEqual(errors, [])
 
     def test_concurrent_issues_use_isolated_report_publishers_and_close_each(self):
         from symphonz.service.orchestrator import Orchestrator
@@ -2120,6 +2298,229 @@ class OrchestratorHardeningTests(unittest.TestCase):
         self.assertIsNotNone(cancelled["cancelled_at"])
         self.assertIsNotNone(cancelled["completed_at"])
         self.assertEqual(cancelled["workspace_cleanup_status"], "removed")
+
+    def test_retry_refresh_missing_persists_final_cancelled_row(self):
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            linear,
+            self.RecordingCodex(),
+            clock=lambda: 0.0,
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+        orchestrator._schedule_retry(issue, "failure", delay=0)
+        linear.issues.clear()
+
+        orchestrator.tick()
+
+        cancelled = store.get_task(issue.identifier)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["linear_state"], "Todo")
+        self.assertEqual(cancelled["cancellation_reason"], "missing")
+        self.assertIsNotNone(cancelled["completed_at"])
+        self.assertIsNotNone(cancelled["cancelled_at"])
+        self.assertEqual(orchestrator.state.snapshot()["counts"]["claimed"], 0)
+
+    def test_retry_refresh_ineligible_persists_latest_linear_state(self):
+        from dataclasses import replace
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            linear,
+            self.RecordingCodex(),
+            clock=lambda: 0.0,
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+        orchestrator._schedule_retry(issue, "failure", delay=0)
+        linear.issues[issue.id] = replace(issue, state="Backlog")
+
+        orchestrator.tick()
+
+        cancelled = store.get_task(issue.identifier)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["linear_state"], "Backlog")
+        self.assertEqual(cancelled["cancellation_reason"], "ineligible")
+        self.assertIsNotNone(cancelled["cancelled_at"])
+
+    def test_retry_refresh_terminal_persists_cancelled_row_and_cleanup(self):
+        from dataclasses import replace
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+        from symphonz.service.workspace import workspace_path
+
+        issue = self.issue(1)
+        terminal = replace(issue, state="Done")
+        linear = self.FakeLinear([issue])
+        store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+        workspace = workspace_path(self.root, self.workflow, issue)
+        workspace.mkdir(parents=True)
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            linear,
+            self.RecordingCodex(),
+            clock=lambda: 0.0,
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+        orchestrator._schedule_retry(issue, "failure", delay=0)
+        linear.issues[issue.id] = terminal
+
+        orchestrator.tick()
+
+        cancelled = store.get_task(issue.identifier)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["linear_state"], "Done")
+        self.assertEqual(cancelled["cancellation_reason"], "terminal")
+        self.assertEqual(cancelled["workspace_cleanup_status"], "removed")
+        self.assertFalse(workspace.exists())
+
+    def test_blocked_refresh_missing_persists_final_cancelled_row(self):
+        self._assert_blocked_refresh_finalized(None, "missing", "Todo")
+
+    def test_attempt_limit_block_refresh_missing_uses_cached_issue_for_final_row(self):
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            linear,
+            self.RecordingCodex(),
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+        orchestrator._block_at_attempt_limit(issue, 5)
+        linear.issues.clear()
+
+        orchestrator.tick()
+
+        cancelled = store.get_task(issue.identifier)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["cancellation_reason"], "missing")
+        self.assertEqual(orchestrator.state.snapshot()["counts"]["claimed"], 0)
+
+    def test_blocked_refresh_ineligible_persists_latest_linear_state(self):
+        from dataclasses import replace
+
+        issue = self.issue(1)
+        self._assert_blocked_refresh_finalized(replace(issue, state="Backlog"), "ineligible", "Backlog")
+
+    def test_blocked_refresh_terminal_persists_cancelled_row_and_cleanup(self):
+        from dataclasses import replace
+        from symphonz.service.workspace import workspace_path
+
+        issue = self.issue(1)
+        workspace = workspace_path(self.root, self.workflow, issue)
+        workspace.mkdir(parents=True)
+
+        cancelled = self._assert_blocked_refresh_finalized(replace(issue, state="Done"), "terminal", "Done")
+
+        self.assertEqual(cancelled["workspace_cleanup_status"], "removed")
+        self.assertFalse(workspace.exists())
+
+    def test_startup_terminal_cleanup_persists_completed_row_before_cleanup(self):
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+        from symphonz.service.workspace import workspace_path
+
+        class RecordingStore:
+            def __init__(inner_self):
+                inner_self.store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+                inner_self.entries = []
+
+            def upsert_issue(inner_self, entry):
+                inner_self.entries.append(dict(entry))
+                inner_self.store.upsert_issue(entry)
+
+            def get_task(inner_self, identifier):
+                return inner_self.store.get_task(identifier)
+
+        issue = self.issue(1, state="Done")
+        workspace = workspace_path(self.root, self.workflow, issue)
+        workspace.mkdir(parents=True)
+        store = RecordingStore()
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([issue]),
+            self.RecordingCodex(),
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.startup_cleanup()
+
+        completed = store.get_task(issue.identifier)
+        self.assertEqual(store.entries[0]["status"], "completed")
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["linear_state"], "Done")
+        self.assertEqual(completed["completion_reason"], "terminal")
+        self.assertIsNotNone(completed["completed_at"])
+        self.assertEqual(completed["workspace_cleanup_status"], "removed")
+        self.assertFalse(workspace.exists())
+
+    def _assert_blocked_refresh_finalized(self, refreshed_issue, reason, expected_state):
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+
+        class BlockedCodex(self.RecordingCodex):
+            def run_turns(inner_self, **kwargs):
+                inner_self.calls.append(kwargs)
+                raise RuntimeError("turn_input_required")
+
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            linear,
+            BlockedCodex(),
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+        if refreshed_issue is None:
+            linear.issues.clear()
+        else:
+            linear.issues[issue.id] = refreshed_issue
+
+        orchestrator.tick()
+
+        cancelled = store.get_task(issue.identifier)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["linear_state"], expected_state)
+        self.assertEqual(cancelled["cancellation_reason"], reason)
+        self.assertIsNotNone(cancelled["completed_at"])
+        self.assertIsNotNone(cancelled["cancelled_at"])
+        self.assertEqual(orchestrator.state.snapshot()["counts"]["claimed"], 0)
+        return cancelled
+
+    @staticmethod
+    def _run_and_record(function, errors):
+        try:
+            function()
+        except Exception as error:
+            errors.append(error)
 
 
 class RuntimeStoreTests(unittest.TestCase):
