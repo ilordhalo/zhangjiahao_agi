@@ -204,6 +204,90 @@ class AuthServiceTests(unittest.TestCase):
         self.assertEqual(first_results, [AuthenticationError] * 5)
         self.assertEqual(extra_results, [LoginLockedError] * 5)
 
+    def test_global_kdf_limit_applies_across_many_client_buckets(self):
+        service = self.make_service()
+        client_keys = []
+        bucket_keys = set()
+        for index in range(1000):
+            client_key = f"192.168.2.{index}"
+            bucket_key = service._rate_limit_key("admin", client_key)
+            if bucket_key not in bucket_keys:
+                bucket_keys.add(bucket_key)
+                client_keys.append(client_key)
+            if len(client_keys) == 6:
+                break
+        self.assertEqual(len(client_keys), 6)
+
+        release_kdf = threading.Event()
+        five_in_kdf = threading.Event()
+        active_kdf = 0
+        max_active_kdf = 0
+        entered_lock = threading.Lock()
+
+        def blocked_verification(_password, _record):
+            nonlocal active_kdf, max_active_kdf
+            with entered_lock:
+                active_kdf += 1
+                max_active_kdf = max(max_active_kdf, active_kdf)
+                if active_kdf == 5:
+                    five_in_kdf.set()
+                over_limit = active_kdf > 5
+            if not over_limit:
+                release_kdf.wait(timeout=2)
+            with entered_lock:
+                active_kdf -= 1
+            return False
+
+        def attempt(client_key):
+            try:
+                service.login("admin", "incorrect", client_key)
+            except AuthenticationError as error:
+                return type(error)
+            return None
+
+        with patch("symphonz.service.auth.verify_password", side_effect=blocked_verification) as verify:
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                first = [executor.submit(attempt, client_key) for client_key in client_keys[:5]]
+                self.assertTrue(five_in_kdf.wait(timeout=2))
+                extra = executor.submit(attempt, client_keys[5])
+                try:
+                    extra_result = extra.result(timeout=1)
+                finally:
+                    release_kdf.set()
+                first_results = [future.result(timeout=2) for future in first]
+
+        self.assertEqual(max_active_kdf, 5)
+        self.assertEqual(verify.call_count, 5)
+        self.assertEqual(first_results, [AuthenticationError] * 5)
+        self.assertEqual(extra_result, LoginLockedError)
+
+    def test_kdf_exception_releases_global_slot_and_preserves_client_failure(self):
+        service = self.make_service()
+        raised = threading.Event()
+
+        def raising_verification(_password, _record):
+            raised.set()
+            raise RuntimeError("KDF failed")
+
+        with patch("symphonz.service.auth.verify_password", side_effect=raising_verification):
+            with self.assertRaises(RuntimeError):
+                service.login("admin", "incorrect", "192.168.3.1")
+
+        self.assertTrue(raised.is_set())
+        attempt = RuntimeStore(self.database).get_login_attempt(
+            service._rate_limit_key("admin", "192.168.3.1")
+        )
+        self.assertEqual(attempt["failures"], 1)
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM login_attempt_reservations").fetchone()[0],
+                0,
+            )
+
+        with patch("symphonz.service.auth.verify_password", return_value=False):
+            with self.assertRaises(AuthenticationError):
+                service.login("admin", "incorrect", "192.168.3.2")
+
     def test_random_usernames_share_a_bounded_kdf_budget(self):
         service = self.make_service()
 

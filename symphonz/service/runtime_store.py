@@ -23,6 +23,7 @@ class RuntimeStore:
     TASK_PAGE_SNAPSHOT_CLEANUP_BATCH_SIZE = 100
     LOGIN_RESERVATION_TTL_SECONDS = 120.0
     LOGIN_ATTEMPT_CLEANUP_BATCH_SIZE = 100
+    LOGIN_GLOBAL_KDF_LIMIT = 5
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -467,6 +468,19 @@ class RuntimeStore:
                     "reservation_id": None,
                     "failures": failures,
                     "locked_until": locked_until,
+                }
+            active_global_reservations = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM login_attempt_reservations WHERE expires_at > ?",
+                    (current_time,),
+                ).fetchone()[0]
+            )
+            if active_global_reservations >= self.LOGIN_GLOBAL_KDF_LIMIT:
+                return {
+                    "reserved": False,
+                    "reservation_id": None,
+                    "failures": failures,
+                    "locked_until": row["locked_until"] if row is not None else None,
                 }
             failures += 1
             locked_until = current_time + lock_seconds if failures >= max_attempts else None

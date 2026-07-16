@@ -1621,6 +1621,23 @@ class RuntimeStoreTests(unittest.TestCase):
         self.assertEqual(attempt["failures"], 5)
         self.assertEqual(attempt["locked_until"], now + 900)
 
+    def test_failed_client_reservation_releases_global_slot(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        first = store.reserve_login_attempt("account:client:1", now=100.0, max_attempts=1)
+        rejected = store.reserve_login_attempt("account:client:1", now=100.0, max_attempts=1)
+        replacement = store.reserve_login_attempt("account:client:2", now=100.0, max_attempts=1)
+
+        self.assertTrue(first["reserved"])
+        self.assertFalse(rejected["reserved"])
+        self.assertTrue(replacement["reserved"])
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM login_attempt_reservations").fetchone()[0],
+                2,
+            )
+
     def test_login_attempt_completion_is_conditional_on_unique_reservation(self):
         from symphonz.service.runtime_store import RuntimeStore
 

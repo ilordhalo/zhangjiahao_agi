@@ -174,15 +174,21 @@ class AuthService:
         if not reservation["reserved"]:
             raise LoginLockedError("Too many failed login attempts; try again later")
 
-        username_matches = hmac.compare_digest(
-            self._normalize_username(username).encode("utf-8"), self._username_key.encode("utf-8")
-        )
-        password_matches = verify_password(password, self.password_record)
-        if not username_matches or not password_matches:
-            self.store.complete_login_attempt(reservation["reservation_id"], succeeded=False, now=now)
+        credentials_valid = False
+        try:
+            username_matches = hmac.compare_digest(
+                self._normalize_username(username).encode("utf-8"), self._username_key.encode("utf-8")
+            )
+            password_matches = verify_password(password, self.password_record)
+            credentials_valid = username_matches and password_matches
+        finally:
+            self.store.complete_login_attempt(
+                reservation["reservation_id"], succeeded=credentials_valid, now=now
+            )
+
+        if not credentials_valid:
             raise AuthenticationError("Invalid username or password")
 
-        self.store.complete_login_attempt(reservation["reservation_id"], succeeded=True, now=now)
         token = secrets.token_urlsafe(TOKEN_BYTES)
         expires_at = now + self._session_seconds
         self.store.save_session(
