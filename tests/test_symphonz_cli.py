@@ -10,9 +10,12 @@ from symphonz.install import (
     InstallConfig,
     collect_install_config,
     detect_git_defaults,
+    ensure_gitignore,
     install_project,
     linear_preflight,
+    read_dashboard_auth,
     read_config,
+    write_auth_config,
     write_config,
 )
 from symphonz.runtime import build_run_command, run_installed
@@ -20,6 +23,24 @@ from symphonz.workflow import render_workflow
 
 
 class ConfigTests(unittest.TestCase):
+    def test_auth_config_is_private_hashed_and_gitignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            password = "dashboard-password"
+            path = root / ".symphonz" / "auth.toml"
+
+            write_auth_config(path, password)
+            ensure_gitignore(root)
+
+            content = path.read_text()
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertIn('algorithm = "scrypt"', content)
+            self.assertNotIn(password, content)
+            auth = read_dashboard_auth(root)
+            self.assertTrue(auth.password_record.password_hash)
+            self.assertTrue(auth.session_secret)
+            self.assertIn(".symphonz/auth.toml", (root / ".gitignore").read_text())
+
     def test_write_config_uses_env_var_for_linear_key(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.toml"

@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import base64
 import os
 from pathlib import Path
+import secrets
 import subprocess
+
+from symphonz.service.auth import DashboardAuth, PasswordRecord, hash_password
 
 
 DEFAULT_GITLAB_BASE_URL = "https://gitlab.example.com"
@@ -102,6 +106,45 @@ def parse_toml_string(value: str) -> str:
         result.append("\\")
 
     return "".join(result)
+
+
+def write_auth_config(path: Path, password: str) -> DashboardAuth:
+    record = hash_password(password)
+    session_secret = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+    content = "\n".join(
+        [
+            "[auth]",
+            f"algorithm = {toml_quote(record.algorithm)}",
+            f"salt = {toml_quote(record.salt)}",
+            f"password_hash = {toml_quote(record.password_hash)}",
+            f"session_secret = {toml_quote(session_secret)}",
+            "",
+        ]
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as auth_file:
+            auth_file.write(content)
+    finally:
+        os.chmod(path, 0o600)
+    return DashboardAuth(password_record=record, session_secret=session_secret)
+
+
+def read_dashboard_auth(project_root: Path) -> DashboardAuth:
+    auth_path = project_root / ".symphonz" / "auth.toml"
+    auth_values = read_config(auth_path).get("auth", {})
+    required = ("algorithm", "salt", "password_hash", "session_secret")
+    if any(not auth_values.get(field) for field in required):
+        raise RuntimeError(f"Dashboard auth configuration is invalid: {auth_path}")
+    return DashboardAuth(
+        password_record=PasswordRecord(
+            algorithm=auth_values["algorithm"],
+            salt=auth_values["salt"],
+            password_hash=auth_values["password_hash"],
+        ),
+        session_secret=auth_values["session_secret"],
+    )
 
 
 def run_git(project_root: Path, args: list[str]) -> str:
@@ -250,7 +293,7 @@ def collect_install_config(
 def ensure_gitignore(project_root: Path) -> None:
     gitignore = project_root / ".gitignore"
     existing = gitignore.read_text().splitlines() if gitignore.exists() else []
-    additions = [".symphonz/workspace/", ".symphonz/logs/"]
+    additions = [".symphonz/workspace/", ".symphonz/logs/", ".symphonz/auth.toml"]
     updated = existing[:]
     for item in additions:
         if item not in updated:
