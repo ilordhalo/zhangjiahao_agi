@@ -352,8 +352,11 @@ def _validate_public_host(host: str) -> bool:
         return folded == "localhost" or folded.endswith(".localhost")
 
     effective_address = address
-    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
-        effective_address = address.ipv4_mapped
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.scope_id is not None or address.is_link_local:
+            raise ValueError("public_base_url must not use a scoped or link-local IPv6 host")
+        if address.ipv4_mapped is not None:
+            effective_address = address.ipv4_mapped
     if effective_address.is_unspecified:
         raise ValueError("public_base_url must not use a wildcard host")
     return effective_address.is_loopback

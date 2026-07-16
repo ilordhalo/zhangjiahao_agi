@@ -3504,6 +3504,8 @@ class RunnerCompositionTests(unittest.TestCase):
             "http://[::]:4000",
             "http://[::ffff:127.0.0.1]:4000",
             "http://[::ffff:0.0.0.0]:4000",
+            "https://[fe80::1]:4000/proxy",
+            "https://[fe80::1%25eth0]:4000/proxy",
             "https://-bad.example",
             "https://reports..example",
             "https://operator:secret@reports.example.test",
