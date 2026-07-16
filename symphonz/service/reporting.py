@@ -27,6 +27,7 @@ _MAX_EDGES = 48
 _MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
 _SYNC_LEASE_SECONDS = 30.0
 _BUNDLE_NAME = re.compile(r"report-[a-z0-9]+\.(?:json|html)$")
+_EXPECTED_REPORT_GENERATION_UNSET = object()
 _HTTP_URL_SCHEMA_PATTERN = (
     r"^https?://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?"
     r"(?::[0-9]{1,5})?(?:/[^\s?#\x00-\x1f\x7f]*)?$"
@@ -42,11 +43,21 @@ class _SyncLeaseLost(RuntimeError):
 class _SyncLeaseHeartbeat:
     """Keeps a claimed SQLite lease alive while Linear pagination or mutations run."""
 
-    def __init__(self, store, issue_identifier: str, owner: str, lease_seconds: float):
+    def __init__(
+        self,
+        store,
+        issue_identifier: str,
+        owner: str,
+        lease_seconds: float,
+        report_version: int | None = None,
+        expected_json_path: object = _EXPECTED_REPORT_GENERATION_UNSET,
+    ):
         self.store = store
         self.issue_identifier = issue_identifier
         self.owner = owner
         self.lease_seconds = lease_seconds
+        self.report_version = report_version
+        self.expected_json_path = expected_json_path
         self._stop = threading.Event()
         self._lost = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -56,12 +67,16 @@ class _SyncLeaseHeartbeat:
 
     def stop(self) -> None:
         self._stop.set()
-        self._thread.join(timeout=max(1.0, self.lease_seconds * 2))
+        if self._thread.ident is not None:
+            self._thread.join(timeout=max(1.0, self.lease_seconds * 2))
 
     def require_owned(self, now: float | None = None) -> None:
-        if self._lost.is_set() or not self.store.owns_report_sync_lease(
-            self.issue_identifier, owner=self.owner, now=time.time(),
-        ):
+        ownership = {"owner": self.owner, "now": time.time()}
+        if self.report_version is not None:
+            ownership["expected_report_version"] = self.report_version
+        if self.expected_json_path is not _EXPECTED_REPORT_GENERATION_UNSET:
+            ownership["expected_json_path"] = self.expected_json_path
+        if self._lost.is_set() or not self.store.owns_report_sync_lease(self.issue_identifier, **ownership):
             self._lost.set()
             raise _SyncLeaseLost("Report synchronization lease was lost.")
 
@@ -719,9 +734,11 @@ class ReportPublisher(ReportArtifactReader):
             entry["issue_identifier"],
             owner,
             self.sync_lease_seconds,
+            entry["report_version"],
+            entry.get("json_path"),
         )
-        heartbeat.start()
         try:
+            heartbeat.start()
             heartbeat.require_owned(now)
             document = self._load_report_document(entry)
             self._validate_active_issue(document)
@@ -733,8 +750,10 @@ class ReportPublisher(ReportArtifactReader):
             self._pending_after_failure(entry, error, now, owner)
             return False
         finally:
-            heartbeat.stop()
-            self.store.release_report_sync(entry["issue_identifier"], owner=owner)
+            try:
+                heartbeat.stop()
+            finally:
+                self.store.release_report_sync(entry["issue_identifier"], owner=owner)
 
     def _current_report_entry(self, issue_identifier: str) -> dict:
         if issue_identifier != self.active_issue_identifier:
@@ -822,8 +841,9 @@ class ReportPublisher(ReportArtifactReader):
             retry_count=retry_count,
             next_retry_at=next_retry_at,
             updated_at=now,
+            expected_report_version=entry["report_version"],
         )
-        return self.store.get_report(entry["issue_identifier"]) if updated else None
+        return self.store.get_report(entry["issue_identifier"], entry["report_version"]) if updated else None
 
     def _find_comment_id(self, issue_id: str) -> str | None:
         after = None
@@ -914,15 +934,19 @@ class PendingReportSynchronizer:
         synced = 0
         for entry in self.store.list_due_reports(now=current, limit=self.batch_size):
             owner = f"retry-{secrets.token_hex(16)}"
-            claimed = self.store.claim_report_sync(
-                entry["issue_identifier"],
-                owner=owner,
-                now=current,
-                lease_seconds=self.sync_lease_seconds,
-            )
-            if claimed is None:
-                continue
+            claimed = None
+            publisher = None
             try:
+                claimed = self.store.claim_report_sync(
+                    entry["issue_identifier"],
+                    owner=owner,
+                    now=current,
+                    lease_seconds=self.sync_lease_seconds,
+                    expected_report_version=entry["report_version"],
+                    expected_json_path=entry.get("json_path"),
+                )
+                if claimed is None:
+                    continue
                 issue_id, issue_identifier = _active_issue_identity(
                     claimed.get("issue_id"),
                     claimed.get("issue_identifier"),
@@ -937,24 +961,32 @@ class PendingReportSynchronizer:
                     error_sink=self.error_sink,
                     sync_lease_seconds=self.sync_lease_seconds,
                 )
-            except Exception as error:
-                try:
-                    _pending_after_sync_failure(
-                        self.store,
-                        claimed,
-                        error,
-                        current,
-                        owner,
-                        self.error_sink,
-                    )
-                finally:
-                    self.store.release_report_sync(claimed["issue_identifier"], owner=owner)
-                continue
-            try:
                 if publisher._sync_claimed(claimed, owner, current):
                     synced += 1
+            except Exception as error:
+                if claimed is not None:
+                    try:
+                        _pending_after_sync_failure(
+                            self.store,
+                            claimed,
+                            error,
+                            current,
+                            owner,
+                            self.error_sink,
+                        )
+                    except Exception:
+                        pass
             finally:
-                publisher.close()
+                if publisher is not None:
+                    try:
+                        publisher.close()
+                    except Exception:
+                        pass
+                if claimed is not None:
+                    try:
+                        self.store.release_report_sync(claimed["issue_identifier"], owner=owner)
+                    except Exception:
+                        pass
         return synced
 
 
@@ -977,10 +1009,11 @@ def _pending_after_sync_failure(
         retry_count=retries,
         next_retry_at=retry_at,
         updated_at=now,
+        expected_report_version=entry["report_version"],
     )
     if not updated:
         return None
-    pending = store.get_report(entry["issue_identifier"])
+    pending = store.get_report(entry["issue_identifier"], entry["report_version"])
     record = RuntimeErrorRecord(
         issue_identifier=entry["issue_identifier"],
         stage="report_sync",

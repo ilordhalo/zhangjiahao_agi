@@ -12,6 +12,9 @@ from symphonz.service.event_log import bounded_redacted_data
 from symphonz.service.models import RuntimeErrorRecord, RuntimeEvent, runtime_error_from_event
 
 
+_EXPECTED_REPORT_GENERATION_UNSET = object()
+
+
 class RuntimeStoreInputError(ValueError):
     """Raised when a runtime-store pagination input is invalid."""
 
@@ -343,6 +346,7 @@ class RuntimeStore:
     def list_due_reports(self, *, now: float, limit: int = 50) -> list[dict]:
         """Return the oldest bounded set of latest reports due for synchronization."""
         current = float(now)
+        lease_checked_at = time.time()
         batch_limit = self._limit(limit)
         with self._connect() as connection:
             rows = connection.execute(
@@ -353,6 +357,12 @@ class RuntimeStore:
                   AND (reports.next_retry_at IS NULL OR reports.next_retry_at <= ?)
                   AND NOT EXISTS (
                       SELECT 1
+                      FROM report_sync_leases
+                      WHERE report_sync_leases.issue_identifier = reports.issue_identifier
+                        AND report_sync_leases.expires_at > ?
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
                       FROM reports AS newer
                       WHERE newer.issue_identifier = reports.issue_identifier
                         AND newer.report_version > reports.report_version
@@ -361,7 +371,7 @@ class RuntimeStore:
                          reports.issue_identifier ASC, reports.report_version DESC
                 LIMIT ?
                 """,
-                (current, batch_limit),
+                (current, lease_checked_at, batch_limit),
             ).fetchall()
         return [self._report_from_row(row) for row in rows]
 
@@ -372,6 +382,8 @@ class RuntimeStore:
         owner: str,
         now: float,
         lease_seconds: float,
+        expected_report_version: int | None = None,
+        expected_json_path: object = _EXPECTED_REPORT_GENERATION_UNSET,
     ) -> dict | None:
         if not isinstance(owner, str) or not owner:
             raise ValueError("Report sync lease owner must be a non-empty string")
@@ -380,6 +392,9 @@ class RuntimeStore:
         duration = float(lease_seconds)
         if duration <= 0:
             raise ValueError("Report sync lease duration must be positive")
+        report_version = None if expected_report_version is None else int(expected_report_version)
+        generation_fenced = expected_json_path is not _EXPECTED_REPORT_GENERATION_UNSET
+        json_path = None if not generation_fenced else expected_json_path
 
         def write(connection: sqlite3.Connection) -> dict | None:
             report = connection.execute(
@@ -388,10 +403,25 @@ class RuntimeStore:
                 WHERE issue_identifier = ?
                   AND linear_sync_status = 'pending'
                   AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                  AND (? IS NULL OR report_version = ?)
+                  AND (? = 0 OR json_path IS ?)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM reports AS newer
+                      WHERE newer.issue_identifier = reports.issue_identifier
+                        AND newer.report_version > reports.report_version
+                  )
                 ORDER BY report_version DESC
                 LIMIT 1
                 """,
-                (issue_identifier, due_at),
+                (
+                    issue_identifier,
+                    due_at,
+                    report_version,
+                    report_version,
+                    int(generation_fenced),
+                    json_path,
+                ),
             ).fetchone()
             if report is None:
                 return None
@@ -458,23 +488,54 @@ class RuntimeStore:
 
         return self._write(write)
 
-    def owns_report_sync_lease(self, issue_identifier: str, *, owner: str, now: float) -> bool:
+    def owns_report_sync_lease(
+        self,
+        issue_identifier: str,
+        *,
+        owner: str,
+        now: float,
+        expected_report_version: int | None = None,
+        expected_json_path: object = _EXPECTED_REPORT_GENERATION_UNSET,
+    ) -> bool:
         """Return whether ``owner`` still holds an unexpired report-sync lease."""
         current = time.time()
+        report_version = None if expected_report_version is None else int(expected_report_version)
+        generation_fenced = expected_json_path is not _EXPECTED_REPORT_GENERATION_UNSET
+        json_path = None if not generation_fenced else expected_json_path
         with self._connect() as connection:
             return connection.execute(
                 """
-                SELECT 1 FROM report_sync_leases
-                WHERE issue_identifier = ? AND owner = ? AND expires_at > ?
+                SELECT 1
+                FROM report_sync_leases
+                JOIN reports ON reports.issue_identifier = report_sync_leases.issue_identifier
+                WHERE report_sync_leases.issue_identifier = ?
+                  AND report_sync_leases.owner = ?
+                  AND report_sync_leases.expires_at > ?
+                  AND (? IS NULL OR reports.report_version = ?)
+                  AND (? = 0 OR reports.json_path IS ?)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM reports AS newer
+                      WHERE newer.issue_identifier = reports.issue_identifier
+                        AND newer.report_version > reports.report_version
+                  )
                 """,
-                (issue_identifier, owner, current),
+                (
+                    issue_identifier,
+                    owner,
+                    current,
+                    report_version,
+                    report_version,
+                    int(generation_fenced),
+                    json_path,
+                ),
             ).fetchone() is not None
 
     def update_report_sync_state(
         self,
         issue_identifier: str,
         *,
-        expected_json_path: str,
+        expected_json_path: str | None,
         owner: str,
         linear_sync_status: str,
         linear_comment_id: str | None,
@@ -482,6 +543,7 @@ class RuntimeStore:
         next_retry_at: float | None,
         updated_at: float,
         lease_checked_at: float | None = None,
+        expected_report_version: int | None = None,
     ) -> bool:
         assignments = [
             "linear_sync_status = ?",
@@ -500,9 +562,12 @@ class RuntimeStore:
         if self._legacy_report_sync_status:
             assignments.append("sync_status = ?")
             parameters.append(linear_sync_status)
+        report_version = None if expected_report_version is None else int(expected_report_version)
         parameters.extend([
             issue_identifier,
             expected_json_path,
+            report_version,
+            report_version,
             owner,
             time.time(),
         ])
@@ -513,6 +578,13 @@ class RuntimeStore:
                 UPDATE reports
                 SET {', '.join(assignments)}
                 WHERE issue_identifier = ? AND json_path IS ?
+                  AND (? IS NULL OR report_version = ?)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM reports AS newer
+                      WHERE newer.issue_identifier = reports.issue_identifier
+                        AND newer.report_version > reports.report_version
+                  )
                   AND EXISTS (
                       SELECT 1 FROM report_sync_leases
                       WHERE report_sync_leases.issue_identifier = reports.issue_identifier

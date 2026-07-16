@@ -484,6 +484,226 @@ class ReportingTests(unittest.TestCase):
             indexes = {row["name"] for row in connection.execute("PRAGMA index_list(reports)")}
         self.assertIn("reports_due_sync", indexes)
 
+    def test_due_report_query_excludes_wall_clock_active_leases_before_limit(self):
+        self.pending_report(1, next_retry_at=1.0)
+        self.pending_report(2, next_retry_at=2.0)
+        due_time = time.time() + 10_000
+        claimed = self.store.claim_report_sync(
+            "SYM-1",
+            owner="active-worker",
+            now=due_time,
+            lease_seconds=30.0,
+        )
+        self.assertIsNotNone(claimed)
+
+        due = self.store.list_due_reports(now=due_time, limit=1)
+
+        self.assertEqual([entry["issue_identifier"] for entry in due], ["SYM-2"])
+
+    def test_synchronizer_does_not_claim_a_newer_version_after_due_selection(self):
+        selected = self.pending_report(1, next_retry_at=1.0)
+        original_claim = self.store.claim_report_sync
+
+        def insert_newer_version_before_claim(*args, **kwargs):
+            self.store.save_report(
+                {
+                    **selected,
+                    "report_version": selected["report_version"] + 1,
+                    "linear_sync_status": "pending",
+                    "next_retry_at": 1.0,
+                }
+            )
+            return original_claim(*args, **kwargs)
+
+        with mock.patch.object(
+            self.store,
+            "claim_report_sync",
+            side_effect=insert_newer_version_before_claim,
+        ):
+            synced = self.synchronizer(batch_size=1).sync_pending(now=10.0)
+
+        self.assertEqual(synced, 0)
+        self.assertEqual(self.linear.calls, [])
+        self.assertEqual(self.store.get_report("SYM-1", 1)["linear_sync_status"], "pending")
+        self.assertEqual(self.store.get_report("SYM-1", 2)["linear_sync_status"], "pending")
+
+    def test_synchronizer_does_not_claim_a_new_generation_after_due_selection(self):
+        selected = self.pending_report(1, next_retry_at=1.0)
+        issue_directory = self.root / "artifacts" / "SYM-1"
+        replacement_json = "report-replacement.json"
+        replacement_html = "report-replacement.html"
+        (issue_directory / replacement_json).write_text(
+            self.artifact_path(selected, "json_path").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        (issue_directory / replacement_html).write_text(
+            self.artifact_path(selected, "html_path").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        original_claim = self.store.claim_report_sync
+
+        def replace_generation_before_claim(*args, **kwargs):
+            self.store.save_report(
+                {
+                    **selected,
+                    "json_path": replacement_json,
+                    "html_path": replacement_html,
+                    "linear_sync_status": "pending",
+                    "next_retry_at": 1.0,
+                }
+            )
+            return original_claim(*args, **kwargs)
+
+        with mock.patch.object(
+            self.store,
+            "claim_report_sync",
+            side_effect=replace_generation_before_claim,
+        ):
+            synced = self.synchronizer(batch_size=1).sync_pending(now=10.0)
+
+        current = self.store.get_report("SYM-1", selected["report_version"])
+        self.assertEqual(synced, 0)
+        self.assertEqual(self.linear.calls, [])
+        self.assertEqual(current["json_path"], replacement_json)
+        self.assertEqual(current["linear_sync_status"], "pending")
+        self.assertEqual(current["retry_count"], selected["retry_count"])
+
+    def test_malformed_null_generation_failure_updates_only_selected_version(self):
+        for version in (1, 2):
+            self.store.save_report(
+                {
+                    "issue_identifier": "SYM-1",
+                    "issue_id": "issue-1",
+                    "report_version": version,
+                    "json_path": None,
+                    "html_path": None,
+                    "linear_sync_status": "pending",
+                    "retry_count": 0,
+                    "next_retry_at": 1.0,
+                    "created_at": float(version),
+                    "updated_at": float(version),
+                }
+            )
+        errors = []
+
+        synced = self.synchronizer(error_sink=errors.append, batch_size=1).sync_pending(now=10.0)
+
+        self.assertEqual(synced, 0)
+        self.assertEqual(self.store.get_report("SYM-1", 1)["retry_count"], 0)
+        self.assertEqual(self.store.get_report("SYM-1", 2)["retry_count"], 1)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0].issue_identifier, "SYM-1")
+        self.assertIn("path", errors[0].message.lower())
+
+    def test_newer_version_after_claim_prevents_linear_mutation_and_state_update(self):
+        selected = self.pending_report(1, next_retry_at=1.0)
+
+        class NewVersionDuringLookup(FakeLinearClient):
+            inserted = False
+
+            def graphql(client, query, variables):
+                if "SymphonzFindReportComment" in query and not client.inserted:
+                    client.inserted = True
+                    self.store.save_report(
+                        {
+                            **selected,
+                            "report_version": selected["report_version"] + 1,
+                            "linear_sync_status": "pending",
+                            "next_retry_at": 1.0,
+                        }
+                    )
+                return super().graphql(query, variables)
+
+        linear = NewVersionDuringLookup()
+
+        synced = self.synchronizer(linear_client=linear, batch_size=1).sync_pending(now=10.0)
+
+        mutations = [
+            query
+            for query, _ in linear.calls
+            if "SymphonzCreateReportComment" in query or "SymphonzUpdateReportComment" in query
+        ]
+        self.assertEqual(synced, 0)
+        self.assertEqual(mutations, [])
+        self.assertEqual(self.store.get_report("SYM-1", 1)["linear_sync_status"], "pending")
+        self.assertEqual(self.store.get_report("SYM-1", 2)["linear_sync_status"], "pending")
+
+    def test_heartbeat_start_failure_isolated_released_closed_and_recorded(self):
+        import symphonz.service.reporting as reporting
+
+        first = self.pending_report(1, next_retry_at=1.0)
+        self.pending_report(2, next_retry_at=2.0)
+        errors = []
+        stopped = []
+        closed = []
+        original_start = reporting._SyncLeaseHeartbeat.start
+        original_stop = reporting._SyncLeaseHeartbeat.stop
+        original_close = reporting.ReportPublisher.close
+
+        def fail_first_start(heartbeat):
+            if heartbeat.issue_identifier == "SYM-1":
+                raise RuntimeError("heartbeat start failed")
+            original_start(heartbeat)
+
+        def tracked_stop(heartbeat):
+            stopped.append(heartbeat.issue_identifier)
+            original_stop(heartbeat)
+
+        def tracked_close(publisher):
+            was_open = publisher._artifact_root_fd >= 0
+            original_close(publisher)
+            if was_open:
+                closed.append(publisher.active_issue_identifier)
+
+        with mock.patch.object(reporting._SyncLeaseHeartbeat, "start", fail_first_start), mock.patch.object(
+            reporting._SyncLeaseHeartbeat,
+            "stop",
+            tracked_stop,
+        ), mock.patch.object(reporting.ReportPublisher, "close", tracked_close):
+            try:
+                synced = self.synchronizer(error_sink=errors.append, batch_size=2).sync_pending(now=10.0)
+            except RuntimeError as error:
+                self.fail(f"heartbeat start failure aborted the batch: {error}")
+
+        retried = self.store.get_report("SYM-1")
+        self.assertEqual(synced, 1)
+        self.assertEqual(retried["linear_sync_status"], "pending")
+        self.assertEqual(retried["retry_count"], first["retry_count"] + 1)
+        self.assertEqual([error.issue_identifier for error in errors], ["SYM-1"])
+        self.assertEqual(stopped, ["SYM-1", "SYM-2"])
+        self.assertEqual(closed, ["SYM-1", "SYM-2"])
+        with self.store._connect() as connection:
+            leases = connection.execute("SELECT issue_identifier FROM report_sync_leases").fetchall()
+        self.assertEqual(leases, [])
+
+    def test_unexpected_claimed_row_exception_is_recorded_released_and_isolated(self):
+        import symphonz.service.reporting as reporting
+
+        first = self.pending_report(1, next_retry_at=1.0)
+        self.pending_report(2, next_retry_at=2.0)
+        errors = []
+        original_sync_claimed = reporting.ReportPublisher._sync_claimed
+
+        def fail_first_row(publisher, entry, owner, now):
+            if entry["issue_identifier"] == "SYM-1":
+                raise RuntimeError("unexpected claimed-row failure")
+            return original_sync_claimed(publisher, entry, owner, now)
+
+        with mock.patch.object(reporting.ReportPublisher, "_sync_claimed", fail_first_row):
+            try:
+                synced = self.synchronizer(error_sink=errors.append, batch_size=2).sync_pending(now=10.0)
+            except RuntimeError as error:
+                self.fail(f"claimed-row failure aborted the batch: {error}")
+
+        retried = self.store.get_report("SYM-1")
+        self.assertEqual(synced, 1)
+        self.assertEqual(retried["linear_sync_status"], "pending")
+        self.assertEqual(retried["retry_count"], first["retry_count"] + 1)
+        self.assertEqual([error.issue_identifier for error in errors], ["SYM-1"])
+        with self.store._connect() as connection:
+            leases = connection.execute("SELECT issue_identifier FROM report_sync_leases").fetchall()
+        self.assertEqual(leases, [])
+
     def test_explicit_synchronizer_restarts_without_global_publisher_registry(self):
         import symphonz.service.reporting as reporting
         from symphonz.service.runtime_store import RuntimeStore
