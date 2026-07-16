@@ -134,3 +134,52 @@ messages while the complete suite exited successfully.
 - HTTP remains intentionally limited to trusted LAN use. Public Internet
   exposure still requires separately managed TLS termination and security
   review, as documented.
+
+## Important Review Fixes
+
+- Added a private runtime-only compatibility mode for pre-0.4 configs with no
+  `[dashboard]`. It activates only when `symphonz run` receives an explicit
+  port, rejects non-loopback hosts in both the runner and dashboard server,
+  emits a warning/event, and is not exposed by the direct `service` CLI.
+  Configured dashboards continue to load and require `auth.toml`.
+- Reworked dashboard section discovery around canonical bare and quoted TOML
+  table headers with optional dotted keys and trailing comments. Migration now
+  replaces a commented dashboard header cleanly, preserves following bare or
+  quoted table headers, and rejects semantic dashboard aliases before password
+  or file mutation.
+- Added atomic fsync-and-replace writes for non-secret config, workflow, and
+  gitignore content. Both installation flows render all content before file
+  mutation, commit gitignore and non-secret files before auth, and retain the
+  pinned-directory atomic auth writer unchanged. Dashboard reconfiguration
+  restores the prior config atomically if auth commit fails.
+
+### Review Fix TDD Evidence
+
+1. The legacy execution RED test reached `read_dashboard_auth` and failed on a
+   missing `auth.toml`; after the loopback-only compatibility implementation,
+   the real `run_installed`/runner path exited cleanly without auth.
+2. Anonymous dashboard boundary RED tests failed by dereferencing a missing
+   auth service and accepting `0.0.0.0`; both passed after loopback validation
+   and the internal anonymous request gate were added.
+3. Commented-header RED tests left two dashboard sections, and duplicate
+   definitions were accepted. Both passed after shared table-header scanning
+   and pre-mutation duplicate rejection.
+4. Atomic-order RED tests showed direct config truncation, no atomic helper,
+   auth attempted before new config, and auth attempted before gitignore and
+   workflow. All passed after staged atomic commits, auth-last ordering, and
+   configure rollback.
+5. Focused review-fix tests: PASS, 13 tests in 0.775s across CLI and
+   dashboard boundary cases.
+6. Complete CLI and service suites: PASS, 197 tests in 12.207s.
+7. Dashboard non-socket handler, startup, and template suites: PASS, 10 tests.
+   The complete 26-test dashboard run was attempted, but the managed sandbox
+   rejected all 16 real HTTP cases at `127.0.0.1` bind setup with
+   `PermissionError: [Errno 1] Operation not permitted`. An escalation request
+   for the required loopback environment was rejected; no assertion failed
+   after a successful bind.
+8. `PYTHONPYCACHEPREFIX=/tmp/symphonz-task6-review-pyc python3 -m py_compile
+   symphonz/*.py symphonz/service/*.py tests/test_symphonz_cli.py
+   tests/test_symphonz_service.py tests/test_symphonz_dashboard.py`: PASS.
+9. `./bin/symphonz version`: PASS, exact output `symphonz 0.4.0`.
+10. `sh -n install.sh` and `git diff --check`: PASS.
+11. Changed-file scope check: PASS; `docs/index.html` is unchanged.

@@ -7,6 +7,7 @@ import binascii
 import getpass
 import os
 from pathlib import Path
+import re
 import secrets
 import stat
 import subprocess
@@ -20,6 +21,20 @@ DEFAULT_DASHBOARD_PORT = 4000
 DEFAULT_DASHBOARD_USERNAME = "admin"
 DEFAULT_DASHBOARD_SESSION_DAYS = 30
 SUPPORTED_GIT_PROVIDERS = {"github", "gitlab"}
+_BARE_TOML_KEY = r"[A-Za-z0-9_-]+"
+_BASIC_TOML_KEY = r'"(?:\\.|[^"\\\r\n])*"'
+_LITERAL_TOML_KEY = r"'[^'\r\n]*'"
+_TOML_KEY_PART = rf"(?:{_BARE_TOML_KEY}|{_BASIC_TOML_KEY}|{_LITERAL_TOML_KEY})"
+_TOML_KEY_PATH = rf"{_TOML_KEY_PART}(?:[ \t]*\.[ \t]*{_TOML_KEY_PART})*"
+_TOML_KEY_PART_PATTERN = re.compile(_TOML_KEY_PART)
+_TABLE_HEADER = re.compile(
+    rf"^[ \t]*\[[ \t]*(?P<name>{_TOML_KEY_PATH})"
+    r"[ \t]*\][ \t]*(?:#.*)?$"
+)
+_ARRAY_TABLE_HEADER = re.compile(
+    rf"^[ \t]*\[\[[ \t]*(?P<name>{_TOML_KEY_PATH})"
+    r"[ \t]*\]\][ \t]*(?:#.*)?$"
+)
 
 
 @dataclass(frozen=True)
@@ -48,8 +63,11 @@ def toml_quote(value: str) -> str:
 
 
 def write_config(path: Path, config: InstallConfig) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    content = "\n".join(
+    _atomic_write_text(path, _render_config(config))
+
+
+def _render_config(config: InstallConfig) -> str:
+    return "\n".join(
         [
             "[runtime]",
             f"mode = {toml_quote(config.runtime_mode)}",
@@ -81,7 +99,47 @@ def write_config(path: Path, config: InstallConfig) -> None:
             "",
         ]
     )
-    path.write_text(content)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = -1
+    temporary_path: Path | None = None
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        for _unused in range(100):
+            candidate = path.with_name(f".{path.name}.{secrets.token_hex(12)}.tmp")
+            try:
+                descriptor = os.open(candidate, flags, 0o666)
+            except FileExistsError:
+                continue
+            temporary_path = candidate
+            break
+        else:
+            raise RuntimeError(f"Unable to create an exclusive temporary file for {path}")
+
+        output = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        with output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+        directory_descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def read_config(path: Path) -> dict[str, dict[str, str]]:
@@ -96,8 +154,9 @@ def _parse_config(content: str) -> dict[str, dict[str, str]]:
         line = raw_line.strip()
         if not line:
             continue
-        if line.startswith("[") and line.endswith("]"):
-            current_section = line[1:-1]
+        section_name = _table_header_name(raw_line)
+        if section_name is not None:
+            current_section = section_name
             parsed[current_section] = {}
             continue
         if current_section is None or "=" not in line:
@@ -107,6 +166,26 @@ def _parse_config(content: str) -> dict[str, dict[str, str]]:
         parsed[current_section][key.strip()] = parse_toml_string(raw_value.strip())
 
     return parsed
+
+
+def _table_header_name(line: str) -> str | None:
+    match = _TABLE_HEADER.fullmatch(line.rstrip("\r\n"))
+    if match is None:
+        return None
+    parts = []
+    for key_match in _TOML_KEY_PART_PATTERN.finditer(match.group("name")):
+        value = key_match.group(0)
+        if value.startswith('"'):
+            value = parse_toml_string(value)
+        elif value.startswith("'"):
+            value = value[1:-1]
+        parts.append(value)
+    return ".".join(parts)
+
+
+def _is_table_header(line: str) -> bool:
+    candidate = line.rstrip("\r\n")
+    return _TABLE_HEADER.fullmatch(candidate) is not None or _ARRAY_TABLE_HEADER.fullmatch(candidate) is not None
 
 
 def parse_toml_string(value: str) -> str:
@@ -527,7 +606,7 @@ def collect_install_config(
     )
 
 
-def ensure_gitignore(project_root: Path) -> None:
+def _render_gitignore(project_root: Path) -> str:
     gitignore = project_root / ".gitignore"
     existing = gitignore.read_text().splitlines() if gitignore.exists() else []
     additions = [
@@ -540,7 +619,11 @@ def ensure_gitignore(project_root: Path) -> None:
     for item in additions:
         if item not in updated:
             updated.append(item)
-    gitignore.write_text("\n".join(updated).rstrip() + "\n")
+    return "\n".join(updated).rstrip() + "\n"
+
+
+def ensure_gitignore(project_root: Path) -> None:
+    _atomic_write_text(project_root / ".gitignore", _render_gitignore(project_root))
 
 
 def create_base_layout(project_root: Path) -> None:
@@ -600,21 +683,33 @@ def _render_dashboard_section(
 
 def _replace_dashboard_section(content: str, section: str) -> str:
     lines = content.splitlines(keepends=True)
-    start = next((index for index, line in enumerate(lines) if line.strip() == "[dashboard]"), None)
-    if start is None:
+    bounds = _dashboard_section_bounds(lines)
+    if bounds is None:
         if not content:
             return section.rstrip("\n") + "\n"
         separator = "" if content.endswith("\n\n") else "\n" if content.endswith("\n") else "\n\n"
         return content + separator + section.rstrip("\n") + "\n"
 
-    end = len(lines)
-    for index in range(start + 1, len(lines)):
-        stripped = lines[index].strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            end = index
-            break
+    start, end = bounds
     replacement = section if end < len(lines) else section.rstrip("\n") + "\n"
     return "".join(lines[:start]) + replacement + "".join(lines[end:])
+
+
+def _dashboard_section_bounds(lines: list[str]) -> tuple[int, int] | None:
+    starts = [index for index, line in enumerate(lines) if _table_header_name(line) == "dashboard"]
+    if len(starts) > 1:
+        raise RuntimeError(
+            "Configuration contains multiple [dashboard] sections; resolve the duplicate definitions first"
+        )
+    if not starts:
+        return None
+
+    start = starts[0]
+    end = next(
+        (index for index in range(start + 1, len(lines)) if _is_table_header(lines[index])),
+        len(lines),
+    )
+    return start, end
 
 
 def configure_dashboard(
@@ -636,6 +731,7 @@ def configure_dashboard(
 
     environ = os.environ if environ is None else environ
     content = config_path.read_text()
+    _dashboard_section_bounds(content.splitlines(keepends=True))
     current = _parse_config(content).get("dashboard", {})
     resolved_host = (host if host is not None else current.get("host", DEFAULT_DASHBOARD_HOST)).strip()
     resolved_port = _positive_integer(
@@ -676,9 +772,29 @@ def configure_dashboard(
         resolved_username,
         resolved_session_days,
     )
-    write_auth_config(root / ".symphonz" / "auth.toml", resolved_password)
-    config_path.write_text(_replace_dashboard_section(content, section))
-    ensure_gitignore(root)
+    updated_config = _replace_dashboard_section(content, section)
+    updated_gitignore = _render_gitignore(root)
+    _atomic_write_text(root / ".gitignore", updated_gitignore)
+    try:
+        _atomic_write_text(config_path, updated_config)
+    except BaseException as config_error:
+        try:
+            _atomic_write_text(config_path, content)
+        except BaseException as rollback_error:
+            raise RuntimeError(
+                f"Dashboard config update failed and rollback failed: {rollback_error}"
+            ) from config_error
+        raise
+    try:
+        write_auth_config(root / ".symphonz" / "auth.toml", resolved_password)
+    except BaseException as auth_error:
+        try:
+            _atomic_write_text(config_path, content)
+        except BaseException as rollback_error:
+            raise RuntimeError(
+                f"Dashboard auth update failed and config rollback failed: {rollback_error}"
+            ) from auth_error
+        raise
     return root / ".symphonz"
 
 
@@ -726,13 +842,15 @@ def install_project(
     )
     if not skip_linear_preflight:
         (output_func or print)(linear_preflight(config, environ=environ))
+    from symphonz.workflow import render_workflow, template_path
+
+    config_content = _render_config(config)
+    workflow_content = render_workflow(template_path().read_text(), config)
+    gitignore_content = _render_gitignore(root)
     create_base_layout(root)
-    write_config(root / ".symphonz" / "config.toml", config)
+    _atomic_write_text(root / ".gitignore", gitignore_content)
+    _atomic_write_text(root / ".symphonz" / "config.toml", config_content)
+    _atomic_write_text(root / ".symphonz" / "WORKFLOW.md", workflow_content)
     write_auth_config(root / ".symphonz" / "auth.toml", password)
-
-    from symphonz.workflow import write_workflow
-
-    write_workflow(root, config)
-    ensure_gitignore(root)
 
     return root / ".symphonz"

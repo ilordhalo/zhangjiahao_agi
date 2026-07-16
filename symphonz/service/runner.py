@@ -10,7 +10,7 @@ import sys
 import time
 from urllib.parse import urlsplit
 
-from symphonz.install import read_dashboard_auth
+from symphonz.install import read_config, read_dashboard_auth
 from symphonz.service.auth import AuthService, DashboardAuth
 from symphonz.service.codex_app_server import CodexAppServer
 from symphonz.service.attempt_store import AttemptStore
@@ -122,9 +122,20 @@ def run_service(
     public_base_url: str | None = None,
     dashboard_username: str = "admin",
     session_days: int = 30,
+    _legacy_unauthenticated_dashboard: bool = False,
 ) -> int:
     dashboard_configuration = None
     dashboard_auth = None
+    if _legacy_unauthenticated_dashboard:
+        installed_config_path = project_root / ".symphonz" / "config.toml"
+        if not installed_config_path.is_file() or "dashboard" in read_config(installed_config_path):
+            raise ValueError(
+                "Legacy unauthenticated dashboard requires an installed config without [dashboard]"
+            )
+        if port is None:
+            raise ValueError("Legacy unauthenticated dashboard requires an explicit port")
+        if not _is_loopback_host(_validate_bind_host(host)):
+            raise ValueError("Legacy unauthenticated dashboard must bind to a loopback host")
     if port is not None:
         dashboard_configuration = _validate_dashboard_configuration(
             host=host,
@@ -133,7 +144,8 @@ def run_service(
             dashboard_username=dashboard_username,
             session_days=session_days,
         )
-        dashboard_auth = read_dashboard_auth(project_root)
+        if not _legacy_unauthenticated_dashboard:
+            dashboard_auth = read_dashboard_auth(project_root)
 
     workflow = load_workflow(workflow_path)
     linear = build_linear_client(workflow.config)
@@ -150,7 +162,7 @@ def run_service(
     )
     state = collaborators.state
     auth_service = None
-    if dashboard_configuration is not None:
+    if dashboard_configuration is not None and not _legacy_unauthenticated_dashboard:
         assert dashboard_auth is not None
         auth_service = _build_auth_service(
             collaborators.store,
@@ -185,7 +197,18 @@ def run_service(
         state.add_event("service_started", "Symphonz service started")
         orchestrator.startup_cleanup()
         if dashboard_configuration is not None:
-            assert auth_service is not None
+            if _legacy_unauthenticated_dashboard:
+                message = (
+                    "Legacy dashboard is running unauthenticated on loopback only; "
+                    "run `symphonz configure-dashboard` to enable authentication."
+                )
+                state.add_event(
+                    "legacy_dashboard_warning",
+                    message,
+                    severity="warning",
+                    category="dashboard",
+                )
+                print(f"Warning: {message}", file=sys.stderr)
             dashboard = DashboardServer(
                 dashboard_configuration.host,
                 dashboard_configuration.port,

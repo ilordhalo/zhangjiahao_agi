@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 from pathlib import Path
 import re
@@ -56,6 +57,8 @@ class DashboardServer:
         artifacts_root: Path,
         insecure_warning: bool,
     ):
+        if auth_service is None and not _is_loopback_bind(host):
+            raise ValueError("Unauthenticated legacy dashboard must bind to a loopback host")
         self.host = host
         self.requested_port = port
         self.store = store
@@ -89,6 +92,9 @@ class DashboardServer:
                     self._respond_json({"status": "ok"})
                     return
                 if path == "/login":
+                    if dashboard.auth_service is None:
+                        self._redirect("/")
+                        return
                     try:
                         next_path = safe_next_path(_query_value(query, "next"))
                     except _RequestInputError:
@@ -118,6 +124,9 @@ class DashboardServer:
                     return
                 path, _query = target
                 if path == "/login":
+                    if dashboard.auth_service is None:
+                        self._redirect("/")
+                        return
                     self._login()
                     return
                 if path == "/healthz":
@@ -390,6 +399,9 @@ class DashboardServer:
                 self._redirect(next_path or "/", set_cookie=result.set_cookie)
 
             def _logout(self) -> None:
+                if dashboard.auth_service is None:
+                    self._redirect("/")
+                    return
                 form = self._read_form()
                 if form is None:
                     return
@@ -481,6 +493,8 @@ class DashboardServer:
                 return parsed.path, query
 
             def _authenticated(self, path: str) -> bool:
+                if dashboard.auth_service is None:
+                    return True
                 if dashboard.auth_service.authenticate_cookie(self.headers.get("Cookie")) is not None:
                     return True
                 if _is_api_path(path):
@@ -876,6 +890,16 @@ def _decode_identifier(value: str) -> str:
     if _ISSUE_IDENTIFIER.fullmatch(identifier) is None:
         raise _RequestInputError("invalid issue identifier")
     return identifier
+
+
+def _is_loopback_bind(host: str) -> bool:
+    normalized = host.rstrip(".").casefold()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 def _is_api_path(path: str) -> bool:

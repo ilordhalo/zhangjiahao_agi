@@ -98,6 +98,7 @@ def run_installed(
     from symphonz.service.runner import run_service
 
     config = read_config(root / ".symphonz" / "config.toml")
+    legacy_unauthenticated_dashboard = "dashboard" not in config and port is not None
     dashboard_host, dashboard_port, public_base_url, dashboard_username, session_days = (
         _dashboard_values(config, host, port)
     )
@@ -117,6 +118,7 @@ def run_installed(
             public_base_url=public_base_url,
             dashboard_username=dashboard_username,
             session_days=session_days,
+            _legacy_unauthenticated_dashboard=legacy_unauthenticated_dashboard,
         )
     finally:
         os.environ.clear()

@@ -153,8 +153,36 @@ class DashboardHandlerTests(unittest.TestCase):
                 self.assertGreater(int(response["headers"]["Content-Length"]), 0)
                 self.assertEqual(handler.wfile.getvalue(), b"")
 
+    def test_loopback_legacy_mode_allows_requests_without_a_session(self):
+        artifacts = Path(self.tmp.name) / "legacy-artifacts"
+        artifacts.mkdir()
+        server = DashboardServer("127.0.0.1", 0, object(), None, artifacts, False)
+        with (
+            patch("symphonz.service.dashboard.ThreadingHTTPServer", _FakeHTTPServer),
+            patch("symphonz.service.dashboard.Thread", _FakeThread),
+        ):
+            server.start()
+        self.addCleanup(server.stop)
+        handler_class = server.httpd.RequestHandlerClass
+        handler = handler_class.__new__(handler_class)
+        handler.headers = {}
+
+        self.assertTrue(handler._authenticated("/api/overview"))
+
 
 class DashboardStartupTests(unittest.TestCase):
+    def test_legacy_mode_rejects_non_loopback_bind(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "loopback"):
+                DashboardServer(
+                    "0.0.0.0",
+                    4000,
+                    object(),
+                    None,
+                    Path(tmp),
+                    False,
+                )
+
     def test_thread_start_failure_closes_bound_server_and_report_reader(self):
         class FakeReader:
             def __init__(self):
