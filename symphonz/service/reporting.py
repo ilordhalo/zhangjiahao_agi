@@ -382,15 +382,20 @@ class ReportArtifactReader:
     def __init__(self, store, artifact_root: Path):
         self.store = store
         self.artifact_root = Path(os.path.abspath(os.fspath(artifact_root)))
+        self._descriptor_lock = threading.Lock()
         self._artifact_root_fd = _open_pinned_directory(self.artifact_root)
         root_metadata = os.fstat(self._artifact_root_fd)
         self._artifact_root_identity = (root_metadata.st_dev, root_metadata.st_ino)
 
     def close(self) -> None:
-        descriptor = getattr(self, "_artifact_root_fd", -1)
-        if descriptor >= 0:
-            self._artifact_root_fd = -1
-            os.close(descriptor)
+        lock = getattr(self, "_descriptor_lock", None)
+        if lock is None:
+            return
+        with lock:
+            descriptor = getattr(self, "_artifact_root_fd", -1)
+            if descriptor >= 0:
+                self._artifact_root_fd = -1
+                os.close(descriptor)
 
     def __del__(self):
         try:
@@ -427,10 +432,11 @@ class ReportArtifactReader:
         os.close(descriptor)
 
     def _borrow_root_fd(self) -> int:
-        self._assert_root_unchanged()
-        if self._artifact_root_fd < 0:
-            raise RuntimeError("Report artifact reader has been closed.")
-        return os.dup(self._artifact_root_fd)
+        with self._descriptor_lock:
+            if self._artifact_root_fd < 0:
+                raise RuntimeError("Report artifact reader has been closed.")
+            self._assert_root_unchanged()
+            return os.dup(self._artifact_root_fd)
 
     def _open_issue_directory(self, issue_identifier: str, *, create: bool) -> int:
         if _ISSUE_IDENTIFIER.fullmatch(issue_identifier) is None:
@@ -470,9 +476,15 @@ class ReportArtifactReader:
         descriptor = -1
         try:
             try:
+                expected = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError as error:
+                raise RuntimeError("Report artifact is missing.") from error
+            if not stat.S_ISREG(expected.st_mode):
+                raise RuntimeError("Report artifact must be a regular file.")
+            try:
                 descriptor = os.open(
                     filename,
-                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0),
                     dir_fd=directory_fd,
                 )
             except FileNotFoundError as error:
@@ -480,13 +492,18 @@ class ReportArtifactReader:
             metadata = os.fstat(descriptor)
             if not stat.S_ISREG(metadata.st_mode):
                 raise RuntimeError("Report artifact must be a regular file.")
-            source = os.fdopen(descriptor, "r", encoding="utf-8")
+            if (metadata.st_dev, metadata.st_ino) != (expected.st_dev, expected.st_ino):
+                raise RuntimeError("Report artifact changed while opening.")
+            source = os.fdopen(descriptor, "rb")
             descriptor = -1
             with source:
                 content = source.read(_MAX_ARTIFACT_BYTES + 1)
-            if len(content.encode("utf-8")) > _MAX_ARTIFACT_BYTES:
+            if len(content) > _MAX_ARTIFACT_BYTES:
                 raise RuntimeError("Report artifact exceeds the safe size limit.")
-            return content
+            try:
+                return content.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as error:
+                raise RuntimeError("Report artifact is not valid UTF-8.") from error
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -518,17 +535,21 @@ class ReportPublisher(ReportArtifactReader):
         error_sink=None,
         sync_lease_seconds: float = _SYNC_LEASE_SECONDS,
     ):
+        validated_base_url = _public_base_url(public_base_url)
+        validated_lease_seconds = float(sync_lease_seconds)
+        if validated_lease_seconds <= 0:
+            raise ValueError("sync_lease_seconds must be positive")
+        validated_issue_id = _text(active_issue_id, "active_issue_id", _MAX_SHORT_TEXT_LENGTH)
+        validated_issue_identifier = _text(active_issue_identifier, "active_issue_identifier", 64)
+        if _ISSUE_IDENTIFIER.fullmatch(validated_issue_identifier) is None:
+            raise ValueError("active_issue_identifier must be a safe Linear-style identifier.")
         super().__init__(store, artifact_root)
-        self.public_base_url = _public_base_url(public_base_url)
+        self.public_base_url = validated_base_url
         self.linear_client = linear_client
         self.error_sink = error_sink
-        self.sync_lease_seconds = float(sync_lease_seconds)
-        if self.sync_lease_seconds <= 0:
-            raise ValueError("sync_lease_seconds must be positive")
-        self.active_issue_id = _text(active_issue_id, "active_issue_id", _MAX_SHORT_TEXT_LENGTH)
-        self.active_issue_identifier = _text(active_issue_identifier, "active_issue_identifier", 64)
-        if _ISSUE_IDENTIFIER.fullmatch(self.active_issue_identifier) is None:
-            raise ValueError("active_issue_identifier must be a safe Linear-style identifier.")
+        self.sync_lease_seconds = validated_lease_seconds
+        self.active_issue_id = validated_issue_id
+        self.active_issue_identifier = validated_issue_identifier
         _register_publisher(linear_client, self)
 
     def report_url(self, issue_identifier: str) -> str:

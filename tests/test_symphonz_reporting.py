@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 
 def valid_report(**overrides):
@@ -223,6 +224,133 @@ class ReportingTests(unittest.TestCase):
         reader.close()
         with self.assertRaisesRegex(RuntimeError, "closed"):
             reader.read_current_html("SYM-123")
+
+    def test_artifact_reader_rejects_fifo_without_blocking(self):
+        from symphonz.service.reporting import ReportArtifactReader
+
+        publisher = self.publisher()
+        publisher.publish(valid_report())
+        entry = self.store.get_report("SYM-123")
+        artifact = self.artifact_path(entry, "html_path")
+        artifact.unlink()
+        os.mkfifo(artifact)
+        reader = ReportArtifactReader(self.store, self.root / "artifacts")
+        self.addCleanup(reader.close)
+        finished = threading.Event()
+        errors = []
+
+        def read_fifo():
+            try:
+                reader.read_current_html("SYM-123")
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=read_fifo, daemon=True)
+        worker.start()
+        completed_without_writer = finished.wait(timeout=0.2)
+        if not completed_without_writer:
+            writer_fd = os.open(artifact, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(writer_fd)
+            finished.wait(timeout=1)
+        worker.join(timeout=1)
+
+        self.assertTrue(completed_without_writer, "opening a FIFO blocked waiting for a writer")
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], RuntimeError)
+        self.assertRegex(str(errors[0]), "regular file")
+
+    def test_artifact_reader_rejects_oversized_bytes_before_decoding(self):
+        import symphonz.service.reporting as reporting
+
+        publisher = self.publisher()
+        publisher.publish(valid_report())
+        entry = self.store.get_report("SYM-123")
+        artifact = self.artifact_path(entry, "html_path")
+
+        with mock.patch.object(reporting, "_MAX_ARTIFACT_BYTES", 4):
+            artifact.write_bytes(b"\xc3\xa9\xc3\xa9")
+            self.assertEqual(publisher.read_current_html("SYM-123"), "\u00e9\u00e9")
+
+            artifact.write_bytes(b"abcd\xff")
+            with self.assertRaises(Exception) as raised:
+                publisher.read_current_html("SYM-123")
+            self.assertIsInstance(raised.exception, RuntimeError)
+            self.assertRegex(str(raised.exception), "safe size limit")
+
+    def test_artifact_reader_rejects_malformed_utf8_with_clear_error(self):
+        import symphonz.service.reporting as reporting
+
+        publisher = self.publisher()
+        publisher.publish(valid_report())
+        entry = self.store.get_report("SYM-123")
+        artifact = self.artifact_path(entry, "html_path")
+        artifact.write_bytes(b"abc\xff")
+
+        with mock.patch.object(reporting, "_MAX_ARTIFACT_BYTES", 4):
+            with self.assertRaises(Exception) as raised:
+                publisher.read_current_html("SYM-123")
+        self.assertIsInstance(raised.exception, RuntimeError)
+        self.assertRegex(str(raised.exception), "valid UTF-8")
+
+    def test_artifact_reader_serializes_close_with_descriptor_borrow(self):
+        import symphonz.service.reporting as reporting
+
+        publisher = self.publisher()
+        publisher.publish(valid_report(summary="Descriptor race report."))
+        reader = reporting.ReportArtifactReader(self.store, self.root / "artifacts")
+        root_fd = reader._artifact_root_fd
+        original_dup = os.dup
+        duplicate_started = threading.Event()
+        release_duplicate = threading.Event()
+        close_finished = threading.Event()
+        results = []
+        errors = []
+
+        def controlled_dup(descriptor):
+            if descriptor == root_fd and not duplicate_started.is_set():
+                duplicate_started.set()
+                release_duplicate.wait(timeout=1)
+            return original_dup(descriptor)
+
+        def read_report():
+            try:
+                results.append(reader.read_current_html("SYM-123"))
+            except BaseException as error:
+                errors.append(error)
+
+        def close_reader():
+            reader.close()
+            close_finished.set()
+
+        with mock.patch.object(reporting.os, "dup", side_effect=controlled_dup):
+            read_worker = threading.Thread(target=read_report)
+            read_worker.start()
+            self.assertTrue(duplicate_started.wait(timeout=1))
+            close_worker = threading.Thread(target=close_reader)
+            close_worker.start()
+            closed_while_borrowing = close_finished.wait(timeout=0.1)
+            release_duplicate.set()
+            read_worker.join(timeout=1)
+            close_worker.join(timeout=1)
+
+        self.assertFalse(closed_while_borrowing)
+        self.assertFalse(read_worker.is_alive())
+        self.assertFalse(close_worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertIn("Descriptor race report.", results[0])
+
+    def test_publisher_validates_active_issue_before_creating_artifact_root(self):
+        artifact_root = self.root / "invalid-publisher-artifacts"
+
+        with self.assertRaisesRegex(ValueError, "active_issue_identifier"):
+            self.publisher(
+                artifact_root=artifact_root,
+                active_issue_identifier="../SYM-123",
+            )
+
+        self.assertFalse(artifact_root.exists())
 
     def test_second_bundle_write_failure_keeps_previous_database_paths_authoritative(self):
         publisher = self.publisher()
