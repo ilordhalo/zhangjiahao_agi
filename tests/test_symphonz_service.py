@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 
 class WorkflowServiceTests(unittest.TestCase):
@@ -700,6 +701,127 @@ class CodexAppServerTests(unittest.TestCase):
 
             replies = [json.loads(line) for line in records.read_text().splitlines() if json.loads(line).get("id") == 950]
             self.assertEqual(replies[-1]["result"]["decision"], "decline")
+
+    @unittest.skipUnless(os.name == "posix", "process watcher fallback is POSIX-specific")
+    def test_approval_decline_survives_process_watcher_constructor_errors(self):
+        import fcntl
+        import signal
+        import symphonz.service.codex_app_server as codex_app_server
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock_path = root / "descendant.lock"
+            pid_path = root / "descendant.pid"
+            records = root / "records.jsonl"
+            server, _ = self.write_server(
+                root,
+                "import json, os, signal, subprocess, sys\n"
+                f"lock_path = {str(lock_path)!r}\n"
+                f"pid_path = {str(pid_path)!r}\n"
+                f"records = open({str(records)!r}, 'a')\n"
+                "child_code = '''import fcntl, os, signal, sys\n"
+                "lock = open(sys.argv[1], 'w')\n"
+                "fcntl.flock(lock, fcntl.LOCK_EX)\n"
+                "os.write(int(sys.argv[2]), b'1')\n"
+                "signal.pause()\n'''\n"
+                "ready_read, ready_write = os.pipe()\n"
+                "child = subprocess.Popen([sys.executable, '-c', child_code, lock_path, str(ready_write)], pass_fds=(ready_write,))\n"
+                "os.close(ready_write)\n"
+                "os.read(ready_read, 1); os.close(ready_read)\n"
+                "with open(pid_path, 'w') as output: output.write(str(child.pid))\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); records.write(json.dumps(msg) + '\\n'); records.flush(); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        print(json.dumps({'id': 953, 'method': 'item/commandExecution/requestApproval', 'params': {}}), flush=True)\n"
+                "        tail = sys.stdin.read()\n"
+                "        records.write(tail); records.flush()\n"
+                "        break\n",
+            )
+
+            try:
+                with (
+                    mock.patch.object(
+                        codex_app_server.os,
+                        "pidfd_open",
+                        side_effect=OSError("pidfd unsupported"),
+                        create=True,
+                    ) as pidfd_open,
+                    mock.patch.object(
+                        codex_app_server.select,
+                        "kqueue",
+                        side_effect=OSError("kqueue unsupported"),
+                        create=True,
+                    ) as kqueue,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "approval_required"):
+                        self.client(server).run_turn(**self.run_kwargs(root))
+
+                pidfd_open.assert_called()
+                kqueue.assert_called()
+                replies = [
+                    json.loads(line)
+                    for line in records.read_text().splitlines()
+                    if json.loads(line).get("id") == 953
+                ]
+                self.assertEqual(replies[-1]["result"]["decision"], "decline")
+                with lock_path.open("w") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                if pid_path.exists():
+                    try:
+                        os.kill(int(pid_path.read_text()), signal.SIGKILL)
+                    except (PermissionError, ProcessLookupError):
+                        pass
+
+    @unittest.skipUnless(os.name == "posix", "process watcher fallback is POSIX-specific")
+    def test_approval_decline_uses_bounded_fallback_without_process_watchers(self):
+        import symphonz.service.codex_app_server as codex_app_server
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = root / "records.jsonl"
+            server, _ = self.write_server(
+                root,
+                "import json, sys\n"
+                f"records = open({str(records)!r}, 'a')\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); records.write(json.dumps(msg) + '\\n'); records.flush(); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        print(json.dumps({'id': 954, 'method': 'item/commandExecution/requestApproval', 'params': {}}), flush=True)\n"
+                "        tail = sys.stdin.read()\n"
+                "        records.write(tail); records.flush()\n"
+                "        break\n",
+            )
+
+            with (
+                mock.patch.object(codex_app_server.os, "pidfd_open", None, create=True),
+                mock.patch.object(codex_app_server.select, "kqueue", None, create=True),
+                mock.patch.object(codex_app_server.os, "waitid", None, create=True),
+                mock.patch.object(
+                    codex_app_server,
+                    "_wait_with_libc_waitid",
+                    return_value=None,
+                    create=True,
+                ),
+            ):
+                started = time.monotonic()
+                with self.assertRaisesRegex(RuntimeError, "approval_required"):
+                    self.client(server).run_turn(**self.run_kwargs(root))
+                elapsed = time.monotonic() - started
+
+            replies = [
+                json.loads(line)
+                for line in records.read_text().splitlines()
+                if json.loads(line).get("id") == 954
+            ]
+            self.assertEqual(replies[-1]["result"]["decision"], "decline")
+            self.assertLess(elapsed, 1)
 
     def test_never_approval_policy_preserves_decline_when_event_callback_raises(self):
         with tempfile.TemporaryDirectory() as tmp:

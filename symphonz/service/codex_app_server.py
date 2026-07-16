@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterator
 from copy import deepcopy
 from itertools import count
 from pathlib import Path
+import ctypes
 import json
 import os
 import queue
@@ -545,14 +546,16 @@ def _stop_process_group(
     graceful: bool,
     pipe_closed: tuple[threading.Event, ...],
 ) -> None:
-    leader_exited = _wait_for_process_exit_without_reaping(process.pid, timeout=0)
+    leader_exited = _wait_for_process_exit_without_reaping(
+        process.pid, timeout=0, pipe_closed=pipe_closed
+    )
     if graceful and process.stdin is not None:
         try:
             process.stdin.close()
         except (BrokenPipeError, OSError):
             pass
         leader_exited = leader_exited or _wait_for_process_exit_without_reaping(
-            process.pid, timeout=2
+            process.pid, timeout=2, pipe_closed=pipe_closed
         )
 
     pipes_closed = all(event.is_set() for event in pipe_closed)
@@ -560,7 +563,9 @@ def _stop_process_group(
         _signal_process_group(process_group_id, signal.SIGTERM)
         deadline = time.monotonic() + 2
         leader_exited = leader_exited or _wait_for_process_exit_without_reaping(
-            process.pid, timeout=max(0, deadline - time.monotonic())
+            process.pid,
+            timeout=max(0, deadline - time.monotonic()),
+            pipe_closed=pipe_closed,
         )
         pipes_closed = _wait_for_events(pipe_closed, deadline=deadline)
 
@@ -576,34 +581,145 @@ def _stop_process_group(
     _wait_for_events(pipe_closed, deadline=time.monotonic() + 2)
 
 
-def _wait_for_process_exit_without_reaping(process_id: int, *, timeout: float) -> bool:
+def _wait_for_process_exit_without_reaping(
+    process_id: int,
+    *,
+    timeout: float,
+    pipe_closed: tuple[threading.Event, ...],
+) -> bool:
     timeout = max(0, timeout)
-    if hasattr(os, "pidfd_open"):
+    pidfd_open = getattr(os, "pidfd_open", None)
+    if callable(pidfd_open):
         try:
-            descriptor = os.pidfd_open(process_id)
+            descriptor = pidfd_open(process_id)
         except ProcessLookupError:
             return True
+        except (OSError, NotImplementedError):
+            pass
+        else:
+            try:
+                ready, _, _ = select.select([descriptor], [], [], timeout)
+                return bool(ready)
+            except (OSError, NotImplementedError):
+                pass
+            finally:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+    kqueue = getattr(select, "kqueue", None)
+    if callable(kqueue):
         try:
-            ready, _, _ = select.select([descriptor], [], [], timeout)
-            return bool(ready)
-        finally:
-            os.close(descriptor)
-    if hasattr(select, "kqueue"):
-        watcher = select.kqueue()
-        event = select.kevent(
-            process_id,
-            filter=select.KQ_FILTER_PROC,
-            flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
-            fflags=select.KQ_NOTE_EXIT,
-        )
-        try:
-            return bool(watcher.control([event], 1, timeout))
-        except ProcessLookupError:
-            return True
-        finally:
-            watcher.close()
-    threading.Event().wait(timeout)
+            watcher = kqueue()
+        except (OSError, NotImplementedError):
+            pass
+        else:
+            try:
+                event = select.kevent(
+                    process_id,
+                    filter=select.KQ_FILTER_PROC,
+                    flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                    fflags=select.KQ_NOTE_EXIT,
+                )
+                return bool(watcher.control([event], 1, timeout))
+            except ProcessLookupError:
+                return True
+            except (OSError, NotImplementedError):
+                pass
+            finally:
+                try:
+                    watcher.close()
+                except OSError:
+                    pass
+
+    waitid_result = _wait_with_os_waitid(process_id, timeout=timeout)
+    if waitid_result is not None:
+        return waitid_result
+    waitid_result = _wait_with_libc_waitid(process_id, timeout=timeout)
+    if waitid_result is not None:
+        return waitid_result
+
+    # With no non-reaping process primitive, use pipe EOF only to end the
+    # bounded grace period. It is not proof of leader exit, so return false and
+    # let the caller signal the still-reserved process group before reaping.
+    _wait_for_events(pipe_closed, deadline=time.monotonic() + timeout)
     return False
+
+
+def _wait_with_os_waitid(process_id: int, *, timeout: float) -> bool | None:
+    waitid = getattr(os, "waitid", None)
+    required = ("P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
+    if not callable(waitid) or not all(hasattr(os, name) for name in required):
+        return None
+
+    try:
+        status = waitid(
+            os.P_PID,
+            process_id,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+    except (ChildProcessError, ProcessLookupError):
+        return True
+    except (OSError, NotImplementedError):
+        return None
+    if status is not None or timeout <= 0:
+        return status is not None
+
+    return _wait_for_blocking_waitid(
+        lambda: waitid(os.P_PID, process_id, os.WEXITED | os.WNOWAIT),
+        timeout=timeout,
+    )
+
+
+def _wait_with_libc_waitid(process_id: int, *, timeout: float) -> bool | None:
+    required = ("P_PID", "WEXITED", "WNOWAIT")
+    if timeout <= 0 or not all(hasattr(os, name) for name in required):
+        return None
+    try:
+        waitid = ctypes.CDLL(None, use_errno=True).waitid
+        waitid.argtypes = (ctypes.c_int, ctypes.c_uint, ctypes.c_void_p, ctypes.c_int)
+        waitid.restype = ctypes.c_int
+    except (AttributeError, OSError):
+        return None
+
+    def observe() -> None:
+        status = ctypes.create_string_buffer(256)
+        if waitid(
+            os.P_PID,
+            process_id,
+            ctypes.byref(status),
+            os.WEXITED | os.WNOWAIT,
+        ) != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number))
+
+    return _wait_for_blocking_waitid(observe, timeout=timeout)
+
+
+def _wait_for_blocking_waitid(
+    observe: Callable[[], object], *, timeout: float
+) -> bool | None:
+    completed = threading.Event()
+    outcome: dict[str, object] = {}
+
+    def run() -> None:
+        try:
+            observe()
+        except (ChildProcessError, ProcessLookupError):
+            outcome["exited"] = True
+        except (OSError, NotImplementedError):
+            outcome["unavailable"] = True
+        else:
+            outcome["exited"] = True
+        finally:
+            completed.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    if not completed.wait(timeout=max(0, timeout)):
+        return False
+    if outcome.get("unavailable"):
+        return None
+    return bool(outcome.get("exited"))
 
 
 def _wait_for_events(events: tuple[threading.Event, ...], *, deadline: float) -> bool:
@@ -616,7 +732,7 @@ def _wait_for_events(events: tuple[threading.Event, ...], *, deadline: float) ->
 def _signal_process_group(process_group_id: int, signal_number: int) -> None:
     try:
         os.killpg(process_group_id, signal_number)
-    except ProcessLookupError:
+    except OSError:
         pass
 
 
