@@ -11,6 +11,7 @@ import re
 import secrets
 import stat
 import subprocess
+import warnings
 
 from symphonz.service.auth import DashboardAuth, PasswordRecord, hash_password, validate_password_record
 
@@ -58,6 +59,14 @@ _LEGACY_CONFIG_LAYOUT = (
     "[logs]",
     "root",
 )
+_LEGACY_FIXED_VALUES = {
+    "runtime": {
+        "mode": "embedded",
+        "command": "symphonz-internal",
+    },
+    "workspace": {"root": ".symphonz/workspace"},
+    "logs": {"root": ".symphonz/logs"},
+}
 
 
 @dataclass(frozen=True)
@@ -124,12 +133,78 @@ def _render_config(config: InstallConfig) -> str:
     )
 
 
+def _capture_cleanup_error(
+    errors: list[tuple[str, BaseException]],
+    operation: str,
+    cleanup: Callable[[], object],
+) -> None:
+    try:
+        cleanup()
+    except BaseException as error:
+        errors.append((operation, error))
+
+
+def _complete_atomic_operation(
+    primary_error: BaseException | None,
+    cleanup_errors: list[tuple[str, BaseException]],
+    *,
+    committed: bool = False,
+    warning_context: str = "Atomic write",
+) -> None:
+    if primary_error is not None:
+        if cleanup_errors:
+            details = "; ".join(
+                f"{operation} also failed: {error}" for operation, error in cleanup_errors
+            )
+            raise RuntimeError(f"{primary_error}; {details}") from primary_error
+        raise primary_error.with_traceback(primary_error.__traceback__)
+    if not cleanup_errors:
+        return
+    if committed:
+        details = "; ".join(
+            f"{operation} failed: {type(error).__name__}: {error}"
+            for operation, error in cleanup_errors
+        )
+        try:
+            warnings.warn(
+                f"{warning_context} committed successfully; cleanup diagnostic: {details}",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        except BaseException:
+            pass
+        return
+    first_error = cleanup_errors[0][1]
+    if len(cleanup_errors) == 1:
+        raise first_error.with_traceback(first_error.__traceback__)
+    details = "; ".join(
+        f"{operation} failed: {error}" for operation, error in cleanup_errors[1:]
+    )
+    raise RuntimeError(f"{first_error}; {details}") from first_error
+
+
+def _write_synced_file(output, content: str | bytes, close_operation: str) -> None:
+    primary_error: BaseException | None = None
+    try:
+        output.write(content)
+        output.flush()
+        os.fsync(output.fileno())
+    except BaseException as error:
+        primary_error = error
+
+    cleanup_errors: list[tuple[str, BaseException]] = []
+    _capture_cleanup_error(cleanup_errors, close_operation, output.close)
+    _complete_atomic_operation(primary_error, cleanup_errors)
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = -1
+    directory_descriptor = -1
     temporary_path: Path | None = None
     primary_error: BaseException | None = None
+    committed = False
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
         for _unused in range(100):
@@ -145,38 +220,41 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
         output = os.fdopen(descriptor, "w", encoding="utf-8")
         descriptor = -1
-        with output:
-            output.write(content)
-            output.flush()
-            os.fsync(output.fileno())
+        _write_synced_file(output, content, "temporary file close")
         os.replace(temporary_path, path)
         temporary_path = None
         directory_descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+        os.fsync(directory_descriptor)
+        committed = True
     except BaseException as error:
         primary_error = error
 
+    cleanup_errors: list[tuple[str, BaseException]] = []
     if descriptor >= 0:
-        os.close(descriptor)
-    cleanup_error = None
+        _capture_cleanup_error(
+            cleanup_errors,
+            "temporary descriptor close",
+            lambda: os.close(descriptor),
+        )
     if temporary_path is not None:
         try:
             temporary_path.unlink()
         except FileNotFoundError:
             pass
         except BaseException as error:
-            cleanup_error = error
-    if primary_error is not None:
-        if cleanup_error is not None:
-            raise RuntimeError(
-                f"{primary_error}; temporary file cleanup also failed: {cleanup_error}"
-            ) from primary_error
-        raise primary_error.with_traceback(primary_error.__traceback__)
-    if cleanup_error is not None:
-        raise cleanup_error
+            cleanup_errors.append(("temporary file cleanup", error))
+    if directory_descriptor >= 0:
+        _capture_cleanup_error(
+            cleanup_errors,
+            "directory descriptor close",
+            lambda: os.close(directory_descriptor),
+        )
+    _complete_atomic_operation(
+        primary_error,
+        cleanup_errors,
+        committed=committed,
+        warning_context="Atomic text write",
+    )
 
 
 def read_config(path: Path) -> dict[str, dict[str, str]]:
@@ -282,6 +360,17 @@ def _decode_basic_toml_key(value: str) -> str | None:
 
 
 def classify_dashboard_config(content: str) -> str:
+    table_mode = _classify_dashboard_tables(content)
+    if table_mode is not None:
+        return table_mode
+    if _is_generated_legacy_config(content):
+        return "legacy"
+    raise RuntimeError(
+        "Dashboard configuration is missing or ambiguous; run `symphonz configure-dashboard` to regenerate it"
+    )
+
+
+def _classify_dashboard_tables(content: str) -> str | None:
     dashboard_headers = []
     for line in content.splitlines():
         header = _table_header_path(line)
@@ -301,11 +390,7 @@ def classify_dashboard_config(content: str) -> str:
             "Dashboard configuration uses a noncanonical dashboard-related table; "
             "run `symphonz configure-dashboard` after resolving it"
         )
-    if _is_generated_legacy_config(content):
-        return "legacy"
-    raise RuntimeError(
-        "Dashboard configuration is missing or ambiguous; run `symphonz configure-dashboard` to regenerate it"
-    )
+    return None
 
 
 def _is_generated_legacy_config(content: str) -> bool:
@@ -322,7 +407,12 @@ def _is_generated_legacy_config(content: str) -> bool:
         prefix = f"{expected} = "
         if not line.startswith(prefix) or _GENERATED_TOML_STRING.fullmatch(line[len(prefix) :]) is None:
             return False
-    return True
+    parsed = _parse_config(content)
+    return all(
+        parsed.get(section, {}).get(key) == expected
+        for section, values in _LEGACY_FIXED_VALUES.items()
+        for key, expected in values.items()
+    )
 
 
 def _is_table_header(line: str) -> bool:
@@ -360,6 +450,7 @@ def write_auth_config(path: Path, password: str) -> DashboardAuth:
     temporary_name: str | None = None
     primary_error: BaseException | None = None
     result: DashboardAuth | None = None
+    committed = False
     try:
         _validate_auth_destination(path, directory_descriptor)
         previous = _snapshot_auth_destination(path.name, directory_descriptor)
@@ -375,14 +466,12 @@ def write_auth_config(path: Path, password: str) -> DashboardAuth:
                 "",
             ]
         )
+        result = DashboardAuth(password_record=record, session_secret=session_secret)
         descriptor, temporary_name = _create_auth_temp(path.name, directory_descriptor)
         os.fchmod(descriptor, 0o600)
         auth_file = os.fdopen(descriptor, "w", encoding="utf-8")
         descriptor = -1
-        with auth_file:
-            auth_file.write(content)
-            auth_file.flush()
-            os.fsync(auth_file.fileno())
+        _write_synced_file(auth_file, content, "temporary auth file close")
         _validate_auth_destination(path, directory_descriptor)
         os.replace(
             temporary_name,
@@ -401,25 +490,32 @@ def write_auth_config(path: Path, password: str) -> DashboardAuth:
                     f"{commit_error}; auth rollback also failed: {rollback_error}"
                 ) from commit_error
             raise
-        result = DashboardAuth(password_record=record, session_secret=session_secret)
+        committed = True
     except BaseException as error:
         primary_error = error
 
-    cleanup_error = None
+    cleanup_errors: list[tuple[str, BaseException]] = []
     if descriptor >= 0:
-        os.close(descriptor)
+        _capture_cleanup_error(
+            cleanup_errors,
+            "temporary auth descriptor close",
+            lambda: os.close(descriptor),
+        )
     if temporary_name is not None:
         cleanup_error = _cleanup_auth_temp(temporary_name, directory_descriptor)
-    os.close(directory_descriptor)
-
-    if primary_error is not None:
         if cleanup_error is not None:
-            raise RuntimeError(
-                f"{primary_error}; temporary auth cleanup also failed: {cleanup_error}"
-            ) from primary_error
-        raise primary_error.with_traceback(primary_error.__traceback__)
-    if cleanup_error is not None:
-        raise cleanup_error
+            cleanup_errors.append(("temporary auth cleanup", cleanup_error))
+    _capture_cleanup_error(
+        cleanup_errors,
+        "auth directory descriptor close",
+        lambda: os.close(directory_descriptor),
+    )
+    _complete_atomic_operation(
+        primary_error,
+        cleanup_errors,
+        committed=committed,
+        warning_context="Dashboard auth write",
+    )
     assert result is not None
     return result
 
@@ -437,17 +533,37 @@ def _snapshot_auth_destination(
         )
     except FileNotFoundError:
         return None
+    primary_error: BaseException | None = None
+    result: tuple[bytes, int] | None = None
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise RuntimeError("Dashboard auth configuration destination must be a regular file")
         auth_file = os.fdopen(descriptor, "rb")
         descriptor = -1
-        with auth_file:
-            return auth_file.read(), stat.S_IMODE(metadata.st_mode)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+        read_error: BaseException | None = None
+        content = b""
+        try:
+            content = auth_file.read()
+        except BaseException as error:
+            read_error = error
+        read_cleanup_errors: list[tuple[str, BaseException]] = []
+        _capture_cleanup_error(read_cleanup_errors, "auth snapshot file close", auth_file.close)
+        _complete_atomic_operation(read_error, read_cleanup_errors)
+        result = content, stat.S_IMODE(metadata.st_mode)
+    except BaseException as error:
+        primary_error = error
+
+    cleanup_errors: list[tuple[str, BaseException]] = []
+    if descriptor >= 0:
+        _capture_cleanup_error(
+            cleanup_errors,
+            "auth snapshot descriptor close",
+            lambda: os.close(descriptor),
+        )
+    _complete_atomic_operation(primary_error, cleanup_errors)
+    assert result is not None
+    return result
 
 
 def _restore_auth_destination(
@@ -464,15 +580,13 @@ def _restore_auth_destination(
     descriptor = -1
     temporary_name: str | None = None
     primary_error: BaseException | None = None
+    committed = False
     try:
         descriptor, temporary_name = _create_auth_temp(filename, directory_descriptor)
         os.fchmod(descriptor, mode)
         auth_file = os.fdopen(descriptor, "wb")
         descriptor = -1
-        with auth_file:
-            auth_file.write(content)
-            auth_file.flush()
-            os.fsync(auth_file.fileno())
+        _write_synced_file(auth_file, content, "auth rollback file close")
         _validate_auth_destination(Path(filename), directory_descriptor)
         os.replace(
             temporary_name,
@@ -482,22 +596,27 @@ def _restore_auth_destination(
         )
         temporary_name = None
         os.fsync(directory_descriptor)
+        committed = True
     except BaseException as error:
         primary_error = error
 
-    cleanup_error = None
+    cleanup_errors: list[tuple[str, BaseException]] = []
     if descriptor >= 0:
-        os.close(descriptor)
+        _capture_cleanup_error(
+            cleanup_errors,
+            "auth rollback descriptor close",
+            lambda: os.close(descriptor),
+        )
     if temporary_name is not None:
         cleanup_error = _cleanup_auth_temp(temporary_name, directory_descriptor)
-    if primary_error is not None:
         if cleanup_error is not None:
-            raise RuntimeError(
-                f"{primary_error}; auth rollback temporary cleanup also failed: {cleanup_error}"
-            ) from primary_error
-        raise primary_error.with_traceback(primary_error.__traceback__)
-    if cleanup_error is not None:
-        raise cleanup_error
+            cleanup_errors.append(("auth rollback temporary cleanup", cleanup_error))
+    _complete_atomic_operation(
+        primary_error,
+        cleanup_errors,
+        committed=committed,
+        warning_context="Dashboard auth rollback",
+    )
 
 
 def _cleanup_auth_temp(temporary_name: str, directory_descriptor: int) -> BaseException | None:
@@ -980,7 +1099,7 @@ def configure_dashboard(
 
     environ = os.environ if environ is None else environ
     content = config_path.read_text()
-    classify_dashboard_config(content)
+    _classify_dashboard_tables(content)
     _dashboard_section_bounds(content.splitlines(keepends=True))
     current = _parse_config(content).get("dashboard", {})
     resolved_host = (host if host is not None else current.get("host", DEFAULT_DASHBOARD_HOST)).strip()

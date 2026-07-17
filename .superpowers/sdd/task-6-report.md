@@ -225,3 +225,47 @@ messages while the complete suite exited successfully.
    plaintext test passwords. Test-only password fixtures remain confined to
    the injected failure cases.
 8. `docs/index.html` remains intentionally deferred and unchanged.
+
+## Final Important Review Fixes
+
+- Tightened the runtime-only 0.3 compatibility classifier to require the
+  exact generated table/key layout and generator-owned values: embedded
+  runtime mode, `symphonz-internal` command, `.symphonz/workspace` workspace
+  root, and `.symphonz/logs` logs root. Same-shape edits now fail closed before
+  the service can activate the unauthenticated loopback bridge.
+- Split strict runtime classification from dashboard migration validation.
+  `configure-dashboard` now accepts no-dashboard configs with comments,
+  custom sections, or noncanonical formatting, preserves every existing byte,
+  and appends the generated dashboard section. Duplicate semantic dashboard
+  roots, dotted/implicit tables, and dashboard array tables still fail before
+  password resolution or file mutation.
+- Made descriptor cleanup commit-aware across non-secret atomic writes, auth
+  writes, auth snapshots, and auth restoration. Precommit close failures are
+  secondary to the original exception. Once replace and required directory
+  fsync succeed, close-only failures produce a non-raising, secret-free
+  `RuntimeWarning`; `configure-dashboard` no longer rolls back committed config
+  while leaving rotated auth in place.
+
+### Final Review TDD and Validation
+
+1. Four fixed-value RED subcases each reached `run_service` instead of failing
+   closed. GREEN rejects modifications to runtime mode, runtime command,
+   workspace root, and logs root while preserving exact generated 0.3 support.
+2. Commented, custom-section, and noncanonically formatted no-dashboard RED
+   migrations all stopped at the strict runtime classifier. GREEN migrates all
+   three and verifies the original byte prefix is unchanged.
+3. Injected close-failure RED tests showed raw descriptor cleanup masking
+   config/auth primaries, auth rollback losing its preparation error, and
+   committed config/auth directory closes triggering rollback. GREEN preserves
+   causal primaries and treats committed close-only failures as warnings with
+   no password text.
+4. Focused config/runtime regressions: PASS, 52 tests in 5.970s.
+5. Complete CLI and service modules: PASS, 216 tests in 16.145s.
+6. Dashboard non-socket handler, startup, and template suites: PASS, 10 tests.
+7. Python 3.9-compatible `py_compile`: PASS.
+8. `./bin/symphonz version`: PASS, exact output `symphonz 0.4.0`.
+9. `sh -n install.sh` and `git diff --check`: PASS.
+10. Scope and privacy checks: PASS; only the report, installer module, and CLI
+    tests changed, with no local paths or plaintext password fixtures in
+    production/documentation/report files.
+11. `docs/index.html` remains deferred and unchanged.

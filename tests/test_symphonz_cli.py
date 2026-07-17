@@ -8,6 +8,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+import warnings
 from unittest.mock import patch
 
 from symphonz.cli import main
@@ -374,6 +375,82 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("replace failed", str(raised.exception.__cause__))
             self.assertEqual(path.read_text(), "old-config")
 
+    def test_write_auth_config_descriptor_close_failure_is_secondary_to_precommit_primary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".symphonz" / "auth.toml"
+            real_close = os.close
+            close_calls = 0
+
+            def fail_first_close(descriptor):
+                nonlocal close_calls
+                close_calls += 1
+                real_close(descriptor)
+                if close_calls == 1:
+                    raise OSError("auth descriptor close failed")
+
+            with (
+                patch("symphonz.install.os.fchmod", side_effect=OSError("auth preparation failed")),
+                patch("symphonz.install.os.close", side_effect=fail_first_close),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "auth preparation failed.*auth descriptor close failed",
+                ) as raised:
+                    write_auth_config(path, "descriptor-test-password")
+
+            self.assertIsInstance(raised.exception.__cause__, OSError)
+            self.assertIn("auth preparation failed", str(raised.exception.__cause__))
+            self.assertNotIn("descriptor-test-password", str(raised.exception))
+            self.assertFalse(path.exists())
+
+    def test_auth_restore_descriptor_close_failure_preserves_restore_primary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".symphonz" / "auth.toml"
+            write_auth_config(path, "old-password")
+            real_close = os.close
+            real_fchmod = os.fchmod
+            real_fsync = os.fsync
+            close_calls = 0
+            fchmod_calls = 0
+            failed_directory_fsync = False
+
+            def fail_first_close(descriptor):
+                nonlocal close_calls
+                close_calls += 1
+                real_close(descriptor)
+                if close_calls == 1:
+                    raise OSError("restore descriptor close failed")
+
+            def fail_restore_fchmod(descriptor, mode):
+                nonlocal fchmod_calls
+                fchmod_calls += 1
+                if fchmod_calls == 2:
+                    raise OSError("restore preparation failed")
+                return real_fchmod(descriptor, mode)
+
+            def fail_first_directory_fsync(descriptor):
+                nonlocal failed_directory_fsync
+                if stat.S_ISDIR(os.fstat(descriptor).st_mode) and not failed_directory_fsync:
+                    failed_directory_fsync = True
+                    raise OSError("auth directory fsync failed")
+                return real_fsync(descriptor)
+
+            with (
+                patch("symphonz.install.os.close", side_effect=fail_first_close),
+                patch("symphonz.install.os.fchmod", side_effect=fail_restore_fchmod),
+                patch("symphonz.install.os.fsync", side_effect=fail_first_directory_fsync),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "auth directory fsync failed.*auth rollback.*restore preparation failed"
+                    ".*restore descriptor close failed",
+                ) as raised:
+                    write_auth_config(path, "new-password")
+
+            self.assertIsInstance(raised.exception.__cause__, OSError)
+            self.assertIn("auth directory fsync failed", str(raised.exception.__cause__))
+            self.assertNotIn("new-password", str(raised.exception))
+
     def test_write_auth_config_surfaces_commit_and_rollback_failures(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".symphonz" / "auth.toml"
@@ -528,6 +605,43 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("replace failed", str(raised.exception.__cause__))
             self.assertEqual(path.read_text(), "old-config\n")
 
+    def test_write_config_descriptor_close_failure_is_secondary_to_precommit_primary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            config = InstallConfig(
+                runtime_mode="embedded",
+                runtime_command="symphonz-internal",
+                linear_api_key_env="LINEAR_API_KEY",
+                linear_project_slug="project",
+                git_provider="github",
+                repo_url="https://github.com/example/project.git",
+                base_branch="main",
+                mr_target="main",
+                gitlab_base_url="",
+                workspace_root=".symphonz/workspace",
+                logs_root=".symphonz/logs",
+            )
+            real_close = os.close
+
+            def close_then_fail(descriptor):
+                real_close(descriptor)
+                raise OSError("config descriptor close failed")
+
+            with (
+                patch("symphonz.install.os.fdopen", side_effect=OSError("config fdopen failed")),
+                patch("symphonz.install.os.close", side_effect=close_then_fail),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "config fdopen failed.*config descriptor close failed",
+                ) as raised:
+                    write_config(path, config)
+
+            self.assertIsInstance(raised.exception.__cause__, OSError)
+            self.assertIn("config fdopen failed", str(raised.exception.__cause__))
+            self.assertFalse(path.exists())
+            self.assertEqual(list(path.parent.glob(".config.toml.*.tmp")), [])
+
     def test_configure_dashboard_preserves_other_config_bytes_and_workflow(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -604,6 +718,48 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(read_config(config_path)["dashboard"]["host"], "127.0.0.2")
             self.assertNotIn("environment-secret", content)
             self.assertIn(".symphonz/artifacts/", (root / ".gitignore").read_text())
+
+    def test_configure_dashboard_migrates_no_dashboard_config_with_comments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / ".symphonz" / "config.toml"
+            config_path.parent.mkdir()
+            original = "# retained project note\n" + _legacy_config_content()
+            config_path.write_text(original)
+
+            configure_dashboard(root, password="comment-migration-secret")
+
+            updated = config_path.read_text()
+            self.assertEqual(updated[: len(original)], original)
+            self.assertEqual(read_config(config_path)["dashboard"]["port"], "4000")
+
+    def test_configure_dashboard_migrates_no_dashboard_config_with_custom_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / ".symphonz" / "config.toml"
+            config_path.parent.mkdir()
+            original = _legacy_config_content() + '\n[custom]\nvalue = "preserve-me"\n'
+            config_path.write_text(original)
+
+            configure_dashboard(root, password="custom-migration-secret")
+
+            updated = config_path.read_text()
+            self.assertEqual(updated[: len(original)], original)
+            self.assertEqual(read_config(config_path)["custom"]["value"], "preserve-me")
+
+    def test_configure_dashboard_migrates_noncanonical_no_dashboard_formatting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / ".symphonz" / "config.toml"
+            config_path.parent.mkdir()
+            original = _legacy_config_content().replace(" = ", "=").rstrip("\n")
+            config_path.write_text(original)
+
+            configure_dashboard(root, password="format-migration-secret")
+
+            updated = config_path.read_text()
+            self.assertEqual(updated[: len(original)], original)
+            self.assertEqual(read_config(config_path)["dashboard"]["session_days"], "30")
 
     def test_configure_dashboard_replaces_commented_section_header(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -841,6 +997,55 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(restored.session_secret, old_auth.session_secret)
             self.assertTrue(verify_password("old-password", restored.password_record))
             self.assertFalse(verify_password("new-password", restored.password_record))
+
+    def test_configure_dashboard_committed_close_failures_do_not_roll_back(self):
+        for failed_close, marker in [
+            (2, "config directory close failed"),
+            (3, "auth directory close failed"),
+        ]:
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_path = root / ".symphonz" / "config.toml"
+                write_config(
+                    config_path,
+                    InstallConfig(
+                        runtime_mode="embedded",
+                        runtime_command="symphonz-internal",
+                        linear_api_key_env="LINEAR_API_KEY",
+                        linear_project_slug="project",
+                        git_provider="github",
+                        repo_url="https://github.com/example/project.git",
+                        base_branch="main",
+                        mr_target="main",
+                        gitlab_base_url="",
+                        workspace_root=".symphonz/workspace",
+                        logs_root=".symphonz/logs",
+                    ),
+                )
+                auth_path = root / ".symphonz" / "auth.toml"
+                write_auth_config(auth_path, "old-password")
+                real_close = os.close
+                close_calls = 0
+
+                def fail_selected_close(descriptor):
+                    nonlocal close_calls
+                    close_calls += 1
+                    real_close(descriptor)
+                    if close_calls == failed_close:
+                        raise OSError(marker)
+
+                with warnings.catch_warnings(record=True) as diagnostics:
+                    warnings.simplefilter("always")
+                    with patch("symphonz.install.os.close", side_effect=fail_selected_close):
+                        configure_dashboard(root, port=4200, password="new-password")
+
+                committed_auth = read_dashboard_auth(root)
+                self.assertEqual(read_config(config_path)["dashboard"]["port"], "4200")
+                self.assertTrue(verify_password("new-password", committed_auth.password_record))
+                self.assertFalse(verify_password("old-password", committed_auth.password_record))
+                diagnostic_text = "\n".join(str(item.message) for item in diagnostics)
+                self.assertIn(marker, diagnostic_text)
+                self.assertNotIn("new-password", diagnostic_text)
 
     def test_configure_dashboard_requires_a_secure_password(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1446,6 +1651,26 @@ class RuntimeTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "configure-dashboard"):
                 build_run_command(root, port=4700)
+
+    def test_modified_legacy_fixed_values_never_enable_unauthenticated_mode(self):
+        modifications = [
+            ('mode = "embedded"', 'mode = "global"'),
+            ('command = "symphonz-internal"', 'command = "custom-runner"'),
+            ('root = ".symphonz/workspace"', 'root = "custom-workspace"'),
+            ('root = ".symphonz/logs"', 'root = "custom-logs"'),
+        ]
+        for original, replacement in modifications:
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._write_legacy_config(root)
+                config_path = root / ".symphonz" / "config.toml"
+                config_path.write_text(config_path.read_text().replace(original, replacement))
+
+                with patch("symphonz.service.runner.run_service") as service:
+                    with self.assertRaisesRegex(RuntimeError, "configure-dashboard"):
+                        run_installed(project_root=root, port=4700)
+
+                service.assert_not_called()
 
     def test_legacy_explicit_port_runs_without_auth_on_loopback(self):
         with tempfile.TemporaryDirectory() as tmp:
