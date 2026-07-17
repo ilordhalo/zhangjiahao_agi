@@ -1,20 +1,74 @@
 from __future__ import annotations
 
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Thread
+import ipaddress
 import json
+from pathlib import Path
+import re
+from threading import Thread
 import time
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
-from symphonz.service.models import RuntimeState
+from symphonz.service.auth import (
+    AuthenticationError,
+    LoginLockedError,
+    SESSION_COOKIE_NAME,
+    safe_next_path,
+)
+from symphonz.service.reporting import ReportArtifactReader
+from symphonz.service.runtime_store import RuntimeStoreInputError
+from symphonz.service.web_templates import (
+    render_error_page,
+    render_errors_page,
+    render_issue_page,
+    render_login_page,
+    render_overview_page,
+    render_tasks_page,
+)
+
+
+_MAX_REQUEST_TARGET_BYTES = 8192
+_MAX_FORM_BYTES = 4096
+_MAX_QUERY_FIELDS = 32
+_ISSUE_IDENTIFIER = re.compile(r"[A-Za-z][A-Za-z0-9]*-[0-9]+")
+_DASHBOARD_CSP = (
+    "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+    "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'self'"
+)
+_REPORT_CSP = (
+    "default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'self'"
+)
+_QUIET_EVENT_MARKERS = ("delta", "token_count", "token_usage", "text_stream")
+
+
+class _RequestInputError(ValueError):
+    pass
 
 
 class DashboardServer:
-    def __init__(self, host: str, port: int, state: RuntimeState):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        store,
+        auth_service,
+        artifacts_root: Path,
+        insecure_warning: bool,
+    ):
+        if auth_service is None and not _is_loopback_bind(host):
+            raise ValueError("Unauthenticated legacy dashboard must bind to a loopback host")
         self.host = host
         self.requested_port = port
-        self.state = state
+        self.store = store
+        self.auth_service = auth_service
+        self.artifacts_root = Path(artifacts_root)
+        self.insecure_warning = bool(insecure_warning)
+        self.started_at = time.time()
         self.httpd: ThreadingHTTPServer | None = None
         self.thread: Thread | None = None
+        self.report_reader: ReportArtifactReader | None = None
 
     @property
     def port(self) -> int:
@@ -23,485 +77,868 @@ class DashboardServer:
         return int(self.httpd.server_address[1])
 
     def start(self) -> None:
-        state = self.state
+        if self.httpd is not None:
+            raise RuntimeError("Dashboard server is already running")
+        dashboard = self
+        report_reader = ReportArtifactReader(self.store, self.artifacts_root)
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
-                if self.path == "/":
-                    self.respond_html(render_dashboard_html())
-                elif self.path == "/api/state":
-                    self.respond_json(state.snapshot())
-                elif self.path.startswith("/api/issues/"):
-                    issue_identifier = self.path.rsplit("/", 1)[-1]
-                    snapshot = state.snapshot()
-                    issue = find_issue(snapshot, issue_identifier)
-                    self.respond_json(issue or {"error": "issue not found"})
+                target = self._parse_target()
+                if target is None:
+                    return
+                path, query = target
+                if path == "/healthz":
+                    self._respond_json({"status": "ok"})
+                    return
+                if path == "/login":
+                    if dashboard.auth_service is None:
+                        self._redirect("/")
+                        return
+                    try:
+                        next_path = safe_next_path(_query_value(query, "next"))
+                    except _RequestInputError:
+                        self._respond_html(
+                            render_login_page(
+                                None,
+                                error="登录返回地址无效。",
+                                insecure_warning=dashboard.insecure_warning,
+                            ),
+                            status=400,
+                        )
+                        return
+                    self._respond_html(
+                        render_login_page(next_path, insecure_warning=dashboard.insecure_warning)
+                    )
+                    return
+                if not self._authenticated(path):
+                    return
+                try:
+                    self._dispatch_get(path, query)
+                except (RuntimeStoreInputError, _RequestInputError, UnicodeDecodeError):
+                    self._respond_request_error(path, 400, "invalid_request", "请求参数无效。")
+
+            def do_POST(self) -> None:
+                target = self._parse_target()
+                if target is None:
+                    return
+                path, _query = target
+                if path == "/login":
+                    if dashboard.auth_service is None:
+                        self._redirect("/")
+                        return
+                    self._login()
+                    return
+                if path == "/healthz":
+                    self._method_not_allowed(path, "GET")
+                    return
+                if not self._authenticated(path):
+                    return
+                if path == "/logout":
+                    self._logout()
+                    return
+                allow = _allowed_methods(path)
+                if allow is not None:
+                    self._method_not_allowed(path, allow)
+                    return
+                self._not_found(path)
+
+            def do_HEAD(self) -> None:
+                self._unsupported_method()
+
+            def do_PUT(self) -> None:
+                self._unsupported_method()
+
+            def do_PATCH(self) -> None:
+                self._unsupported_method()
+
+            def do_DELETE(self) -> None:
+                self._unsupported_method()
+
+            def _unsupported_method(self) -> None:
+                target = self._parse_target()
+                if target is None:
+                    return
+                path, _query = target
+                if path not in {"/healthz", "/login"} and not self._authenticated(path):
+                    return
+                allow = _allowed_methods(path)
+                if allow is None:
+                    self._not_found(path)
+                    return
+                self._method_not_allowed(path, allow)
+
+            def _dispatch_get(self, path: str, query: dict[str, list[str]]) -> None:
+                if path == "/logout":
+                    self._method_not_allowed(path, "POST")
+                    return
+                if path == "/":
+                    self._respond_html(
+                        render_overview_page(
+                            _overview_payload(dashboard.store, dashboard.started_at),
+                            insecure_warning=dashboard.insecure_warning,
+                        )
+                    )
+                    return
+                if path == "/tasks":
+                    filters = _task_filters(query)
+                    page = dashboard.store.list_tasks(
+                        status=filters["status"],
+                        query=filters["query"],
+                        cursor=filters["cursor"],
+                        limit=filters["limit"],
+                    )
+                    self._respond_html(
+                        render_tasks_page(page, filters, insecure_warning=dashboard.insecure_warning)
+                    )
+                    return
+                if path == "/errors":
+                    filters = _error_filters(query)
+                    page = dashboard.store.list_errors(
+                        issue_identifier=filters["issue"],
+                        stage=filters["stage"],
+                        error_type=filters["error_type"],
+                        resolved=filters["resolved"],
+                        cursor=filters["cursor"],
+                        limit=filters["limit"],
+                    )
+                    page = _with_nearby_events(dashboard.store, page)
+                    self._respond_html(
+                        render_errors_page(page, filters, insecure_warning=dashboard.insecure_warning)
+                    )
+                    return
+
+                issue_route = _parse_issue_route(path)
+                if issue_route is not None:
+                    identifier, suffix = issue_route
+                    if suffix == "report":
+                        self._report(identifier)
+                    elif suffix is None:
+                        self._issue_page(identifier, query)
+                    else:
+                        self._not_found(path)
+                    return
+
+                if path == "/api/overview":
+                    self._respond_json(_overview_payload(dashboard.store, dashboard.started_at))
+                    return
+                if path == "/api/tasks":
+                    filters = _task_filters(query)
+                    self._respond_json(
+                        dashboard.store.list_tasks(
+                            status=filters["status"],
+                            query=filters["query"],
+                            cursor=filters["cursor"],
+                            limit=filters["limit"],
+                        )
+                    )
+                    return
+
+                api_route = _parse_api_issue_route(path)
+                if api_route is not None:
+                    identifier, resource = api_route
+                    self._issue_api(identifier, resource, query)
+                    return
+                if path == "/api/errors":
+                    filters = _error_filters(query)
+                    self._respond_json(
+                        dashboard.store.list_errors(
+                            issue_identifier=filters["issue"],
+                            stage=filters["stage"],
+                            error_type=filters["error_type"],
+                            resolved=filters["resolved"],
+                            cursor=filters["cursor"],
+                            limit=filters["limit"],
+                        )
+                    )
+                    return
+                self._not_found(path)
+
+            def _issue_page(self, identifier: str, query: dict[str, list[str]]) -> None:
+                task = dashboard.store.get_task(identifier)
+                if task is None:
+                    self._not_found(self.path)
+                    return
+                selected_tab = _query_value(query, "tab") or "overview"
+                if selected_tab not in {"overview", "timeline", "report", "errors"}:
+                    selected_tab = "overview"
+                event_filters = _event_filters(query)
+                error_filters = _error_filters(query, default_issue=identifier)
+                events = {"items": [], "next_cursor": None}
+                errors = {"items": [], "next_cursor": None}
+                if selected_tab == "timeline":
+                    events = _significant_events_page(
+                        dashboard.store,
+                        issue_identifier=identifier,
+                        severity=event_filters["severity"],
+                        category=event_filters["category"],
+                        event_type=event_filters["event_type"],
+                        cursor=event_filters["cursor"],
+                        limit=event_filters["limit"],
+                    )
+                elif selected_tab == "errors":
+                    errors = dashboard.store.list_errors(
+                        issue_identifier=identifier,
+                        stage=error_filters["stage"],
+                        error_type=error_filters["error_type"],
+                        resolved=error_filters["resolved"],
+                        cursor=error_filters["cursor"],
+                        limit=error_filters["limit"],
+                    )
+                    errors = _with_nearby_events(dashboard.store, errors)
+                self._respond_html(
+                    render_issue_page(
+                        task,
+                        _report_metadata(dashboard.store.get_report(identifier)),
+                        events,
+                        errors,
+                        selected_tab=selected_tab,
+                        filters=event_filters,
+                        error_filters=error_filters,
+                        insecure_warning=dashboard.insecure_warning,
+                    )
+                )
+
+            def _issue_api(
+                self,
+                identifier: str,
+                resource: str | None,
+                query: dict[str, list[str]],
+            ) -> None:
+                task = dashboard.store.get_task(identifier)
+                if task is None:
+                    self._json_error(404, "not_found", "未找到任务。")
+                    return
+                if resource is None:
+                    self._respond_json(
+                        {
+                            "report": _report_metadata(dashboard.store.get_report(identifier)),
+                            "task": task,
+                        }
+                    )
+                    return
+                if resource == "events":
+                    filters = _event_filters(query)
+                    self._respond_json(
+                        dashboard.store.list_events(
+                            issue_identifier=identifier,
+                            severity=filters["severity"],
+                            category=filters["category"],
+                            event_type=filters["event_type"],
+                            cursor=filters["cursor"],
+                            limit=filters["limit"],
+                        )
+                    )
+                    return
+                if resource == "errors":
+                    filters = _error_filters(query, default_issue=identifier)
+                    self._respond_json(
+                        dashboard.store.list_errors(
+                            issue_identifier=identifier,
+                            stage=filters["stage"],
+                            error_type=filters["error_type"],
+                            resolved=filters["resolved"],
+                            cursor=filters["cursor"],
+                            limit=filters["limit"],
+                        )
+                    )
+                    return
+                self._json_error(404, "not_found", "未找到请求的资源。")
+
+            def _report(self, identifier: str) -> None:
+                if dashboard.store.get_report(identifier) is None:
+                    self._not_found(self.path)
+                    return
+                try:
+                    report_html = report_reader.read_current_html(identifier)
+                except RuntimeError:
+                    self._respond_html(
+                        render_error_page(
+                            "报告不可用",
+                            "权威报告文件缺失或未通过安全校验。",
+                            insecure_warning=dashboard.insecure_warning,
+                        ),
+                        status=500,
+                    )
+                    return
+                self._respond_report(report_html)
+
+            def _login(self) -> None:
+                form = self._read_form(public=True)
+                if form is None:
+                    return
+                username = form.get("username", "")
+                password = form.get("password", "")
+                next_path = safe_next_path(form.get("next"))
+                try:
+                    result = dashboard.auth_service.login(
+                        username,
+                        password,
+                        str(self.client_address[0]),
+                    )
+                except LoginLockedError:
+                    self._respond_html(
+                        render_login_page(
+                            next_path,
+                            error="登录尝试过多，请稍后重试。",
+                            insecure_warning=dashboard.insecure_warning,
+                        ),
+                        status=429,
+                    )
+                    return
+                except AuthenticationError:
+                    self._respond_html(
+                        render_login_page(
+                            next_path,
+                            error="用户名或密码错误。",
+                            insecure_warning=dashboard.insecure_warning,
+                        ),
+                        status=401,
+                    )
+                    return
+                self._redirect(next_path or "/", set_cookie=result.set_cookie)
+
+            def _logout(self) -> None:
+                if dashboard.auth_service is None:
+                    self._redirect("/")
+                    return
+                form = self._read_form()
+                if form is None:
+                    return
+                dashboard.auth_service.logout(self._session_token())
+                cookie = SimpleCookie()
+                cookie[SESSION_COOKIE_NAME] = ""
+                morsel = cookie[SESSION_COOKIE_NAME]
+                morsel["httponly"] = True
+                morsel["samesite"] = "Lax"
+                morsel["path"] = "/"
+                morsel["max-age"] = "0"
+                if dashboard.auth_service.secure_cookie:
+                    morsel["secure"] = True
+                self._redirect("/login", set_cookie=morsel.OutputString())
+
+            def _read_form(self, *, public: bool = False) -> dict[str, str] | None:
+                length_header = self.headers.get("Content-Length", "0")
+                try:
+                    length = int(length_header)
+                except ValueError:
+                    self._form_error(400, "Content-Length 无效。", public=public)
+                    return None
+                if length < 0:
+                    self._form_error(400, "请求长度无效。", public=public)
+                    return None
+                if length > _MAX_FORM_BYTES:
+                    self._form_error(413, "表单超过允许大小。", public=public)
+                    return None
+                content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                if content_type != "application/x-www-form-urlencoded":
+                    self._form_error(415, "仅接受表单编码请求。", public=public)
+                    return None
+                try:
+                    raw = self.rfile.read(length).decode("utf-8")
+                    values = parse_qs(raw, keep_blank_values=True, max_num_fields=8)
+                except (UnicodeDecodeError, ValueError):
+                    self._form_error(400, "表单编码无效。", public=public)
+                    return None
+                if any(len(items) != 1 for items in values.values()):
+                    self._form_error(400, "表单字段不能重复。", public=public)
+                    return None
+                return {key: items[0] for key, items in values.items()}
+
+            def _form_error(self, status: int, message: str, *, public: bool) -> None:
+                if public:
+                    page = render_login_page(
+                        None,
+                        error=message,
+                        insecure_warning=dashboard.insecure_warning,
+                    )
                 else:
-                    self.send_error(404)
+                    page = render_error_page(
+                        "请求无效",
+                        message,
+                        insecure_warning=dashboard.insecure_warning,
+                    )
+                self._respond_html(page, status=status)
+
+            def _parse_target(self) -> tuple[str, dict[str, list[str]]] | None:
+                if len(self.path.encode("utf-8", "surrogatepass")) > _MAX_REQUEST_TARGET_BYTES:
+                    self._respond_html(
+                        render_login_page(
+                            None,
+                            error="请求地址超过允许长度。",
+                            insecure_warning=dashboard.insecure_warning,
+                        ),
+                        status=414,
+                    )
+                    return None
+                try:
+                    parsed = urlsplit(self.path)
+                    if parsed.scheme or parsed.netloc or not parsed.path.startswith("/"):
+                        raise ValueError("request target must be origin-form")
+                    query = parse_qs(
+                        parsed.query,
+                        keep_blank_values=True,
+                        max_num_fields=_MAX_QUERY_FIELDS,
+                    )
+                except ValueError:
+                    self._respond_html(
+                        render_login_page(
+                            None,
+                            error="请求地址无效。",
+                            insecure_warning=dashboard.insecure_warning,
+                        ),
+                        status=400,
+                    )
+                    return None
+                return parsed.path, query
+
+            def _authenticated(self, path: str) -> bool:
+                if dashboard.auth_service is None:
+                    return True
+                if dashboard.auth_service.authenticate_cookie(self.headers.get("Cookie")) is not None:
+                    return True
+                if _is_api_path(path):
+                    self._json_error(401, "authentication_required", "需要登录。")
+                else:
+                    next_path = safe_next_path(self.path) or "/"
+                    self._redirect("/login?" + urlencode({"next": next_path}))
+                return False
+
+            def _session_token(self) -> str:
+                header = self.headers.get("Cookie")
+                if not header:
+                    return ""
+                cookie = SimpleCookie()
+                try:
+                    cookie.load(header)
+                except CookieError:
+                    return ""
+                morsel = cookie.get(SESSION_COOKIE_NAME)
+                return morsel.value if morsel is not None else ""
+
+            def _not_found(self, path: str) -> None:
+                if _is_api_path(path):
+                    self._json_error(404, "not_found", "未找到请求的资源。")
+                else:
+                    self._respond_html(
+                        render_error_page(
+                            "未找到",
+                            "请求的页面或任务不存在。",
+                            insecure_warning=dashboard.insecure_warning,
+                        ),
+                        status=404,
+                    )
+
+            def _respond_request_error(self, path: str, status: int, code: str, message: str) -> None:
+                if _is_api_path(path):
+                    self._json_error(status, code, message)
+                else:
+                    self._respond_html(
+                        render_error_page("请求无效", message, insecure_warning=dashboard.insecure_warning),
+                        status=status,
+                    )
+
+            def _method_not_allowed(self, path: str, allow: str) -> None:
+                headers = {"Allow": allow}
+                if _is_api_path(path):
+                    self._json_error(405, "method_not_allowed", "请求方法不受支持。", headers=headers)
+                else:
+                    self._respond_html(
+                        render_error_page(
+                            "方法不受支持",
+                            "请使用页面支持的请求方式。",
+                            insecure_warning=dashboard.insecure_warning,
+                        ),
+                        status=405,
+                        headers=headers,
+                    )
+
+            def _json_error(
+                self,
+                status: int,
+                code: str,
+                message: str,
+                *,
+                headers: dict[str, str] | None = None,
+            ) -> None:
+                self._respond_json(
+                    {"error": {"code": code, "message": message}},
+                    status=status,
+                    headers=headers,
+                )
+
+            def _redirect(self, location: str, *, set_cookie: str | None = None) -> None:
+                self.send_response(303)
+                self._common_headers()
+                self.send_header("Location", location)
+                if set_cookie:
+                    self.send_header("Set-Cookie", set_cookie)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def _respond_json(
+                self,
+                payload: dict,
+                *,
+                status: int = 200,
+                headers: dict[str, str] | None = None,
+            ) -> None:
+                body = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+                self.send_response(status)
+                self._common_headers()
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                if headers:
+                    for name, value in headers.items():
+                        self.send_header(name, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+
+            def _respond_html(
+                self,
+                page: str,
+                *,
+                status: int = 200,
+                headers: dict[str, str] | None = None,
+            ) -> None:
+                body = page.encode("utf-8")
+                self.send_response(status)
+                self._common_headers()
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Security-Policy", _DASHBOARD_CSP)
+                if headers:
+                    for name, value in headers.items():
+                        self.send_header(name, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+
+            def _respond_report(self, page: str) -> None:
+                body = page.encode("utf-8")
+                self.send_response(200)
+                self._common_headers()
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Security-Policy", _REPORT_CSP)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+
+            def _common_headers(self) -> None:
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("X-Content-Type-Options", "nosniff")
 
             def log_message(self, format: str, *args: object) -> None:
                 return
 
-            def respond_json(self, payload: dict) -> None:
-                body = json.dumps(payload, indent=2).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def respond_html(self, html: str) -> None:
-                body = html.encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-        self.httpd = ThreadingHTTPServer((self.host, self.requested_port), Handler)
-        self.thread = Thread(target=self.httpd.serve_forever, daemon=True)
-        self.thread.start()
+        try:
+            self.httpd = ThreadingHTTPServer((self.host, self.requested_port), Handler)
+            self.httpd.daemon_threads = True
+            self.report_reader = report_reader
+            self.thread = Thread(target=self.httpd.serve_forever, daemon=True)
+            self.thread.start()
+        except Exception:
+            httpd = self.httpd
+            self.httpd = None
+            self.thread = None
+            self.report_reader = None
+            if httpd is not None:
+                try:
+                    httpd.server_close()
+                except Exception:
+                    pass
+            try:
+                report_reader.close()
+            except Exception:
+                pass
+            raise
 
     def stop(self) -> None:
-        if self.httpd is not None:
-            self.httpd.shutdown()
-            self.httpd.server_close()
-        if self.thread is not None:
-            self.thread.join(timeout=5)
+        httpd = self.httpd
+        thread = self.thread
+        reader = self.report_reader
+        self.httpd = None
+        self.thread = None
+        self.report_reader = None
+        if httpd is not None:
+            httpd.shutdown()
+            httpd.server_close()
+        if thread is not None:
+            thread.join(timeout=5)
+        if reader is not None:
+            reader.close()
+
+
+def _overview_payload(store, started_at: float) -> dict:
+    tasks = _all_tasks(store)
+    counts = {
+        "blocked": 0,
+        "completed": 0,
+        "queued": 0,
+        "retrying": 0,
+        "running": 0,
+        "unresolved_errors": _unresolved_error_count(store),
+    }
+    current_runs = []
+    for task in tasks:
+        status = str(task.get("status") or "unknown").lower()
+        count_key = "queued" if status in {"queued", "claimed", "pending"} else status
+        if count_key in counts and count_key != "unresolved_errors":
+            counts[count_key] += 1
+        if status not in {"completed", "cancelled"} and len(current_runs) < 20:
+            current_runs.append(task)
+    reports_page = store.list_reports(limit=20)
+    events = _significant_events_page(store, limit=20)
+    return {
+        "counts": counts,
+        "current_runs": current_runs,
+        "events": events["items"],
+        "recent_reports": [_report_metadata(item, include_identifier=True) for item in reports_page["items"]],
+        "service": {
+            "started_at": started_at,
+            "status": "healthy",
+            "uptime_seconds": max(0, int(time.time() - started_at)),
+        },
+    }
+
+
+def _all_tasks(store) -> list[dict]:
+    tasks: list[dict] = []
+    cursor = None
+    while True:
+        page = store.list_tasks(cursor=cursor, limit=200)
+        tasks.extend(page["items"])
+        cursor = page.get("next_cursor")
+        if not cursor:
+            return tasks
+
+
+def _unresolved_error_count(store) -> int:
+    count = 0
+    cursor = None
+    while True:
+        page = store.list_errors(resolved=False, cursor=cursor, limit=200)
+        count += len(page["items"])
+        cursor = page.get("next_cursor")
+        if not cursor:
+            return count
+
+
+def _significant_events_page(
+    store,
+    *,
+    issue_identifier: str | None = None,
+    severity: str | None = None,
+    category: str | None = None,
+    event_type: str | None = None,
+    cursor: str | None = None,
+    limit: int = 50,
+) -> dict:
+    items: list[dict] = []
+    current_cursor = cursor
+    next_cursor = None
+    while len(items) < limit:
+        page = store.list_events(
+            issue_identifier=issue_identifier,
+            severity=severity,
+            category=category,
+            event_type=event_type,
+            cursor=current_cursor,
+            limit=max(1, limit - len(items)),
+        )
+        for event in page["items"]:
+            if _is_significant_event(event) and len(items) < limit:
+                items.append(event)
+        next_cursor = page.get("next_cursor")
+        if not next_cursor or len(items) >= limit:
+            break
+        current_cursor = next_cursor
+    return {"items": items, "next_cursor": next_cursor}
+
+
+def _with_nearby_events(store, page: dict) -> dict:
+    enriched = []
+    for error in page["items"]:
+        issue_identifier = error.get("issue_identifier")
+        nearby = []
+        if issue_identifier:
+            nearby = _significant_events_page(
+                store,
+                issue_identifier=str(issue_identifier),
+                limit=5,
+            )["items"]
+        enriched.append({**error, "nearby_events": nearby})
+    return {**page, "items": enriched}
+
+
+def _is_significant_event(event: dict) -> bool:
+    event_type = str(event.get("type") or "").lower()
+    return not any(marker in event_type for marker in _QUIET_EVENT_MARKERS)
+
+
+def _report_metadata(entry: dict | None, *, include_identifier: bool = False) -> dict:
+    if entry is None:
+        return {"available": False}
+    metadata = {
+        "available": True,
+        "created_at": entry.get("created_at"),
+        "linear_sync_status": entry.get("linear_sync_status"),
+        "report_version": entry.get("report_version"),
+        "review_metadata": entry.get("review_metadata") or {},
+        "summary": entry.get("summary"),
+        "updated_at": entry.get("updated_at"),
+        "url": entry.get("url"),
+    }
+    if include_identifier:
+        metadata["issue_identifier"] = entry.get("issue_identifier")
+    return metadata
+
+
+def _task_filters(query: dict[str, list[str]]) -> dict:
+    return {
+        "cursor": _optional(_query_value(query, "cursor")),
+        "limit": _limit(_query_value(query, "limit"), 50),
+        "query": _optional(_query_value(query, "q")),
+        "status": _optional(_query_value(query, "status")),
+    }
+
+
+def _event_filters(query: dict[str, list[str]]) -> dict:
+    return {
+        "category": _optional(_query_value(query, "category")),
+        "cursor": _optional(_query_value(query, "cursor")),
+        "event_type": _optional(_query_value(query, "type")),
+        "limit": _limit(_query_value(query, "limit"), 50),
+        "severity": _optional(_query_value(query, "severity")),
+    }
+
+
+def _error_filters(query: dict[str, list[str]], default_issue: str | None = None) -> dict:
+    return {
+        "cursor": _optional(_query_value(query, "cursor")),
+        "error_type": _optional(_query_value(query, "type")),
+        "issue": _optional(_query_value(query, "issue")) or default_issue,
+        "limit": _limit(_query_value(query, "limit"), 50),
+        "resolved": _resolved(_query_value(query, "resolved")),
+        "stage": _optional(_query_value(query, "stage")),
+    }
+
+
+def _limit(value: str | None, default: int) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise _RequestInputError("invalid limit") from error
+    if not 1 <= parsed <= 200:
+        raise _RequestInputError("invalid limit")
+    return parsed
+
+
+def _resolved(value: str | None) -> bool | None:
+    if value in (None, "", "all"):
+        return None
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise _RequestInputError("invalid resolved filter")
+
+
+def _query_value(query: dict[str, list[str]], name: str) -> str | None:
+    values = query.get(name)
+    if not values:
+        return None
+    if len(values) != 1:
+        raise _RequestInputError("duplicate query field")
+    return values[0]
+
+
+def _optional(value: str | None) -> str | None:
+    return value if value else None
+
+
+def _parse_issue_route(path: str) -> tuple[str, str | None] | None:
+    parts = path.split("/")
+    if len(parts) not in {3, 4} or parts[:2] != ["", "issues"]:
+        return None
+    identifier = _decode_identifier(parts[2])
+    suffix = parts[3] if len(parts) == 4 else None
+    return identifier, suffix
+
+
+def _parse_api_issue_route(path: str) -> tuple[str, str | None] | None:
+    parts = path.split("/")
+    if len(parts) not in {4, 5} or parts[:3] != ["", "api", "issues"]:
+        return None
+    identifier = _decode_identifier(parts[3])
+    resource = parts[4] if len(parts) == 5 else None
+    return identifier, resource
+
+
+def _decode_identifier(value: str) -> str:
+    identifier = unquote(value, errors="strict")
+    if _ISSUE_IDENTIFIER.fullmatch(identifier) is None:
+        raise _RequestInputError("invalid issue identifier")
+    return identifier
+
+
+def _is_loopback_bind(host: str) -> bool:
+    normalized = host.rstrip(".").casefold()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_api_path(path: str) -> bool:
+    return path == "/api" or path.startswith("/api/")
+
+
+def _allowed_methods(path: str) -> str | None:
+    if path == "/login":
+        return "GET, POST"
+    if path == "/logout":
+        return "POST"
+    if path in {"/", "/tasks", "/errors", "/healthz", "/api/overview", "/api/tasks", "/api/errors"}:
+        return "GET"
+    try:
+        issue_route = _parse_issue_route(path)
+        if issue_route is not None and issue_route[1] in {None, "report"}:
+            return "GET"
+        api_route = _parse_api_issue_route(path)
+        if api_route is not None and api_route[1] in {None, "events", "errors"}:
+            return "GET"
+    except (_RequestInputError, UnicodeDecodeError):
+        pass
+    return None
 
 
 def find_issue(snapshot: dict, issue_identifier: str) -> dict | None:
-    for key in ["running", "completed", "blocked", "retrying"]:
-        for issue in snapshot.get(key, []):
+    """Retain the legacy RuntimeState snapshot lookup for existing callers."""
+    for key in ("running", "completed", "blocked", "retrying"):
+        for issue in snapshot.get(key, ()):
             if issue.get("issue_identifier") == issue_identifier:
                 return issue
     return None
 
 
 def render_dashboard_html() -> str:
+    """Return the legacy unauthenticated preview without attaching it to a route."""
     return """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Symphonz Runtime</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f7f8fb;
-      --surface: #ffffff;
-      --surface-subtle: #fafbfc;
-      --line: #e3e6eb;
-      --line-strong: #d7dbe3;
-      --text: #171a1f;
-      --muted: #6b7280;
-      --faint: #9aa3af;
-      --accent: #5e6ad2;
-      --accent-soft: #eef0ff;
-      --green: #16825d;
-      --green-soft: #eaf7f1;
-      --amber: #a46313;
-      --amber-soft: #fff4df;
-      --red: #c23b32;
-      --red-soft: #fff0ef;
-      --blue: #2563eb;
-      --blue-soft: #edf4ff;
-      --shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: var(--bg);
-      color: var(--text);
-    }
-    h1, h2, p { margin: 0; }
-    button {
-      border: 1px solid var(--line-strong);
-      background: var(--surface);
-      border-radius: 6px;
-      color: var(--text);
-      cursor: pointer;
-      font: inherit;
-      height: 32px;
-      padding: 0 10px;
-    }
-    button:hover { border-color: var(--accent); color: var(--accent); }
-    .app-shell {
-      display: grid;
-      grid-template-columns: 248px minmax(0, 1fr);
-      min-height: 100vh;
-    }
-    .sidebar {
-      background: #fbfbfd;
-      border-right: 1px solid var(--line);
-      padding: 18px 14px;
-      display: flex;
-      flex-direction: column;
-      gap: 18px;
-    }
-    .brand {
-      align-items: center;
-      display: flex;
-      gap: 10px;
-      padding: 2px 6px 10px;
-    }
-    .brand-mark {
-      align-items: center;
-      background: var(--text);
-      border-radius: 7px;
-      color: #ffffff;
-      display: inline-flex;
-      font-size: 13px;
-      font-weight: 700;
-      height: 28px;
-      justify-content: center;
-      width: 28px;
-    }
-    .brand-title { font-size: 15px; font-weight: 650; }
-    .muted { color: var(--muted); }
-    .nav-group { display: grid; gap: 4px; }
-    .nav-item {
-      align-items: center;
-      border-radius: 6px;
-      color: var(--muted);
-      display: flex;
-      font-size: 13px;
-      gap: 8px;
-      padding: 8px 10px;
-    }
-    .nav-item.active {
-      background: var(--accent-soft);
-      color: var(--accent);
-      font-weight: 600;
-    }
-    .nav-dot {
-      border: 1px solid currentColor;
-      border-radius: 999px;
-      height: 8px;
-      width: 8px;
-    }
-    .sidebar-footer {
-      border-top: 1px solid var(--line);
-      margin-top: auto;
-      padding: 14px 8px 2px;
-    }
-    .content {
-      align-content: start;
-      display: grid;
-      gap: 18px;
-      min-width: 0;
-      padding: 22px 28px 30px;
-    }
-    .topbar {
-      align-items: center;
-      display: flex;
-      gap: 16px;
-      justify-content: space-between;
-    }
-    .eyebrow {
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 600;
-      letter-spacing: 0;
-      text-transform: uppercase;
-    }
-    h1 { font-size: 24px; font-weight: 680; letter-spacing: 0; line-height: 1.2; }
-    .toolbar { align-items: center; display: flex; gap: 8px; }
-    .live-chip {
-      align-items: center;
-      background: var(--green-soft);
-      border: 1px solid #bfe7d5;
-      border-radius: 999px;
-      color: var(--green);
-      display: inline-flex;
-      font-size: 12px;
-      font-weight: 650;
-      gap: 7px;
-      height: 30px;
-      padding: 0 10px;
-    }
-    .pulse {
-      background: currentColor;
-      border-radius: 999px;
-      height: 7px;
-      width: 7px;
-    }
-    .metrics {
-      display: grid;
-      gap: 10px;
-      grid-template-columns: repeat(5, minmax(110px, 1fr));
-    }
-    .metric {
-      background: var(--surface);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      box-shadow: var(--shadow);
-      min-height: 92px;
-      padding: 14px;
-    }
-    .metric-label {
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 600;
-      text-transform: capitalize;
-    }
-    .metric-value {
-      font-size: 30px;
-      font-weight: 720;
-      letter-spacing: 0;
-      line-height: 1;
-      margin-top: 14px;
-    }
-    .layout-grid {
-      align-items: start;
-      display: grid;
-      gap: 14px;
-      grid-template-columns: minmax(0, 1fr) 360px;
-    }
-    .panel {
-      background: var(--surface);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      box-shadow: var(--shadow);
-      min-width: 0;
-      overflow: hidden;
-    }
-    .panel-header {
-      align-items: center;
-      border-bottom: 1px solid var(--line);
-      display: flex;
-      justify-content: space-between;
-      min-height: 52px;
-      padding: 0 16px;
-    }
-    .panel-title { font-size: 15px; font-weight: 680; }
-    .panel-meta { color: var(--muted); font-size: 12px; }
-    .table-wrap { overflow-x: auto; }
-    table {
-      border-collapse: collapse;
-      font-size: 13px;
-      min-width: 760px;
-      width: 100%;
-    }
-    th, td {
-      border-bottom: 1px solid var(--line);
-      padding: 12px 14px;
-      text-align: left;
-      vertical-align: middle;
-    }
-    th {
-      background: var(--surface-subtle);
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 650;
-      text-transform: uppercase;
-    }
-    tr:hover td { background: #fbfcff; }
-    .issue-key { font-weight: 680; }
-    .issue-title {
-      color: var(--muted);
-      display: block;
-      margin-top: 3px;
-      max-width: 440px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .path, .session {
-      color: var(--muted);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      font-size: 12px;
-      white-space: nowrap;
-    }
-    .detail {
-      color: var(--muted);
-      display: block;
-      font-size: 11px;
-      line-height: 1.45;
-      margin-top: 4px;
-      max-width: 260px;
-      overflow-wrap: anywhere;
-    }
-    .status-chip {
-      align-items: center;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      display: inline-flex;
-      font-size: 12px;
-      font-weight: 650;
-      height: 24px;
-      padding: 0 9px;
-      text-transform: capitalize;
-      white-space: nowrap;
-    }
-    .status-running { background: var(--blue-soft); border-color: #c8dcff; color: var(--blue); }
-    .status-completed { background: var(--green-soft); border-color: #bfe7d5; color: var(--green); }
-    .status-blocked { background: var(--red-soft); border-color: #ffd0cc; color: var(--red); }
-    .status-retrying { background: var(--amber-soft); border-color: #f4d7a3; color: var(--amber); }
-    .activity-list {
-      display: grid;
-      max-height: 620px;
-      overflow: auto;
-    }
-    .event-row {
-      border-bottom: 1px solid var(--line);
-      display: grid;
-      gap: 5px;
-      padding: 13px 16px;
-    }
-    .event-top {
-      align-items: center;
-      display: flex;
-      gap: 8px;
-      justify-content: space-between;
-    }
-    .event-type { font-size: 13px; font-weight: 650; }
-    .event-time { color: var(--faint); font-size: 11px; white-space: nowrap; }
-    .event-message { color: var(--muted); font-size: 12px; line-height: 1.45; }
-    .empty {
-      color: var(--muted);
-      font-size: 13px;
-      padding: 22px 16px;
-    }
-    @media (max-width: 980px) {
-      .app-shell { grid-template-columns: 1fr; }
-      .sidebar { display: none; }
-      .content { padding: 18px; }
-      .metrics { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
-      .layout-grid { grid-template-columns: 1fr; }
-    }
-    @media (max-width: 620px) {
-      .topbar { align-items: flex-start; flex-direction: column; }
-      .metrics { grid-template-columns: 1fr; }
-      .toolbar { width: 100%; }
-      button { flex: 1; }
-    }
-  </style>
-</head>
-<body>
-  <div class="app-shell">
-    <aside class="sidebar">
-      <div class="brand">
-        <span class="brand-mark">S</span>
-        <div>
-          <div class="brand-title">Symphonz</div>
-          <div class="muted">Runtime control</div>
-        </div>
-      </div>
-      <nav class="nav-group" aria-label="Runtime navigation">
-        <div class="nav-item active"><span class="nav-dot"></span>Overview</div>
-        <div class="nav-item"><span class="nav-dot"></span>Issue Queue</div>
-        <div class="nav-item"><span class="nav-dot"></span>Activity Feed</div>
-        <div class="nav-item"><span class="nav-dot"></span>Workspaces</div>
-      </nav>
-      <div class="sidebar-footer">
-        <div class="eyebrow">Tracker</div>
-        <div class="brand-title">Linear</div>
-      </div>
-    </aside>
-    <main class="content">
-      <header class="topbar">
-        <div>
-          <div class="eyebrow">Orchestration</div>
-          <h1>Symphonz Runtime</h1>
-          <p class="muted">Linear orchestration, Codex sessions, workspace activity</p>
-        </div>
-        <div class="toolbar">
-          <span class="live-chip"><span class="pulse"></span>Live</span>
-          <button onclick="loadState()">Refresh</button>
-        </div>
-      </header>
-      <section class="metrics" id="metrics" aria-label="Runtime metrics"></section>
-      <section class="layout-grid">
-        <div class="panel">
-          <div class="panel-header">
-            <h2 class="panel-title">Issue Queue</h2>
-            <span class="panel-meta" id="issue-count">0 issues</span>
-          </div>
-          <div class="table-wrap" id="issues"></div>
-        </div>
-        <div class="panel">
-          <div class="panel-header">
-            <h2 class="panel-title">Activity Feed</h2>
-            <span class="panel-meta">Latest 20</span>
-          </div>
-          <div class="activity-list" id="events"></div>
-        </div>
-      </section>
-    </main>
-  </div>
-  <script>
-    function escapeHtml(value) {
-      return String(value ?? '').replace(/[&<>"']/g, char => ({
-        '&': '&amp;',
-        '<': '&lt;',
-        '>': '&gt;',
-        '"': '&quot;',
-        "'": '&#39;'
-      }[char]));
-    }
-    function statusClass(value) {
-      const normalized = String(value || 'running').toLowerCase();
-      if (normalized.includes('complete')) return 'completed';
-      if (normalized.includes('block') || normalized.includes('fail')) return 'blocked';
-      if (normalized.includes('retry')) return 'retrying';
-      return 'running';
-    }
-    function eventTime(timestamp) {
-      if (!timestamp) return '';
-      return new Date(timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    }
-    async function loadState() {
-      const state = await fetch('/api/state').then(r => r.json());
-      const counts = state.counts;
-      const metricLabels = {
-        claimed: 'Claimed',
-        running: 'Running',
-        completed: 'Completed',
-        blocked: 'Blocked',
-        retrying: 'Retrying'
-      };
-      document.getElementById('metrics').innerHTML = ['claimed','running','completed','blocked','retrying'].map(k => `
-        <div class="metric">
-          <div class="metric-label">${metricLabels[k]}</div>
-          <div class="metric-value">${counts[k] || 0}</div>
-        </div>
-      `).join('');
-      const issues = [...state.running, ...state.blocked, ...state.retrying, ...state.completed];
-      document.getElementById('issue-count').textContent = `${issues.length} ${issues.length === 1 ? 'issue' : 'issues'}`;
-      document.getElementById('issues').innerHTML = issues.length ? `
-        <table>
-          <thead><tr><th>Issue</th><th>Status</th><th>Turn / Attempt</th><th>Retry / Error</th><th>Workspace</th><th>Session</th></tr></thead>
-          <tbody>
-            ${issues.map(i => {
-              const status = statusClass(i.status || i.state);
-              return `<tr>
-                <td><span class="issue-key">${escapeHtml(i.issue_identifier)}</span><span class="issue-title">${escapeHtml(i.title)}</span></td>
-                <td><span class="status-chip status-${status}">${escapeHtml(i.status || i.state || 'running')}</span></td>
-                <td><span class="session">turn ${escapeHtml(i.turn_count || 0)}</span><span class="detail">attempt ${escapeHtml(i.attempt || 0)}</span></td>
-                <td><span class="session">${escapeHtml(i.due_at_epoch ? eventTime(i.due_at_epoch) : '')}</span><span class="detail">${escapeHtml(i.error || i.cancellation_reason || '')}</span></td>
-                <td><span class="path">${escapeHtml(i.workspace)}</span></td>
-                <td><span class="session">${escapeHtml(i.session_id)}</span></td>
-              </tr>`;
-            }).join('')}
-          </tbody>
-        </table>
-      ` : '<p class="empty">No issue activity yet.</p>';
-      const events = state.events.slice(-20).reverse();
-      document.getElementById('events').innerHTML = events.length ? events.map(event => `
-        <div class="event-row">
-          <div class="event-top">
-            <span class="event-type">${escapeHtml(event.type)}</span>
-            <span class="event-time">${escapeHtml(eventTime(event.timestamp))}</span>
-          </div>
-          <div class="event-message">${escapeHtml(event.message)}${event.issue_identifier ? ` · ${escapeHtml(event.issue_identifier)}` : ''}</div>
-        </div>
-      `).join('') : '<p class="empty">No events recorded yet.</p>';
-    }
-    loadState();
-    setInterval(loadState, 3000);
-  </script>
-</body>
-</html>"""
+<html lang="en"><head><meta charset="utf-8"><title>Symphonz Runtime</title></head>
+<body><div class="app-shell"><aside class="sidebar">Symphonz Runtime</aside>
+<main><h1>Issue Queue</h1><h2>Activity Feed</h2><span class="status-chip">Claimed</span>
+<table><thead><tr><th>Turn / Attempt</th></tr></thead></table>
+<code>due_at cancellation_reason</code></main></div></body></html>"""

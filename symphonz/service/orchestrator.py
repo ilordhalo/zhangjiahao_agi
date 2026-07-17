@@ -7,6 +7,7 @@ import time
 
 from symphonz.service.codex_app_server import CodexAppServer
 from symphonz.service.attempt_store import AttemptStore
+from symphonz.service.dynamic_tools import dynamic_tool_specs, execute_dynamic_tool
 from symphonz.service.linear import LinearClient
 from symphonz.service.models import Issue, RuntimeState, WorkflowDefinition
 from symphonz.service.workflow import render_prompt
@@ -29,6 +30,9 @@ class Orchestrator:
         state: RuntimeState | None = None,
         attempt_store: AttemptStore | None = None,
         clock=time.monotonic,
+        runtime_store=None,
+        report_publisher_factory=None,
+        report_synchronizer=None,
     ):
         self.project_root = project_root
         self.workflow = workflow
@@ -37,8 +41,18 @@ class Orchestrator:
         self.state = state or RuntimeState()
         self.attempt_store = attempt_store or AttemptStore()
         self.clock = clock
+        self.runtime_store = runtime_store
+        self.report_publisher_factory = report_publisher_factory
+        self.report_synchronizer = report_synchronizer
         self.max_concurrent_agents = max(1, int(self.workflow.config.get("agent", {}).get("max_concurrent_agents", 10)))
         self.executor = ThreadPoolExecutor(max_workers=self.max_concurrent_agents, thread_name_prefix="symphonz")
+        self._report_sync_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="symphonz-report-sync")
+            if report_synchronizer is not None
+            else None
+        )
+        self._report_sync_future: Future | None = None
+        self._report_sync_lock = threading.Lock()
         self._futures: dict[str, Future] = {}
         self._cancel_events: dict[str, threading.Event] = {}
         self._issues: dict[str, Issue] = {}
@@ -47,8 +61,11 @@ class Orchestrator:
         self._closed = False
 
     def tick(self) -> None:
-        if self._closed:
-            return
+        with self._report_sync_lock:
+            if self._closed:
+                return
+        self._collect_report_sync()
+        self._schedule_report_sync()
         self._collect_finished()
         self._reconcile_running()
         self._collect_finished()
@@ -79,17 +96,29 @@ class Orchestrator:
             self.state.add_event("startup_cleanup_failed", f"Startup cleanup failed: {error}")
             return
         for issue in terminal_issues:
+            completed = self._entry(issue, status="completed")
+            completed.pop("started_at", None)
+            completed.update({"completed_at": time.time(), "completion_reason": "terminal"})
+            with self.state.lock:
+                self.state.completed[issue.id] = completed
+            self._persist_entry(issue, completed)
             self._cleanup_terminal_workspace(issue)
 
     def shutdown(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._report_sync_lock:
+            if self._closed:
+                return
+            self._closed = True
+            report_sync_executor = self._report_sync_executor
+            self._report_sync_executor = None
         with self.state.lock:
             for event in self._cancel_events.values():
                 event.set()
         self.executor.shutdown(wait=True, cancel_futures=True)
         self._collect_finished()
+        if report_sync_executor is not None:
+            report_sync_executor.shutdown(wait=True)
+            self._collect_report_sync()
 
     def _dispatch_candidates(self) -> None:
         if self._available_slots() <= 0:
@@ -127,13 +156,12 @@ class Orchestrator:
                 self._reschedule_tracker_retry(issue, entry, error)
                 continue
             if not refreshed:
-                self._release(issue_id)
+                self._finish_cancelled(issue, entry, "missing")
                 continue
             issue = refreshed[0]
             if not self._eligible(issue):
-                if self._terminal(issue):
-                    self._cleanup_terminal_workspace(issue)
-                self._release(issue_id)
+                reason = "terminal" if self._terminal(issue) else "ineligible"
+                self._finish_cancelled(issue, entry, reason)
                 continue
             self._dispatch(issue, already_claimed=True)
 
@@ -155,15 +183,18 @@ class Orchestrator:
             self.state.running[issue.id] = entry
             self._issues[issue.id] = issue
             self._cancel_events[issue.id] = cancel_event
+            self._persist_entry(issue, entry)
             future = self.executor.submit(self._run_issue, issue, attempt, cancel_event)
             self._futures[issue.id] = future
         self.state.add_event("issue_started", f"Started {issue.identifier}", issue.identifier, attempt=attempt)
 
     def _run_issue(self, issue: Issue, attempt: int, cancel_event: threading.Event) -> dict:
-        workspace = prepare_workspace(self.project_root, self.workflow, issue)
+        publisher = self.report_publisher_factory(issue) if self.report_publisher_factory is not None else None
+        workspace = None
         latest_issue = [issue]
         hook_started = False
         try:
+            workspace = prepare_workspace(self.project_root, self.workflow, issue)
             run_before_run_hook(workspace, self.workflow, issue)
             hook_started = True
             prompt = render_prompt(self.workflow.prompt_template, issue, attempt=attempt or None)
@@ -192,12 +223,22 @@ class Orchestrator:
                 ),
                 on_event=lambda event: self.record_codex_event(issue, event),
                 cancel_event=cancel_event,
+                dynamic_tool_specs=dynamic_tool_specs(report_publisher=publisher),
+                dynamic_tool_executor=lambda tool_name, arguments: execute_dynamic_tool(
+                    tool_name,
+                    arguments,
+                    linear_client=self.linear_client,
+                    report_publisher=publisher,
+                ),
             )
             still_active = should_continue()
             return {"result": result, "issue": latest_issue[0], "still_active": still_active}
         finally:
-            if hook_started or workspace.exists():
-                run_after_run_hook(workspace, self.workflow, latest_issue[0])
+            try:
+                if workspace is not None and (hook_started or workspace.exists()):
+                    run_after_run_hook(workspace, self.workflow, latest_issue[0])
+            finally:
+                self._close_report_publisher(issue, publisher)
 
     def _collect_finished(self) -> None:
         with self.state.lock:
@@ -235,17 +276,16 @@ class Orchestrator:
 
     def _handle_worker_error(self, issue: Issue, entry: dict, error: Exception, cancel_reason: str | None) -> None:
         message = str(error)
-        if self._closed and not cancel_reason:
-            self._finish_cancelled(issue, entry, "shutdown")
-            return
-        if cancel_reason:
-            self._finish_cancelled(issue, entry, cancel_reason)
+        finish_reason = cancel_reason or ("shutdown" if self._closed else None)
+        if finish_reason:
+            self._finish_cancelled(issue, entry, finish_reason)
             return
         if "turn_input_required" in message or "approval_required" in message:
             blocked = dict(entry)
             blocked.update({"status": "blocked", "blocked_at": time.time(), "error": message, "state": issue.state})
             with self.state.lock:
                 self.state.blocked[issue.id] = blocked
+            self._persist_entry(issue, blocked)
             self.state.add_event("issue_blocked", f"Blocked {issue.identifier}: {message}", issue.identifier)
             return
         if self._schedule_retry(issue, message):
@@ -277,6 +317,7 @@ class Orchestrator:
             self.state.retrying[issue.id] = entry
             self._retry_issues[issue.id] = issue
             self.state.claimed.add(issue.id)
+        self._persist_entry(issue, entry)
         return True
 
     def _reschedule_tracker_retry(self, issue: Issue, entry: dict, error: Exception) -> None:
@@ -296,6 +337,7 @@ class Orchestrator:
             self.state.retrying[issue.id] = retry
             self._retry_issues[issue.id] = issue
             self.state.claimed.add(issue.id)
+        self._persist_entry(issue, retry)
         self.state.add_event(
             "tracker_poll_failed",
             f"Linear retry refresh failed for {issue.identifier}: {error}",
@@ -316,7 +358,9 @@ class Orchestrator:
             self.state.retrying.pop(issue.id, None)
             self._retry_issues.pop(issue.id, None)
             self.state.blocked[issue.id] = blocked
+            self._issues[issue.id] = issue
             self.state.claimed.add(issue.id)
+        self._persist_entry(issue, blocked)
         self.state.add_event(
             "issue_blocked",
             f"Blocked {issue.identifier}: attempt limit exceeded",
@@ -345,12 +389,23 @@ class Orchestrator:
             elif not self._eligible(issue):
                 reason = "ineligible"
             if reason:
+                persisted_issue = issue
+                persisted_running = None
                 with self.state.lock:
                     event = self._cancel_events.get(issue_id)
                     self._cancel_reasons[issue_id] = reason
+                    if issue is not None:
+                        self._issues[issue_id] = issue
+                    else:
+                        persisted_issue = self._issues.get(issue_id)
                     running = self.state.running.get(issue_id)
                     if running is not None:
                         running["cancellation_reason"] = reason
+                        if issue is not None:
+                            running["state"] = issue.state
+                        persisted_running = dict(running)
+                if persisted_issue is not None and persisted_running is not None:
+                    self._persist_entry(persisted_issue, persisted_running)
                 if event is not None:
                     event.set()
 
@@ -370,11 +425,15 @@ class Orchestrator:
             if blocked is None:
                 continue
             if issue is None or not self._eligible(issue):
-                with self.state.lock:
-                    self.state.blocked.pop(issue_id, None)
-                if issue is not None and self._terminal(issue):
-                    self._cleanup_terminal_workspace(issue)
-                self._release(issue_id)
+                final_issue = issue
+                if final_issue is None:
+                    with self.state.lock:
+                        final_issue = self._issues.get(issue_id)
+                if final_issue is not None:
+                    reason = "terminal" if issue is not None and self._terminal(issue) else (
+                        "missing" if issue is None else "ineligible"
+                    )
+                    self._finish_cancelled(final_issue, blocked, reason)
             elif issue.state != blocked.get("state"):
                 with self.state.lock:
                     self.state.blocked.pop(issue_id, None)
@@ -384,10 +443,20 @@ class Orchestrator:
         if reason == "terminal" and issue is not None:
             self._cleanup_terminal_workspace(issue)
         if issue is not None:
+            finished_at = time.time()
             completed = dict(entry)
-            completed.update({"status": "cancelled", "completed_at": time.time(), "cancellation_reason": reason})
+            completed.update(
+                {
+                    "status": "cancelled",
+                    "state": issue.state,
+                    "completed_at": finished_at,
+                    "cancelled_at": finished_at,
+                    "cancellation_reason": reason,
+                }
+            )
             with self.state.lock:
                 self.state.completed[issue.id] = completed
+            self._persist_entry(issue, completed)
             self.state.add_event("issue_cancelled", f"Cancelled {issue.identifier}: {reason}", issue.identifier)
             self._release(issue.id)
 
@@ -396,7 +465,9 @@ class Orchestrator:
         completed.update(
             {
                 "completed_at": time.time(),
-                "session_id": result.get("session_id"),
+                "session_id": result.get("session_id") or entry.get("session_id"),
+                "thread_id": result.get("thread_id") or entry.get("thread_id"),
+                "turn_id": result.get("turn_id") or entry.get("turn_id"),
                 "turn_count": result.get("turn_count", 1),
                 "status": "completed",
                 "state": issue.state,
@@ -404,6 +475,7 @@ class Orchestrator:
         )
         with self.state.lock:
             self.state.completed[issue.id] = completed
+        self._persist_entry(issue, completed)
         self._release(issue.id)
         self.state.add_event("issue_completed", f"Completed {issue.identifier}", issue.identifier)
 
@@ -412,18 +484,38 @@ class Orchestrator:
         workspace = workspace_path(self.project_root, self.workflow, issue)
         try:
             remove_workspace(workspace, self.workflow, issue)
+            self._persist_entry(
+                issue,
+                {
+                    "workspace": str(workspace),
+                    "workspace_cleanup_status": "removed",
+                    "workspace_cleaned_at": time.time(),
+                },
+            )
             self.state.add_event("workspace_removed", f"Removed workspace for {issue.identifier}", issue.identifier)
         except Exception as error:
+            self._persist_entry(
+                issue,
+                {
+                    "workspace": str(workspace),
+                    "workspace_cleanup_status": "failed",
+                    "workspace_cleanup_failed_at": time.time(),
+                    "workspace_cleanup_error": str(error),
+                    "error": str(error),
+                },
+            )
             self.state.add_event("workspace_cleanup_failed", f"Workspace cleanup failed for {issue.identifier}: {error}", issue.identifier)
 
     def _release(self, issue_id: str) -> None:
         with self.state.lock:
             self.state.claimed.discard(issue_id)
+            self.state.blocked.pop(issue_id, None)
             self.state.retrying.pop(issue_id, None)
             self._retry_issues.pop(issue_id, None)
             self._issues.pop(issue_id, None)
 
     def record_codex_event(self, issue: Issue, event: dict) -> None:
+        persisted = None
         with self.state.lock:
             running = self.state.running.get(issue.id)
             if running is not None:
@@ -432,7 +524,95 @@ class Orchestrator:
                         running[field] = event[field]
                 running["last_event"] = event.get("type", "codex_event")
                 running["last_event_at"] = time.time()
+                persisted = dict(running)
+        if persisted is not None:
+            self._persist_entry(issue, persisted)
         self.state.add_event("codex_event", event.get("type", "codex_event"), issue.identifier, event=event)
+
+    def _schedule_report_sync(self) -> None:
+        with self._report_sync_lock:
+            if self._closed or self._report_sync_executor is None or self._report_sync_future is not None:
+                return
+            self._report_sync_future = self._report_sync_executor.submit(
+                self.report_synchronizer.sync_pending,
+                time.time(),
+            )
+
+    def _collect_report_sync(self) -> None:
+        with self._report_sync_lock:
+            future = self._report_sync_future
+            if future is None or not future.done():
+                return
+            self._report_sync_future = None
+        try:
+            future.result()
+        except Exception as error:
+            self.state.add_event(
+                "report_sync_failed",
+                f"Pending report sync failed: {error}",
+                stage="report_sync",
+                error_type=type(error).__name__,
+                error=str(error),
+                retryable=True,
+            )
+
+    def _close_report_publisher(self, issue: Issue, publisher) -> None:
+        if publisher is None:
+            return
+        try:
+            publisher.close()
+        except Exception as error:
+            self.state.add_event(
+                "report_publisher_close_failed",
+                f"Report publisher close failed for {issue.identifier}: {error}",
+                issue.identifier,
+                stage="report_publish",
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+
+    def _persist_entry(self, issue: Issue, entry: dict) -> None:
+        if self.runtime_store is None:
+            return
+        payload = dict(entry)
+        payload.update(
+            {
+                "issue_identifier": issue.identifier,
+                "issue_id": issue.id,
+                "title": issue.title,
+                "linear_state": issue.state,
+                "url": issue.url,
+                "updated_at": time.time(),
+            }
+        )
+        payload.setdefault("workspace", str(workspace_path(self.project_root, self.workflow, issue)))
+        if issue.branch_name is not None:
+            payload.setdefault("branch", issue.branch_name)
+        aliases = {
+            "process_id": "codex_process_id",
+            "thread_id": "codex_thread_id",
+            "turn_id": "codex_turn_id",
+            "session_id": "codex_session_id",
+        }
+        for source, target in aliases.items():
+            if payload.get(source) is not None:
+                payload[target] = payload[source]
+        if payload.get("error") is not None:
+            payload["latest_error_summary"] = str(payload["error"])
+        try:
+            self.runtime_store.upsert_issue(payload)
+        except Exception as error:
+            try:
+                self.state.add_event(
+                    "runtime_persistence_failed",
+                    f"Runtime persistence failed for {issue.identifier}: {error}",
+                    issue.identifier,
+                    stage="runtime_store",
+                    error_type=type(error).__name__,
+                    error=str(error),
+                )
+            except Exception:
+                pass
 
     def _eligible(self, issue: Issue) -> bool:
         if self._normalize_state(issue.state) not in {self._normalize_state(state) for state in self.active_states()}:

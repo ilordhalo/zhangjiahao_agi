@@ -181,6 +181,64 @@ def stateful_fixture_response(state_path: Path, operation: str, variables: dict)
         ids = {str(value) for value in variables.get("ids", [])}
         return _fixture_issue_page([issue] if str(issue.get("id")) in ids else [])
 
+    comments = state.get("comments")
+    if isinstance(comments, list):
+        if operation == "SymphonzFindReportComment":
+            issue_id = str(variables.get("issueId") or "")
+            nodes = [
+                {"id": comment["id"], "body": comment["body"]}
+                for comment in comments
+                if isinstance(comment, dict)
+                and comment.get("issueId") == issue_id
+                and isinstance(comment.get("id"), str)
+                and isinstance(comment.get("body"), str)
+            ]
+            return {
+                "data": {
+                    "issue": {
+                        "comments": {
+                            "nodes": nodes,
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            }
+
+        if operation in {"SymphonzCreateWorkpadComment", "SymphonzCreateReportComment"}:
+            if operation == "SymphonzCreateReportComment" and state.get("reportSyncSuccess") is not True:
+                return {"data": {"commentCreate": {"success": False, "comment": None}}}
+            input_payload = variables.get("input")
+            if not isinstance(input_payload, dict):
+                return {"errors": [{"message": "comment input is required"}]}
+            issue_id = input_payload.get("issueId")
+            body = input_payload.get("body")
+            if not isinstance(issue_id, str) or not isinstance(body, str):
+                return {"errors": [{"message": "comment issueId and body are required"}]}
+            prefix = "workpad-QA-1" if operation == "SymphonzCreateWorkpadComment" else "report-comment-QA-1"
+            duplicate_count = sum(
+                isinstance(comment, dict) and str(comment.get("id") or "").startswith(prefix)
+                for comment in comments
+            )
+            comment_id = prefix if duplicate_count == 0 else f"{prefix}-{duplicate_count + 1}"
+            comments.append({"id": comment_id, "issueId": issue_id, "body": body})
+            _write_json_atomic(state_path, state)
+            return {"data": {"commentCreate": {"success": True, "comment": {"id": comment_id}}}}
+
+        if operation in {"SymphonzUpdateWorkpadComment", "SymphonzUpdateReportComment"}:
+            comment_id = variables.get("id")
+            input_payload = variables.get("input")
+            body = input_payload.get("body") if isinstance(input_payload, dict) else None
+            if not isinstance(comment_id, str) or not isinstance(body, str):
+                return {"errors": [{"message": "comment id and body are required"}]}
+            for comment in comments:
+                if isinstance(comment, dict) and comment.get("id") == comment_id:
+                    comment["body"] = body
+                    _write_json_atomic(state_path, state)
+                    return {
+                        "data": {"commentUpdate": {"success": True, "comment": {"id": comment_id}}}
+                    }
+            return {"errors": [{"message": f"unknown comment id: {comment_id}"}]}
+
     return None
 
 

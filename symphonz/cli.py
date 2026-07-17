@@ -23,7 +23,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subcommands.add_parser("run", help="Run the installed Symphony workflow")
     run.add_argument("--print-command", action="store_true", help="Print the runtime command instead of executing it")
+    run.add_argument("--host", help="Temporarily override the configured dashboard host")
     run.add_argument("--port", type=int, help="Serve the built-in dashboard on this port")
+
+    configure = subcommands.add_parser(
+        "configure-dashboard",
+        help="Configure dashboard networking and authentication without reinstalling",
+    )
+    configure.add_argument("--host")
+    configure.add_argument("--port", type=int)
+    configure.add_argument("--public-base-url")
+    configure.add_argument("--username")
+    configure.add_argument("--session-days", type=int)
 
     subcommands.add_parser("version", help="Print symphonz version")
 
@@ -34,7 +45,11 @@ def build_service_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="symphonz service")
     parser.add_argument("workflow")
     parser.add_argument("--logs-root", default=".symphonz/logs")
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int)
+    parser.add_argument("--public-base-url")
+    parser.add_argument("--dashboard-username", default="admin")
+    parser.add_argument("--session-days", type=int, default=30)
     parser.add_argument("--once", action="store_true")
     return parser
 
@@ -52,6 +67,10 @@ def main(argv: list[str] | None = None) -> int:
             logs_root=Path(args.logs_root),
             port=args.port,
             once=args.once,
+            host=args.host,
+            public_base_url=args.public_base_url,
+            dashboard_username=args.dashboard_username,
+            session_days=args.session_days,
         )
 
     parser = build_parser()
@@ -76,7 +95,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         from symphonz.runtime import run_installed
 
-        return run_installed(print_command=args.print_command, port=args.port)
+        return run_installed(print_command=args.print_command, host=args.host, port=args.port)
+
+    if args.command == "configure-dashboard":
+        from symphonz.install import configure_dashboard
+
+        configure_dashboard(
+            host=args.host,
+            port=args.port,
+            public_base_url=args.public_base_url,
+            username=args.username,
+            session_days=args.session_days,
+        )
+        return 0
 
     if args.command == "version":
         print(f"symphonz {__version__}")

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 
+from symphonz.service.reporting import report_tool_spec
+
 
 _NAME_PATTERN = re.compile(r"[_A-Za-z][_0-9A-Za-z]*")
 
@@ -21,6 +23,29 @@ def linear_graphql_tool_spec() -> dict:
             "additionalProperties": False,
         },
     }
+
+
+def dynamic_tool_specs(*, report_publisher=None) -> list[dict]:
+    """Advertise the stable Linear and report dynamic-tool contracts."""
+    return [linear_graphql_tool_spec(), report_tool_spec()]
+
+
+def execute_dynamic_tool(tool_name: str, arguments: object, *, linear_client, report_publisher) -> dict:
+    """Dispatch an advertised dynamic tool without allowing arbitrary tool names."""
+    if tool_name == "linear_graphql":
+        if linear_client is None:
+            return _failure("Linear client is unavailable.")
+        return execute_linear_graphql(linear_client, arguments)
+    if tool_name == "symphonz_report":
+        if report_publisher is None:
+            return _failure("Report publisher is unavailable.")
+        try:
+            body = report_publisher.publish(arguments)
+        except Exception as exc:
+            return _failure(str(exc))
+        output = json.dumps(body)
+        return {"success": bool(body.get("success")), "output": output, "contentItems": [{"type": "inputText", "text": output}]}
+    return _failure("Unsupported dynamic tool.")
 
 
 def execute_linear_graphql(client, arguments: object) -> dict:

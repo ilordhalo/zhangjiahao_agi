@@ -1,15 +1,19 @@
 from pathlib import Path
 from typing import Optional
-from contextlib import redirect_stderr
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
 import shlex
+import sqlite3
 import subprocess
 import tempfile
 import threading
 import time
+import traceback
 import unittest
+from unittest import mock
 
 
 class WorkflowServiceTests(unittest.TestCase):
@@ -24,6 +28,21 @@ class WorkflowServiceTests(unittest.TestCase):
         self.assertIn("Todo", workflow.config["tracker"]["active_states"])
         self.assertIn("git clone --depth 1", workflow.config["hooks"]["after_create"])
         self.assertIn("{{ issue.identifier }}", workflow.prompt_template)
+
+    def test_workflow_blocks_human_review_until_report_and_review_links_are_synchronized(self):
+        from symphonz.service.workflow import load_workflow
+
+        prompt = load_workflow(Path("WORKFLOW.md")).prompt_template
+
+        review_index = prompt.index("Create or update a review request")
+        report_index = prompt.index("Call `symphonz_report`")
+        human_review_index = prompt.index("Move the issue to `Human Review`", report_index)
+        self.assertLess(review_index, report_index)
+        self.assertLess(report_index, human_review_index)
+        self.assertIn("missing or failed report publication is a publication blocker", prompt)
+        self.assertIn("report URL and review request URL", prompt)
+        self.assertNotIn("document the blocker in the workpad and move to `Human Review`", prompt)
+        self.assertNotIn("record the blocker, and move to `Human Review`", prompt)
 
     def test_render_prompt_supports_issue_variables_and_description_condition(self):
         from symphonz.service.models import Issue
@@ -66,6 +85,42 @@ class WorkflowServiceTests(unittest.TestCase):
 
 
 class LinearAndWorkspaceTests(unittest.TestCase):
+    def test_dynamic_tool_router_advertises_and_dispatches_report_tool(self):
+        from symphonz.service.dynamic_tools import dynamic_tool_specs, execute_dynamic_tool
+
+        class Publisher:
+            def publish(self, arguments):
+                self.arguments = arguments
+                return {"success": True, "report_url": "https://reports.example.test/issues/SYM-1/report"}
+
+        publisher = Publisher()
+        specs = dynamic_tool_specs(report_publisher=publisher)
+        result = execute_dynamic_tool(
+            "symphonz_report",
+            {"operation": "publish"},
+            linear_client=None,
+            report_publisher=publisher,
+        )
+
+        self.assertEqual([spec["name"] for spec in specs], ["linear_graphql", "symphonz_report"])
+        self.assertTrue(result["success"])
+        self.assertEqual(publisher.arguments, {"operation": "publish"})
+
+    def test_dynamic_tool_specs_keep_unavailable_report_publishing_explicit(self):
+        from symphonz.service.dynamic_tools import dynamic_tool_specs, execute_dynamic_tool
+
+        specs = dynamic_tool_specs(report_publisher=None)
+        result = execute_dynamic_tool(
+            "symphonz_report",
+            {"operation": "publish"},
+            linear_client=None,
+            report_publisher=None,
+        )
+
+        self.assertEqual([spec["name"] for spec in specs], ["linear_graphql", "symphonz_report"])
+        self.assertFalse(result["success"])
+        self.assertIn("Report publisher is unavailable", result["output"])
+
     def test_linear_client_paginates_candidates_and_normalizes_blockers(self):
         from symphonz.service.linear import LinearClient
 
@@ -354,6 +409,52 @@ class LinearAndWorkspaceTests(unittest.TestCase):
             self.assertEqual(requests[0]["authorization"], "test-key")
             self.assertEqual(requests[0]["operation"], "SymphonzPoll")
             self.assertEqual(requests[0]["variables"]["projectSlug"], "quality-project")
+
+    def test_stateful_linear_file_fixture_persists_comments_and_rejects_unknown_update_ids(self):
+        from symphonz.service.linear import LinearClient
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp)
+            (fixture / "state.json").write_text(
+                json.dumps(
+                    {
+                        "issue": {"id": "issue-1", "state": {"name": "Todo"}},
+                        "comments": [],
+                        "reportSyncSuccess": True,
+                    }
+                )
+            )
+            client = LinearClient(api_key="test-key", project_slug="quality-project", endpoint=fixture.as_uri())
+            create = client.graphql(
+                "mutation SymphonzCreateWorkpadComment($input: CommentCreateInput!) { "
+                "commentCreate(input: $input) { success comment { id } } }",
+                {"input": {"issueId": "issue-1", "body": "## Symphonz Workpad\ncreated"}},
+            )
+            comment_id = create["data"]["commentCreate"]["comment"]["id"]
+            self.assertEqual(comment_id, "workpad-QA-1")
+
+            unknown = client.graphql(
+                "mutation SymphonzUpdateWorkpadComment($id: String!, $input: CommentUpdateInput!) { "
+                "commentUpdate(id: $id, input: $input) { success comment { id } } }",
+                {"id": "wrong-id", "input": {"body": "wrong"}},
+            )
+            self.assertEqual(unknown["errors"][0]["message"], "unknown comment id: wrong-id")
+
+            updated = client.graphql(
+                "mutation SymphonzUpdateWorkpadComment($id: String!, $input: CommentUpdateInput!) { "
+                "commentUpdate(id: $id, input: $input) { success comment { id } } }",
+                {"id": comment_id, "input": {"body": "## Symphonz Workpad\nupdated"}},
+            )
+            self.assertTrue(updated["data"]["commentUpdate"]["success"])
+            found = client.graphql(
+                "query SymphonzFindReportComment($issueId: String!) { "
+                "issue(id: $issueId) { comments { nodes { id body } } } }",
+                {"issueId": "issue-1"},
+            )
+            self.assertEqual(
+                found["data"]["issue"]["comments"]["nodes"],
+                [{"id": comment_id, "body": "## Symphonz Workpad\nupdated"}],
+            )
 
     def test_build_linear_client_uses_endpoint_override_from_environment(self):
         from symphonz.service.runner import build_linear_client
@@ -651,7 +752,10 @@ class CodexAppServerTests(unittest.TestCase):
                 "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
                 "    elif method == 'turn/start':\n"
                 "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
-                "        print(json.dumps({'id': 950, 'method': 'item/commandExecution/requestApproval', 'params': {}}), flush=True)\n",
+                "        print(json.dumps({'id': 950, 'method': 'item/commandExecution/requestApproval', 'params': {}}), flush=True)\n"
+                "        tail = sys.stdin.read()\n"
+                "        records.write(tail); records.flush()\n"
+                "        break\n",
             )
 
             with self.assertRaisesRegex(RuntimeError, "approval_required"):
@@ -659,6 +763,403 @@ class CodexAppServerTests(unittest.TestCase):
 
             replies = [json.loads(line) for line in records.read_text().splitlines() if json.loads(line).get("id") == 950]
             self.assertEqual(replies[-1]["result"]["decision"], "decline")
+
+    @unittest.skipUnless(os.name == "posix", "process watcher fallback is POSIX-specific")
+    def test_approval_decline_survives_process_watcher_constructor_errors(self):
+        import fcntl
+        import signal
+        import symphonz.service.codex_app_server as codex_app_server
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock_path = root / "descendant.lock"
+            pid_path = root / "descendant.pid"
+            records = root / "records.jsonl"
+            server, _ = self.write_server(
+                root,
+                "import json, os, signal, subprocess, sys\n"
+                f"lock_path = {str(lock_path)!r}\n"
+                f"pid_path = {str(pid_path)!r}\n"
+                f"records = open({str(records)!r}, 'a')\n"
+                "child_code = '''import fcntl, os, signal, sys\n"
+                "lock = open(sys.argv[1], 'w')\n"
+                "fcntl.flock(lock, fcntl.LOCK_EX)\n"
+                "os.write(int(sys.argv[2]), b'1')\n"
+                "signal.pause()\n'''\n"
+                "ready_read, ready_write = os.pipe()\n"
+                "child = subprocess.Popen([sys.executable, '-c', child_code, lock_path, str(ready_write)], pass_fds=(ready_write,))\n"
+                "os.close(ready_write)\n"
+                "os.read(ready_read, 1); os.close(ready_read)\n"
+                "with open(pid_path, 'w') as output: output.write(str(child.pid))\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); records.write(json.dumps(msg) + '\\n'); records.flush(); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        print(json.dumps({'id': 953, 'method': 'item/commandExecution/requestApproval', 'params': {}}), flush=True)\n"
+                "        tail = sys.stdin.read()\n"
+                "        records.write(tail); records.flush()\n"
+                "        break\n",
+            )
+
+            try:
+                with (
+                    mock.patch.object(
+                        codex_app_server.os,
+                        "pidfd_open",
+                        side_effect=OSError("pidfd unsupported"),
+                        create=True,
+                    ) as pidfd_open,
+                    mock.patch.object(
+                        codex_app_server.select,
+                        "kqueue",
+                        side_effect=OSError("kqueue unsupported"),
+                        create=True,
+                    ) as kqueue,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "approval_required"):
+                        self.client(server).run_turn(**self.run_kwargs(root))
+
+                pidfd_open.assert_called()
+                kqueue.assert_called()
+                replies = [
+                    json.loads(line)
+                    for line in records.read_text().splitlines()
+                    if json.loads(line).get("id") == 953
+                ]
+                self.assertEqual(replies[-1]["result"]["decision"], "decline")
+                with lock_path.open("w") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                if pid_path.exists():
+                    try:
+                        os.kill(int(pid_path.read_text()), signal.SIGKILL)
+                    except (PermissionError, ProcessLookupError):
+                        pass
+
+    @unittest.skipUnless(os.name == "posix", "process watcher fallback is POSIX-specific")
+    def test_approval_decline_uses_bounded_fallback_without_process_watchers(self):
+        import symphonz.service.codex_app_server as codex_app_server
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = root / "records.jsonl"
+            server, _ = self.write_server(
+                root,
+                "import json, sys\n"
+                f"records = open({str(records)!r}, 'a')\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); records.write(json.dumps(msg) + '\\n'); records.flush(); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        print(json.dumps({'id': 954, 'method': 'item/commandExecution/requestApproval', 'params': {}}), flush=True)\n"
+                "        tail = sys.stdin.read()\n"
+                "        records.write(tail); records.flush()\n"
+                "        break\n",
+            )
+
+            with (
+                mock.patch.object(codex_app_server.os, "pidfd_open", None, create=True),
+                mock.patch.object(codex_app_server.select, "kqueue", None, create=True),
+                mock.patch.object(codex_app_server.os, "waitid", None, create=True),
+                mock.patch.object(
+                    codex_app_server,
+                    "_wait_with_libc_waitid",
+                    return_value=None,
+                    create=True,
+                ),
+            ):
+                started = time.monotonic()
+                with self.assertRaisesRegex(RuntimeError, "approval_required"):
+                    self.client(server).run_turn(**self.run_kwargs(root))
+                elapsed = time.monotonic() - started
+
+            replies = [
+                json.loads(line)
+                for line in records.read_text().splitlines()
+                if json.loads(line).get("id") == 954
+            ]
+            self.assertEqual(replies[-1]["result"]["decision"], "decline")
+            self.assertLess(elapsed, 1)
+
+    @unittest.skipUnless(os.name == "posix", "process-group cleanup is POSIX-specific")
+    def test_process_group_cleanup_signals_before_reaping_when_leader_and_pipes_are_closed(self):
+        import symphonz.service.codex_app_server as codex_app_server
+
+        pipe_closed = threading.Event()
+        pipe_closed.set()
+        process = mock.Mock()
+        process.pid = 12345
+        process.stdin = None
+        process.wait.return_value = 0
+
+        with (
+            mock.patch.object(
+                codex_app_server,
+                "_wait_for_process_exit_without_reaping",
+                return_value=True,
+            ),
+            mock.patch.object(codex_app_server, "_signal_process_group") as signal_group,
+        ):
+            codex_app_server._stop_process_group(
+                process,
+                12345,
+                graceful=False,
+                pipe_closed=(pipe_closed,),
+            )
+
+        signal_group.assert_any_call(12345, codex_app_server.signal.SIGTERM)
+        signal_group.assert_any_call(12345, codex_app_server.signal.SIGKILL)
+        process.wait.assert_called_once()
+
+    @unittest.skipUnless(os.name == "posix", "kqueue cleanup is POSIX-specific")
+    def test_kqueue_close_capability_error_does_not_escape_process_observation(self):
+        import symphonz.service.codex_app_server as codex_app_server
+
+        watcher = mock.Mock()
+        watcher.control.return_value = [object()]
+        watcher.close.side_effect = NotImplementedError("kqueue close unsupported")
+
+        with (
+            mock.patch.object(codex_app_server.os, "pidfd_open", None, create=True),
+            mock.patch.object(codex_app_server.select, "kqueue", return_value=watcher, create=True),
+            mock.patch.object(codex_app_server.select, "kevent", return_value=object(), create=True),
+        ):
+            observed = codex_app_server._wait_for_process_exit_without_reaping(
+                os.getpid(),
+                timeout=0,
+                pipe_closed=(),
+            )
+
+        self.assertTrue(observed)
+
+    def test_never_approval_policy_preserves_decline_when_event_callback_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = root / "records.jsonl"
+            server, _ = self.write_server(
+                root,
+                "import json, sys\n"
+                f"records = open({str(records)!r}, 'a')\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); records.write(json.dumps(msg) + '\\n'); records.flush(); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        print(json.dumps({'id': 951, 'method': 'item/commandExecution/requestApproval', 'params': {}}), flush=True)\n"
+                "        tail = sys.stdin.read()\n"
+                "        records.write(tail); records.flush()\n"
+                "        break\n",
+            )
+
+            def raise_on_rejection(event):
+                if event["type"] == "approval_rejected":
+                    raise RuntimeError("event callback failed")
+
+            with self.assertRaisesRegex(RuntimeError, "approval_required"):
+                self.client(server).run_turn(
+                    **self.run_kwargs(root), on_event=raise_on_rejection
+                )
+
+            replies = [
+                json.loads(line)
+                for line in records.read_text().splitlines()
+                if json.loads(line).get("id") == 951
+            ]
+            self.assertEqual(replies[-1]["result"]["decision"], "decline")
+
+    @unittest.skipUnless(os.name == "posix", "process-group cleanup is POSIX-specific")
+    def test_graceful_approval_decline_terminates_pipe_holding_descendant(self):
+        import fcntl
+        import signal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock_path = root / "descendant.lock"
+            pid_path = root / "descendant.pid"
+            server, _ = self.write_server(
+                root,
+                "import json, os, signal, subprocess, sys\n"
+                f"lock_path = {str(lock_path)!r}\n"
+                f"pid_path = {str(pid_path)!r}\n"
+                "child_code = '''import fcntl, os, signal, sys\n"
+                "lock = open(sys.argv[1], 'w')\n"
+                "fcntl.flock(lock, fcntl.LOCK_EX)\n"
+                "os.write(int(sys.argv[2]), b'1')\n"
+                "signal.pause()\n'''\n"
+                "ready_read, ready_write = os.pipe()\n"
+                "child = subprocess.Popen([sys.executable, '-c', child_code, lock_path, str(ready_write)], pass_fds=(ready_write,))\n"
+                "os.close(ready_write)\n"
+                "os.read(ready_read, 1); os.close(ready_read)\n"
+                "with open(pid_path, 'w') as output: output.write(str(child.pid))\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        print(json.dumps({'id': 952, 'method': 'item/commandExecution/requestApproval', 'params': {}}), flush=True)\n"
+                "        sys.stdin.read()\n"
+                "        break\n",
+            )
+            approval_rejected = threading.Event()
+
+            def capture_rejection(event):
+                if event["type"] == "approval_rejected":
+                    approval_rejected.set()
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    self.client(server).run_turn,
+                    **self.run_kwargs(root),
+                    on_event=capture_rejection,
+                )
+                self.assertTrue(approval_rejected.wait(timeout=2))
+                child_pid = int(pid_path.read_text())
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "approval_required"):
+                        future.result(timeout=2)
+                finally:
+                    if not future.done():
+                        os.kill(child_pid, signal.SIGKILL)
+                        try:
+                            future.result(timeout=2)
+                        except RuntimeError:
+                            pass
+
+            with lock_path.open("w") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    os.kill(child_pid, signal.SIGKILL)
+                    self.fail("descendant still holds its lifecycle lock")
+
+    def test_codex_app_server_routes_concurrent_per_run_report_executors(self):
+        from symphonz.service.dynamic_tools import dynamic_tool_specs, linear_graphql_tool_spec
+        from symphonz.service.reporting import report_tool_spec
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = root / "records.jsonl"
+            server, _ = self.write_server(
+                root,
+                "import json, os, sys\n"
+                f"records_path = {str(records)!r}\n"
+                "tool_specs = []\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start':\n"
+                "        tool_specs = msg['params']['dynamicTools']\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': f'thread-{os.getpid()}'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        issue = msg['params']['input'][0]['text']\n"
+                "        with open(records_path, 'a') as output:\n"
+                "            output.write(json.dumps({'issue': issue, 'dynamicTools': tool_specs}) + '\\n')\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        print(json.dumps({'id': 900, 'method': 'item/tool/call', 'params': {'tool': 'symphonz_report', 'arguments': {'issue': issue}}}), flush=True)\n"
+                "    elif msg.get('id') == 900:\n"
+                "        print(json.dumps({'method': 'turn/completed', 'params': {}}), flush=True)\n",
+            )
+            default_specs = [linear_graphql_tool_spec()]
+            default_calls = []
+            client = self.client(
+                server,
+                dynamic_tool_specs=default_specs,
+                dynamic_tool_executor=lambda name, arguments: default_calls.append((name, arguments)),
+            )
+            barrier = threading.Barrier(2)
+            calls = {"SYM-1": [], "SYM-2": []}
+
+            def executor_for(issue):
+                def execute(name, arguments):
+                    barrier.wait(timeout=2)
+                    calls[issue].append((name, arguments))
+                    return {"success": True, "output": issue, "contentItems": []}
+
+                return execute
+
+            def run(issue, specs):
+                kwargs = self.run_kwargs(root)
+                kwargs["prompt"] = issue
+                return client.run_turns(
+                    **kwargs,
+                    max_turns=1,
+                    should_continue=lambda: False,
+                    continuation_prompt=lambda _turn: "unused",
+                    dynamic_tool_specs=specs,
+                    dynamic_tool_executor=executor_for(issue),
+                )
+
+            specs_by_issue = {
+                "SYM-1": [report_tool_spec()],
+                "SYM-2": dynamic_tool_specs(report_publisher=None),
+            }
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(run, issue, specs) for issue, specs in specs_by_issue.items()]
+                results = [future.result(timeout=5) for future in futures]
+
+            advertised = {
+                record["issue"]: record["dynamicTools"]
+                for record in map(json.loads, records.read_text().splitlines())
+            }
+            self.assertEqual([result["turn_count"] for result in results], [1, 1])
+            self.assertEqual(advertised, specs_by_issue)
+            self.assertEqual(calls["SYM-1"], [("symphonz_report", {"issue": "SYM-1"})])
+            self.assertEqual(calls["SYM-2"], [("symphonz_report", {"issue": "SYM-2"})])
+            self.assertEqual(default_specs, [linear_graphql_tool_spec()])
+            self.assertEqual(default_calls, [])
+
+    def test_codex_app_server_rejects_unadvertised_tool_without_executor_call(self):
+        from symphonz.service.dynamic_tools import linear_graphql_tool_spec
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = root / "records.jsonl"
+            server, _ = self.write_server(
+                root,
+                "import json, sys\n"
+                f"records = open({str(records)!r}, 'a')\n"
+                "for line in sys.stdin:\n"
+                "    msg = json.loads(line); records.write(json.dumps(msg) + '\\n'); records.flush(); method = msg.get('method')\n"
+                "    if method == 'initialize': print(json.dumps({'id': msg['id'], 'result': {}}), flush=True)\n"
+                "    elif method == 'thread/start': print(json.dumps({'id': msg['id'], 'result': {'thread': {'id': 'thread-1'}}}), flush=True)\n"
+                "    elif method == 'turn/start':\n"
+                "        print(json.dumps({'id': msg['id'], 'result': {'turn': {'id': 'turn-1'}}}), flush=True)\n"
+                "        print(json.dumps({'id': 903, 'method': 'item/tool/call', 'params': {'tool': 'symphonz_report', 'arguments': {'operation': 'publish'}}}), flush=True)\n"
+                "    elif msg.get('id') == 903: print(json.dumps({'method': 'turn/completed', 'params': {}}), flush=True)\n",
+            )
+            executor_calls = []
+            events = []
+
+            result = self.client(server).run_turn(
+                **self.run_kwargs(root),
+                dynamic_tool_specs=[linear_graphql_tool_spec()],
+                dynamic_tool_executor=lambda name, arguments: executor_calls.append((name, arguments)),
+                on_event=events.append,
+            )
+
+            messages = [json.loads(line) for line in records.read_text().splitlines()]
+            thread_start = next(message for message in messages if message.get("method") == "thread/start")
+            tool_reply = next(message for message in messages if message.get("id") == 903 and "result" in message)
+            self.assertEqual(result["turn_id"], "turn-1")
+            self.assertEqual(thread_start["params"]["dynamicTools"], [linear_graphql_tool_spec()])
+            self.assertEqual(executor_calls, [])
+            self.assertEqual(
+                tool_reply["result"],
+                {
+                    "success": False,
+                    "output": "Unsupported dynamic tool: symphonz_report",
+                    "contentItems": [
+                        {"type": "inputText", "text": "Unsupported dynamic tool: symphonz_report"}
+                    ],
+                },
+            )
+            self.assertTrue(any(event["type"] == "unsupported_tool_call" for event in events))
 
     def test_codex_app_server_reuses_thread_and_executes_dynamic_tool(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1289,6 +1790,2544 @@ class OrchestratorHardeningTests(unittest.TestCase):
         snapshot = orchestrator.state.snapshot()
         self.assertEqual(snapshot["counts"]["claimed"], 0)
         self.assertEqual(snapshot["counts"]["retrying"], 0)
+
+    def test_worker_error_during_shutdown_finishes_cancelled_once(self):
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+
+        class RecordingStore:
+            def __init__(inner_self):
+                inner_self.store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+                inner_self.entries = []
+
+            def upsert_issue(inner_self, entry):
+                inner_self.entries.append(dict(entry))
+                inner_self.store.upsert_issue(entry)
+
+        issue = self.issue(1)
+        codex = self.RecordingCodex(wait_for_cancel=True)
+        store = RecordingStore()
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([issue]),
+            codex,
+            runtime_store=store,
+        )
+        orchestrator.tick()
+        deadline = time.time() + 1
+        while not codex.calls and time.time() < deadline:
+            time.sleep(0.01)
+
+        orchestrator.shutdown()
+
+        cancelled_writes = [entry for entry in store.entries if entry.get("status") == "cancelled"]
+        cancelled_events = [
+            event for event in orchestrator.state.snapshot()["events"] if event["type"] == "issue_cancelled"
+        ]
+        self.assertEqual(len(cancelled_writes), 1)
+        self.assertEqual(len(cancelled_events), 1)
+        self.assertEqual(orchestrator.state.snapshot()["counts"]["completed"], 1)
+
+    def test_tick_schedules_pending_report_sync_without_candidate_issues(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        class RecordingSynchronizer:
+            def __init__(inner_self):
+                inner_self.calls = []
+                inner_self.called = threading.Event()
+
+            def sync_pending(inner_self, now):
+                inner_self.calls.append(now)
+                inner_self.called.set()
+                return 0
+
+        synchronizer = RecordingSynchronizer()
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([]),
+            self.RecordingCodex(),
+            report_synchronizer=synchronizer,
+        )
+        self.addCleanup(orchestrator.shutdown)
+
+        before = time.time()
+        orchestrator.tick()
+
+        self.assertTrue(synchronizer.called.wait(timeout=1))
+        self.assertEqual(len(synchronizer.calls), 1)
+        self.assertGreaterEqual(synchronizer.calls[0], before)
+        self.assertLessEqual(synchronizer.calls[0], time.time())
+
+    def test_slow_pending_report_sync_does_not_block_tick_or_issue_worker(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        class SlowSynchronizer:
+            def __init__(inner_self):
+                inner_self.calls = 0
+                inner_self.active = 0
+                inner_self.max_active = 0
+                inner_self.started = threading.Event()
+                inner_self.release = threading.Event()
+                inner_self.lock = threading.Lock()
+
+            def sync_pending(inner_self, now):
+                with inner_self.lock:
+                    inner_self.calls += 1
+                    inner_self.active += 1
+                    inner_self.max_active = max(inner_self.max_active, inner_self.active)
+                inner_self.started.set()
+                try:
+                    if not inner_self.release.wait(timeout=2):
+                        raise RuntimeError("sync was not released")
+                    return 0
+                finally:
+                    with inner_self.lock:
+                        inner_self.active -= 1
+
+        class StartedCodex(self.RecordingCodex):
+            def __init__(inner_self):
+                super().__init__(sleep_seconds=0)
+                inner_self.started = threading.Event()
+
+            def run_turns(inner_self, **kwargs):
+                inner_self.started.set()
+                return super().run_turns(**kwargs)
+
+        self.workflow.config["agent"]["max_concurrent_agents"] = 1
+        synchronizer = SlowSynchronizer()
+        codex = StartedCodex()
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([self.issue(1)]),
+            codex,
+            report_synchronizer=synchronizer,
+        )
+        self.addCleanup(orchestrator.shutdown)
+        self.addCleanup(synchronizer.release.set)
+
+        started_at = time.monotonic()
+        orchestrator.tick()
+        elapsed = time.monotonic() - started_at
+
+        self.assertLess(elapsed, 0.25)
+        self.assertTrue(synchronizer.started.wait(timeout=1))
+        self.assertTrue(codex.started.wait(timeout=1))
+        orchestrator.tick()
+        with synchronizer.lock:
+            self.assertEqual(synchronizer.calls, 1)
+            self.assertEqual(synchronizer.max_active, 1)
+
+    def test_pending_report_sync_failure_emits_runtime_error_event(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        class FailingSynchronizer:
+            def __init__(inner_self):
+                inner_self.called = threading.Event()
+
+            def sync_pending(inner_self, now):
+                inner_self.called.set()
+                raise RuntimeError("pending sync failed")
+
+        synchronizer = FailingSynchronizer()
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([]),
+            self.RecordingCodex(),
+            report_synchronizer=synchronizer,
+        )
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        self.assertTrue(synchronizer.called.wait(timeout=1))
+        deadline = time.time() + 1
+        failures = []
+        while not failures and time.time() < deadline:
+            orchestrator.tick()
+            failures = [
+                event
+                for event in orchestrator.state.snapshot()["events"]
+                if event["type"] == "report_sync_failed"
+            ]
+            time.sleep(0.01)
+
+        self.assertTrue(failures)
+        self.assertEqual(failures[0]["data"]["stage"], "report_sync")
+        self.assertEqual(failures[0]["data"]["error_type"], "RuntimeError")
+        self.assertEqual(failures[0]["data"]["error"], "pending sync failed")
+
+    def test_concurrent_ticks_submit_exactly_one_report_sync(self):
+        from concurrent.futures import Future
+        from symphonz.service.orchestrator import Orchestrator
+
+        class ContendedExecutor:
+            def __init__(inner_self):
+                inner_self.calls = 0
+                inner_self.second_submit = threading.Event()
+                inner_self.futures = []
+                inner_self.lock = threading.Lock()
+
+            def submit(inner_self, function, *args):
+                with inner_self.lock:
+                    inner_self.calls += 1
+                    call = inner_self.calls
+                if call == 1:
+                    inner_self.second_submit.wait(timeout=0.2)
+                else:
+                    inner_self.second_submit.set()
+                future = Future()
+                future.set_result(0)
+                inner_self.futures.append(future)
+                return future
+
+            def shutdown(inner_self, wait=True):
+                return None
+
+        class ContendedOrchestrator(Orchestrator):
+            def __init__(inner_self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                inner_self.schedule_barrier = threading.Barrier(2)
+
+            def _schedule_report_sync(inner_self):
+                inner_self.schedule_barrier.wait(timeout=1)
+                return super()._schedule_report_sync()
+
+        orchestrator = ContendedOrchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([]),
+            self.RecordingCodex(),
+            report_synchronizer=mock.Mock(sync_pending=lambda now: 0),
+        )
+        original_executor = orchestrator._report_sync_executor
+        original_executor.shutdown(wait=True)
+        executor = ContendedExecutor()
+        orchestrator._report_sync_executor = executor
+        errors = []
+
+        threads = [threading.Thread(target=lambda: self._run_and_record(orchestrator.tick, errors)) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(executor.calls, 1)
+        orchestrator.shutdown()
+
+    def test_concurrent_report_sync_collection_records_exception_once(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        class ContendedFailureFuture:
+            def __init__(inner_self):
+                inner_self.done_barrier = threading.Barrier(2)
+                inner_self.result_calls = 0
+
+            def done(inner_self):
+                try:
+                    inner_self.done_barrier.wait(timeout=0.2)
+                except threading.BrokenBarrierError:
+                    pass
+                return True
+
+            def result(inner_self):
+                inner_self.result_calls += 1
+                raise RuntimeError("collect once")
+
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([]),
+            self.RecordingCodex(),
+            report_synchronizer=mock.Mock(sync_pending=lambda now: 0),
+        )
+        self.addCleanup(orchestrator.shutdown)
+        future = ContendedFailureFuture()
+        orchestrator._report_sync_future = future
+        threads = [threading.Thread(target=orchestrator._collect_report_sync) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        failures = [
+            event for event in orchestrator.state.snapshot()["events"] if event["type"] == "report_sync_failed"
+        ]
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(future.result_calls, 1)
+        self.assertEqual(len(failures), 1)
+
+    def test_concurrent_tick_and_shutdown_do_not_submit_report_sync_after_shutdown(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        class PausingOrchestrator(Orchestrator):
+            def __init__(inner_self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                inner_self.tick_collecting = threading.Event()
+                inner_self.release_tick = threading.Event()
+
+            def _collect_report_sync(inner_self):
+                if threading.current_thread().name == "contended-tick":
+                    inner_self.tick_collecting.set()
+                    if not inner_self.release_tick.wait(timeout=2):
+                        raise RuntimeError("tick was not released")
+                return super()._collect_report_sync()
+
+        orchestrator = PausingOrchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([]),
+            self.RecordingCodex(),
+            report_synchronizer=mock.Mock(sync_pending=lambda now: 0),
+        )
+        errors = []
+        tick_thread = threading.Thread(
+            name="contended-tick",
+            target=lambda: self._run_and_record(orchestrator.tick, errors),
+        )
+        tick_thread.start()
+        self.assertTrue(orchestrator.tick_collecting.wait(timeout=1))
+
+        orchestrator.shutdown()
+        orchestrator.release_tick.set()
+        tick_thread.join(timeout=2)
+
+        self.assertFalse(tick_thread.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_concurrent_issues_use_isolated_report_publishers_and_close_each(self):
+        from symphonz.service.orchestrator import Orchestrator
+
+        class ToolLinear(self.FakeLinear):
+            def graphql(inner_self, query, variables):
+                return {"data": {"marker": variables["marker"]}}
+
+        class Publisher:
+            def __init__(inner_self, identifier):
+                inner_self.identifier = identifier
+                inner_self.close_calls = 0
+
+            def publish(inner_self, arguments):
+                return {
+                    "success": True,
+                    "issue_identifier": inner_self.identifier,
+                    "operation": arguments["operation"],
+                }
+
+            def close(inner_self):
+                inner_self.close_calls += 1
+
+        publishers = {}
+        publisher_lock = threading.Lock()
+
+        def publisher_factory(issue):
+            publisher = Publisher(issue.identifier)
+            with publisher_lock:
+                publishers[issue.identifier] = publisher
+            return publisher
+
+        class ToolCallingCodex:
+            def __init__(inner_self):
+                inner_self.barrier = threading.Barrier(2)
+                inner_self.results = {}
+                inner_self.lock = threading.Lock()
+
+            def run_turns(inner_self, **kwargs):
+                identifier = kwargs["title"].split(":", 1)[0]
+                inner_self.barrier.wait(timeout=2)
+                report_result = kwargs["dynamic_tool_executor"](
+                    "symphonz_report",
+                    {"operation": "publish"},
+                )
+                linear_result = kwargs["dynamic_tool_executor"](
+                    "linear_graphql",
+                    {"query": "query Marker { viewer { id } }", "variables": {"marker": identifier}},
+                )
+                with inner_self.lock:
+                    inner_self.results[identifier] = {
+                        "specs": [spec["name"] for spec in kwargs["dynamic_tool_specs"]],
+                        "report": json.loads(report_result["output"]),
+                        "linear": json.loads(linear_result["output"]),
+                    }
+                kwargs["on_event"](
+                    {
+                        "type": "session_started",
+                        "session_id": f"session-{identifier}",
+                        "thread_id": f"thread-{identifier}",
+                        "turn_id": f"turn-{identifier}",
+                        "turn_count": 1,
+                        "process_id": 100,
+                    }
+                )
+                if identifier == "SYM-2":
+                    raise RuntimeError("codex failed after tool call")
+                return {
+                    "session_id": f"session-{identifier}",
+                    "thread_id": f"thread-{identifier}",
+                    "turn_id": f"turn-{identifier}",
+                    "turn_count": 1,
+                    "result": {},
+                }
+
+        issues = [self.issue(1), self.issue(2)]
+        codex = ToolCallingCodex()
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            ToolLinear(issues),
+            codex,
+            report_publisher_factory=publisher_factory,
+        )
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+
+        self.assertEqual(set(publishers), {"SYM-1", "SYM-2"})
+        self.assertEqual(set(codex.results), {"SYM-1", "SYM-2"})
+        for identifier in ("SYM-1", "SYM-2"):
+            self.assertEqual(codex.results[identifier]["specs"], ["linear_graphql", "symphonz_report"])
+            self.assertEqual(codex.results[identifier]["report"]["issue_identifier"], identifier)
+            self.assertEqual(codex.results[identifier]["linear"]["data"]["marker"], identifier)
+            self.assertEqual(publishers[identifier].close_calls, 1)
+
+    def test_runtime_store_persists_dispatch_codex_completion_and_cleanup_fields(self):
+        from dataclasses import replace
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+        from symphonz.service.workspace import workspace_path
+
+        class MilestoneCodex:
+            def __init__(inner_self):
+                inner_self.started = threading.Event()
+                inner_self.release = threading.Event()
+
+            def run_turns(inner_self, **kwargs):
+                kwargs["on_event"](
+                    {
+                        "type": "tool_call_completed",
+                        "session_id": "session-1",
+                        "thread_id": "thread-1",
+                        "turn_id": "turn-1",
+                        "turn_count": 1,
+                        "process_id": 321,
+                    }
+                )
+                inner_self.started.set()
+                if not inner_self.release.wait(timeout=2):
+                    raise RuntimeError("codex was not released")
+                return {
+                    "session_id": "session-1",
+                    "thread_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "turn_count": 1,
+                    "result": {},
+                }
+
+        issue = replace(
+            self.issue(1),
+            branch_name="codex/sym-1",
+            url="https://linear.example.test/SYM-1",
+        )
+        linear = self.FakeLinear([issue])
+        codex = MilestoneCodex()
+        store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            linear,
+            codex,
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+        self.addCleanup(codex.release.set)
+
+        orchestrator.tick()
+        self.assertTrue(codex.started.wait(timeout=1))
+        deadline = time.time() + 1
+        running = store.get_task(issue.identifier)
+        while (running is None or running.get("codex_session_id") != "session-1") and time.time() < deadline:
+            time.sleep(0.01)
+            running = store.get_task(issue.identifier)
+
+        self.assertEqual(running["status"], "running")
+        self.assertEqual(running["issue_id"], issue.id)
+        self.assertEqual(running["linear_state"], "Todo")
+        self.assertEqual(running["attempt"], 0)
+        self.assertEqual(running["workspace"], str(workspace_path(self.root, self.workflow, issue)))
+        self.assertEqual(running["codex_process_id"], "321")
+        self.assertEqual(running["codex_thread_id"], "thread-1")
+        self.assertEqual(running["codex_turn_id"], "turn-1")
+        self.assertEqual(running["codex_session_id"], "session-1")
+        self.assertEqual(running["branch"], "codex/sym-1")
+        self.assertEqual(running["last_event"], "tool_call_completed")
+        self.assertIsNotNone(running["started_at"])
+
+        linear.issues[issue.id] = replace(issue, state="Done")
+        codex.release.set()
+        orchestrator.wait_for_idle(timeout=2)
+
+        completed = store.get_task(issue.identifier)
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["linear_state"], "Done")
+        self.assertEqual(completed["codex_thread_id"], "thread-1")
+        self.assertEqual(completed["codex_turn_id"], "turn-1")
+        self.assertEqual(completed["codex_session_id"], "session-1")
+        self.assertIsNotNone(completed["completed_at"])
+        self.assertEqual(completed["workspace_cleanup_status"], "removed")
+        self.assertIsNotNone(completed["workspace_cleaned_at"])
+
+    def test_runtime_store_persists_retry_and_attempt_limit_block(self):
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+
+        class AlwaysFailCodex:
+            def __init__(inner_self):
+                inner_self.calls = 0
+
+            def run_turns(inner_self, **kwargs):
+                inner_self.calls += 1
+                raise RuntimeError(f"failure-{inner_self.calls}")
+
+        self.workflow.config["agent"]["max_attempts"] = 2
+        now = [0.0]
+        issue = self.issue(1)
+        store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([issue]),
+            AlwaysFailCodex(),
+            clock=lambda: now[0],
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+
+        retrying = store.get_task(issue.identifier)
+        self.assertEqual(retrying["status"], "retrying")
+        self.assertEqual(retrying["attempt"], 1)
+        self.assertEqual(retrying["latest_error_summary"], "failure-1")
+        self.assertEqual(retrying["due_at"], 10.0)
+
+        now[0] = 10.0
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+
+        blocked = store.get_task(issue.identifier)
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertEqual(blocked["attempt"], 2)
+        self.assertEqual(blocked["latest_error_summary"], "attempt_limit_exceeded")
+        self.assertEqual(blocked["max_attempts"], 2)
+        self.assertIsNotNone(blocked["blocked_at"])
+
+    def test_runtime_store_persists_terminal_cancellation_reason_and_timestamp(self):
+        from dataclasses import replace
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        codex = self.RecordingCodex(wait_for_cancel=True)
+        store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            linear,
+            codex,
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.tick()
+        deadline = time.time() + 1
+        while not codex.calls and time.time() < deadline:
+            time.sleep(0.01)
+        linear.issues[issue.id] = replace(issue, state="Done")
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+
+        cancelled = store.get_task(issue.identifier)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["linear_state"], "Done")
+        self.assertEqual(cancelled["cancellation_reason"], "terminal")
+        self.assertIsNotNone(cancelled["cancelled_at"])
+        self.assertIsNotNone(cancelled["completed_at"])
+        self.assertEqual(cancelled["workspace_cleanup_status"], "removed")
+
+    def test_retry_refresh_missing_persists_final_cancelled_row(self):
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            linear,
+            self.RecordingCodex(),
+            clock=lambda: 0.0,
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+        orchestrator._schedule_retry(issue, "failure", delay=0)
+        linear.issues.clear()
+
+        orchestrator.tick()
+
+        cancelled = store.get_task(issue.identifier)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["linear_state"], "Todo")
+        self.assertEqual(cancelled["cancellation_reason"], "missing")
+        self.assertIsNotNone(cancelled["completed_at"])
+        self.assertIsNotNone(cancelled["cancelled_at"])
+        self.assertEqual(orchestrator.state.snapshot()["counts"]["claimed"], 0)
+
+    def test_retry_refresh_ineligible_persists_latest_linear_state(self):
+        from dataclasses import replace
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            linear,
+            self.RecordingCodex(),
+            clock=lambda: 0.0,
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+        orchestrator._schedule_retry(issue, "failure", delay=0)
+        linear.issues[issue.id] = replace(issue, state="Backlog")
+
+        orchestrator.tick()
+
+        cancelled = store.get_task(issue.identifier)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["linear_state"], "Backlog")
+        self.assertEqual(cancelled["cancellation_reason"], "ineligible")
+        self.assertIsNotNone(cancelled["cancelled_at"])
+
+    def test_retry_refresh_terminal_persists_cancelled_row_and_cleanup(self):
+        from dataclasses import replace
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+        from symphonz.service.workspace import workspace_path
+
+        issue = self.issue(1)
+        terminal = replace(issue, state="Done")
+        linear = self.FakeLinear([issue])
+        store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+        workspace = workspace_path(self.root, self.workflow, issue)
+        workspace.mkdir(parents=True)
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            linear,
+            self.RecordingCodex(),
+            clock=lambda: 0.0,
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+        orchestrator._schedule_retry(issue, "failure", delay=0)
+        linear.issues[issue.id] = terminal
+
+        orchestrator.tick()
+
+        cancelled = store.get_task(issue.identifier)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["linear_state"], "Done")
+        self.assertEqual(cancelled["cancellation_reason"], "terminal")
+        self.assertEqual(cancelled["workspace_cleanup_status"], "removed")
+        self.assertFalse(workspace.exists())
+
+    def test_blocked_refresh_missing_persists_final_cancelled_row(self):
+        self._assert_blocked_refresh_finalized(None, "missing", "Todo")
+
+    def test_attempt_limit_block_refresh_missing_uses_cached_issue_for_final_row(self):
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            linear,
+            self.RecordingCodex(),
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+        orchestrator._block_at_attempt_limit(issue, 5)
+        linear.issues.clear()
+
+        orchestrator.tick()
+
+        cancelled = store.get_task(issue.identifier)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["cancellation_reason"], "missing")
+        self.assertEqual(orchestrator.state.snapshot()["counts"]["claimed"], 0)
+
+    def test_blocked_refresh_ineligible_persists_latest_linear_state(self):
+        from dataclasses import replace
+
+        issue = self.issue(1)
+        self._assert_blocked_refresh_finalized(replace(issue, state="Backlog"), "ineligible", "Backlog")
+
+    def test_blocked_refresh_terminal_persists_cancelled_row_and_cleanup(self):
+        from dataclasses import replace
+        from symphonz.service.workspace import workspace_path
+
+        issue = self.issue(1)
+        workspace = workspace_path(self.root, self.workflow, issue)
+        workspace.mkdir(parents=True)
+
+        cancelled = self._assert_blocked_refresh_finalized(replace(issue, state="Done"), "terminal", "Done")
+
+        self.assertEqual(cancelled["workspace_cleanup_status"], "removed")
+        self.assertFalse(workspace.exists())
+
+    def test_startup_terminal_cleanup_persists_completed_row_before_cleanup(self):
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+        from symphonz.service.workspace import workspace_path
+
+        class RecordingStore:
+            def __init__(inner_self):
+                inner_self.store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+                inner_self.entries = []
+
+            def upsert_issue(inner_self, entry):
+                inner_self.entries.append(dict(entry))
+                inner_self.store.upsert_issue(entry)
+
+            def get_task(inner_self, identifier):
+                return inner_self.store.get_task(identifier)
+
+        issue = self.issue(1, state="Done")
+        workspace = workspace_path(self.root, self.workflow, issue)
+        workspace.mkdir(parents=True)
+        store = RecordingStore()
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            self.FakeLinear([issue]),
+            self.RecordingCodex(),
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+
+        orchestrator.startup_cleanup()
+
+        completed = store.get_task(issue.identifier)
+        self.assertEqual(store.entries[0]["status"], "completed")
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["linear_state"], "Done")
+        self.assertEqual(completed["completion_reason"], "terminal")
+        self.assertIsNotNone(completed["completed_at"])
+        self.assertEqual(completed["workspace_cleanup_status"], "removed")
+        self.assertFalse(workspace.exists())
+
+    def _assert_blocked_refresh_finalized(self, refreshed_issue, reason, expected_state):
+        from symphonz.service.orchestrator import Orchestrator
+        from symphonz.service.runtime_store import RuntimeStore
+
+        class BlockedCodex(self.RecordingCodex):
+            def run_turns(inner_self, **kwargs):
+                inner_self.calls.append(kwargs)
+                raise RuntimeError("turn_input_required")
+
+        issue = self.issue(1)
+        linear = self.FakeLinear([issue])
+        store = RuntimeStore(self.root / "logs" / "runtime.sqlite3")
+        orchestrator = Orchestrator(
+            self.root,
+            self.workflow,
+            linear,
+            BlockedCodex(),
+            runtime_store=store,
+        )
+        self.addCleanup(orchestrator.shutdown)
+        orchestrator.tick()
+        orchestrator.wait_for_idle(timeout=2)
+        if refreshed_issue is None:
+            linear.issues.clear()
+        else:
+            linear.issues[issue.id] = refreshed_issue
+
+        orchestrator.tick()
+
+        cancelled = store.get_task(issue.identifier)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["linear_state"], expected_state)
+        self.assertEqual(cancelled["cancellation_reason"], reason)
+        self.assertIsNotNone(cancelled["completed_at"])
+        self.assertIsNotNone(cancelled["cancelled_at"])
+        snapshot = orchestrator.state.snapshot()
+        self.assertEqual(snapshot["counts"]["claimed"], 0)
+        self.assertEqual(snapshot["counts"]["blocked"], 0)
+        cancellation_events = sum(event["type"] == "issue_cancelled" for event in snapshot["events"])
+
+        orchestrator.tick()
+
+        repeated = store.get_task(issue.identifier)
+        repeated_snapshot = orchestrator.state.snapshot()
+        self.assertEqual(repeated["cancelled_at"], cancelled["cancelled_at"])
+        self.assertEqual(repeated_snapshot["counts"]["blocked"], 0)
+        self.assertEqual(
+            sum(event["type"] == "issue_cancelled" for event in repeated_snapshot["events"]),
+            cancellation_events,
+        )
+        return cancelled
+
+    @staticmethod
+    def _run_and_record(function, errors):
+        try:
+            function()
+        except Exception as error:
+            errors.append(error)
+
+
+class RuntimeStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "logs" / "runtime.sqlite3"
+
+    def test_runtime_store_persists_tasks_events_and_errors_across_instances(self):
+        from symphonz.service.models import RuntimeErrorRecord, RuntimeEvent
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.upsert_issue(
+            {
+                "issue_identifier": "SYM-1",
+                "issue_id": "issue-1",
+                "title": "Persist runtime history",
+                "linear_state": "Todo",
+                "status": "running",
+                "attempt": 2,
+                "workspace": "/tmp/SYM-1",
+            }
+        )
+        store.record_event(RuntimeEvent("issue_started", "Started", "SYM-1", data={"category": "lifecycle"}))
+        error_id = store.record_error(
+            RuntimeErrorRecord(
+                issue_identifier="SYM-1",
+                session_id="session-1",
+                stage="codex",
+                error_type="RuntimeError",
+                message="boom",
+                retryable=True,
+                attempt=2,
+                context={"request": {"authorization": "Bearer secret"}},
+            )
+        )
+
+        reopened = RuntimeStore(self.path)
+
+        self.assertEqual(reopened.get_task("SYM-1")["status"], "running")
+        self.assertEqual(reopened.get_task("SYM-1")["title"], "Persist runtime history")
+        self.assertEqual(reopened.list_events(issue_identifier="SYM-1")["items"][0]["type"], "issue_started")
+        error = reopened.list_errors(issue_identifier="SYM-1")["items"][0]
+        self.assertEqual(error["id"], error_id)
+        self.assertEqual(error["message"], "boom")
+        self.assertEqual(error["context"]["request"]["authorization"], "[REDACTED]")
+
+    def test_task_filters_and_cursor_pagination_use_persisted_rows(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.upsert_issue({"issue_identifier": "SYM-1", "title": "First dashboard", "status": "completed"})
+        store.upsert_issue({"issue_identifier": "SYM-2", "title": "Runtime dashboard", "status": "running"})
+        store.upsert_issue({"issue_identifier": "SYM-3", "title": "Another runtime", "status": "running"})
+
+        filtered = store.list_tasks(status="running", query="runtime", cursor=None, limit=1)
+        remaining = store.list_tasks(status="running", query="runtime", cursor=filtered["next_cursor"], limit=1)
+
+        self.assertEqual(len(filtered["items"]), 1)
+        self.assertIsNotNone(filtered["next_cursor"])
+        self.assertEqual(len(remaining["items"]), 1)
+        self.assertIsNone(remaining["next_cursor"])
+        self.assertEqual(
+            {filtered["items"][0]["issue_identifier"], remaining["items"][0]["issue_identifier"]},
+            {"SYM-2", "SYM-3"},
+        )
+
+    def test_upserting_a_task_updates_its_last_activity_timestamp(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.upsert_issue({"issue_identifier": "SYM-1", "status": "queued"})
+        first_updated_at = store.get_task("SYM-1")["updated_at"]
+        time.sleep(0.001)
+
+        store.upsert_issue({"issue_identifier": "SYM-1", "status": "running"})
+
+        self.assertGreater(store.get_task("SYM-1")["updated_at"], first_updated_at)
+
+    def test_events_errors_and_jsonl_logs_redact_secrets_and_errors_resolve(self):
+        from symphonz.service.event_log import CompositeEventSink, ErrorJsonlLog, JsonlEventLog
+        from symphonz.service.models import RuntimeErrorRecord, RuntimeEvent
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        runtime_path = self.path.parent / "runtime.jsonl"
+        errors_path = self.path.parent / "errors.jsonl"
+        event = RuntimeEvent(
+            "tool_failed",
+            "Tool failed",
+            "SYM-1",
+            data={"api_key": "top-secret", "nested": [{"password": "hidden"}]},
+        )
+        error_log = ErrorJsonlLog(errors_path)
+        CompositeEventSink(JsonlEventLog(runtime_path).write, store.record_event, error_log.write).write(event)
+
+        event_payload = json.loads(runtime_path.read_text().strip())
+        error_payload = json.loads(errors_path.read_text().strip())
+        persisted_event = store.list_events(issue_identifier="SYM-1")["items"][0]
+        self.assertEqual(event_payload["data"]["api_key"], "[REDACTED]")
+        self.assertEqual(event_payload["data"]["nested"][0]["password"], "[REDACTED]")
+        self.assertEqual(error_payload["context"]["api_key"], "[REDACTED]")
+        self.assertEqual(persisted_event["data"]["api_key"], "[REDACTED]")
+
+        error_id = store.list_errors(issue_identifier="SYM-1")["items"][0]["id"]
+        store.resolve_error(error_id, resolving_event="tool_completed")
+
+        self.assertEqual(store.list_errors(resolved=False)["items"], [])
+        self.assertEqual(store.list_errors(resolved=True)["items"][0]["resolving_event"], "tool_completed")
+
+    def test_wal_store_accepts_concurrent_event_writers(self):
+        from symphonz.service.models import RuntimeEvent
+        from symphonz.service.runtime_store import RuntimeStore
+
+        RuntimeStore(self.path)
+        failures = []
+
+        def record(index):
+            try:
+                RuntimeStore(self.path).record_event(RuntimeEvent("tool_completed", str(index), "SYM-1"))
+            except Exception as error:  # pragma: no cover - asserted below
+                failures.append(error)
+
+        writers = [threading.Thread(target=record, args=(index,)) for index in range(12)]
+        for writer in writers:
+            writer.start()
+        for writer in writers:
+            writer.join()
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(RuntimeStore(self.path).list_events(issue_identifier="SYM-1", limit=20)["items"]), 12)
+
+    def test_reports_sessions_and_login_attempts_are_persisted(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        now = time.time()
+        store = RuntimeStore(self.path)
+        store.save_report(
+            {
+                "issue_identifier": "SYM-1",
+                "report_version": 1,
+                "json_path": "/tmp/report.json",
+                "html_path": "/tmp/report.html",
+                "url": "https://reports.example/SYM-1",
+                "sync_status": "pending",
+            }
+        )
+        store.save_session("token-hash", expires_at=now + 60, metadata={"user": "admin"})
+        store.record_login_attempt("127.0.0.1", failures=2, window_started_at=now, locked_until=now + 30)
+
+        reopened = RuntimeStore(self.path)
+
+        self.assertEqual(reopened.get_report("SYM-1")["url"], "https://reports.example/SYM-1")
+        self.assertEqual(reopened.get_session("token-hash")["metadata"], {"user": "admin"})
+        self.assertEqual(reopened.get_login_attempt("127.0.0.1")["failures"], 2)
+        reopened.clear_login_attempt("127.0.0.1")
+        self.assertIsNone(reopened.get_login_attempt("127.0.0.1"))
+
+    def test_nested_codex_failures_are_normalized_for_sqlite_and_error_jsonl(self):
+        from symphonz.service.event_log import CompositeEventSink, ErrorJsonlLog
+        from symphonz.service.models import RuntimeEvent
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.upsert_issue({"issue_identifier": "SYM-1", "status": "running"})
+        errors_path = self.path.parent / "errors.jsonl"
+        event = RuntimeEvent(
+            "codex_event",
+            "tool_call_failed",
+            "SYM-1",
+            data={
+                "event": {
+                    "type": "tool_call_failed",
+                    "tool": "linear_graphql",
+                    "result": {"success": False, "output": "permission denied"},
+                    "session_id": "session-1",
+                    "attempt": 2,
+                }
+            },
+        )
+
+        CompositeEventSink(store.record_event, ErrorJsonlLog(errors_path)).write(event)
+
+        error = store.list_errors(issue_identifier="SYM-1")["items"][0]
+        payload = json.loads(errors_path.read_text().strip())
+        self.assertEqual(error["stage"], "codex")
+        self.assertEqual(error["error_type"], "tool_call_failed")
+        self.assertEqual(error["message"], "permission denied")
+        self.assertEqual(payload["error_type"], "tool_call_failed")
+
+    def test_runtime_event_router_keeps_jsonl_complete_and_filters_quiet_codex_events(self):
+        from symphonz.service.event_log import ErrorJsonlLog, JsonlEventLog, RuntimeEventRouter
+        from symphonz.service.models import RuntimeEvent
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        runtime_path = self.path.parent / "runtime.jsonl"
+        errors_path = self.path.parent / "errors.jsonl"
+        router = RuntimeEventRouter(
+            JsonlEventLog(runtime_path),
+            store,
+            ErrorJsonlLog(errors_path),
+        )
+        events = [
+            RuntimeEvent("service_started", "started", "SYM-1"),
+            RuntimeEvent(
+                "codex_event",
+                "text delta",
+                "SYM-1",
+                data={"event": {"type": "item_agent_message_delta", "text": "hello"}},
+            ),
+            RuntimeEvent(
+                "codex_event",
+                "token usage",
+                "SYM-1",
+                data={"event": {"type": "turn_token_usage", "usage": {"total": 1}}},
+            ),
+            RuntimeEvent(
+                "codex_event",
+                "session started",
+                "SYM-1",
+                data={"event": {"type": "session_started", "session_id": "session-1"}},
+            ),
+            RuntimeEvent("report_published", "published", "SYM-1"),
+            RuntimeEvent("issue_retrying", "retrying", "SYM-1"),
+            RuntimeEvent("workspace_cleanup_failed", "cleanup failed", "SYM-1"),
+        ]
+
+        for event in events:
+            router(event)
+
+        runtime_lines = runtime_path.read_text().splitlines()
+        stored_types = [item["type"] for item in store.list_events(issue_identifier="SYM-1")["items"]]
+        self.assertEqual(len(runtime_lines), len(events))
+        self.assertEqual(stored_types, [
+            "workspace_cleanup_failed",
+            "issue_retrying",
+            "report_published",
+            "codex_event",
+            "service_started",
+        ])
+
+    def test_runtime_event_router_records_nested_codex_failure_once_and_mirrors_redacted_error(self):
+        from symphonz.service.event_log import ErrorJsonlLog, JsonlEventLog, RuntimeEventRouter
+        from symphonz.service.models import RuntimeEvent
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        errors_path = self.path.parent / "errors.jsonl"
+        router = RuntimeEventRouter(
+            JsonlEventLog(self.path.parent / "runtime.jsonl"),
+            store,
+            ErrorJsonlLog(errors_path),
+        )
+        event = RuntimeEvent(
+            "codex_event",
+            "tool_call_failed",
+            "SYM-1",
+            data={
+                "event": {
+                    "type": "tool_call_failed",
+                    "tool": "linear_graphql",
+                    "result": {"success": False, "output": "permission denied"},
+                    "session_id": "session-1",
+                },
+                "api_key": "top-secret",
+            },
+        )
+
+        router.write(event)
+
+        errors = store.list_errors(issue_identifier="SYM-1")["items"]
+        error_lines = errors_path.read_text().splitlines()
+        payload = json.loads(error_lines[0])
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(len(error_lines), 1)
+        self.assertEqual(errors[0]["message"], "permission denied")
+        self.assertEqual(payload["context"]["api_key"], "[REDACTED]")
+
+    def test_runtime_event_router_isolates_sink_failures(self):
+        from symphonz.service.event_log import RuntimeEventRouter
+        from symphonz.service.models import RuntimeEvent
+
+        calls = []
+
+        def failing_runtime_log(event):
+            calls.append("runtime")
+            raise OSError("runtime log unavailable")
+
+        class Store:
+            def record_event(self, event):
+                calls.append("store")
+                raise RuntimeError("sqlite unavailable")
+
+        class ErrorLog:
+            def write(self, record):
+                calls.append("error")
+
+        RuntimeEventRouter(failing_runtime_log, Store(), ErrorLog()).write(
+            RuntimeEvent("tool_failed", "failed", "SYM-1")
+        )
+
+        self.assertEqual(calls, ["runtime", "store", "error"])
+
+    def test_keyset_pagination_has_no_duplicates_when_rows_change_between_pages(self):
+        from symphonz.service.models import RuntimeErrorRecord, RuntimeEvent
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        for identifier, updated_at in (("SYM-1", 30.0), ("SYM-2", 20.0), ("SYM-3", 10.0)):
+            store.upsert_issue({"issue_identifier": identifier, "status": "running", "updated_at": updated_at})
+        first_tasks = store.list_tasks(limit=1)
+        store.upsert_issue({"issue_identifier": "SYM-1", "status": "running", "updated_at": 40.0})
+        store.upsert_issue({"issue_identifier": "SYM-4", "status": "running", "updated_at": 50.0})
+        second_tasks = store.list_tasks(cursor=first_tasks["next_cursor"], limit=1)
+
+        events = [
+            RuntimeEvent("event", "first", "SYM-1", timestamp=30.0),
+            RuntimeEvent("event", "second", "SYM-1", timestamp=20.0),
+            RuntimeEvent("event", "third", "SYM-1", timestamp=10.0),
+        ]
+        for event in events:
+            store.record_event(event)
+        first_events = store.list_events(limit=1)
+        store.record_event(RuntimeEvent("event", "new", "SYM-1", timestamp=50.0))
+        second_events = store.list_events(cursor=first_events["next_cursor"], limit=1)
+
+        for timestamp, message in ((30.0, "first"), (20.0, "second"), (10.0, "third")):
+            store.record_error(RuntimeErrorRecord(issue_identifier="SYM-1", message=message, timestamp=timestamp))
+        first_errors = store.list_errors(limit=1)
+        store.record_error(RuntimeErrorRecord(issue_identifier="SYM-1", message="new", timestamp=50.0))
+        second_errors = store.list_errors(cursor=first_errors["next_cursor"], limit=1)
+
+        self.assertEqual(first_tasks["items"][0]["issue_identifier"], "SYM-1")
+        self.assertEqual(second_tasks["items"][0]["issue_identifier"], "SYM-2")
+        self.assertEqual(first_events["items"][0]["message"], "first")
+        self.assertEqual(second_events["items"][0]["message"], "second")
+        self.assertEqual(first_errors["items"][0]["message"], "first")
+        self.assertEqual(second_errors["items"][0]["message"], "second")
+
+    def test_recording_an_issue_event_updates_last_activity_in_the_same_transaction(self):
+        from symphonz.service.models import RuntimeEvent
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.upsert_issue({"issue_identifier": "SYM-1", "status": "running", "updated_at": 10.0})
+
+        store.record_event(RuntimeEvent("tool_completed", "Done", "SYM-1", timestamp=20.0))
+
+        self.assertEqual(store.get_task("SYM-1")["updated_at"], 20.0)
+
+    def test_report_and_session_metadata_redact_header_secrets(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.save_report(
+            {
+                "issue_identifier": "SYM-1",
+                "report_version": 1,
+                "linear_sync_status": "pending",
+                "review_metadata": {"headers": {"X-Api-Key": "hidden"}},
+            }
+        )
+        store.save_session(
+            "token-hash",
+            expires_at=time.time() + 60,
+            metadata={"headers": {"X-Api-Key": "hidden"}},
+        )
+
+        self.assertEqual(store.get_report("SYM-1")["review_metadata"]["headers"]["X-Api-Key"], "[REDACTED]")
+        self.assertEqual(store.get_session("token-hash")["metadata"]["headers"]["X-Api-Key"], "[REDACTED]")
+
+    def test_report_sync_status_uses_linear_sync_status_with_compatibility_alias(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        entry = {"issue_identifier": "SYM-1", "report_version": 1}
+        store.save_report({**entry, "linear_sync_status": "pending"})
+        self.assertEqual(store.get_report("SYM-1")["linear_sync_status"], "pending")
+        store.save_report({**entry, "sync_status": "failed"})
+        self.assertEqual(store.get_report("SYM-1")["linear_sync_status"], "failed")
+        store.save_report({**entry, "linear_sync_status": "synced"})
+
+        report = store.get_report("SYM-1")
+        self.assertEqual(report["linear_sync_status"], "synced")
+        self.assertNotIn("sync_status", report)
+
+    def test_report_sync_lease_is_atomic_across_store_instances_and_reclaimable_after_expiry(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        first = RuntimeStore(self.path)
+        second = RuntimeStore(self.path)
+        first.save_report(
+            {
+                "issue_identifier": "SYM-1",
+                "report_version": 1,
+                "linear_sync_status": "pending",
+                "next_retry_at": 10.0,
+            }
+        )
+
+        lease_started_at = time.time()
+        claimed = first.claim_report_sync(
+            "SYM-1", owner="worker-1", now=lease_started_at, lease_seconds=0.05,
+        )
+        contended = second.claim_report_sync(
+            "SYM-1", owner="worker-2", now=lease_started_at, lease_seconds=0.05,
+        )
+        time.sleep(0.1)
+        reclaimed = second.claim_report_sync(
+            "SYM-1", owner="worker-2", now=time.time(), lease_seconds=30.0,
+        )
+
+        self.assertIsNotNone(claimed)
+        self.assertIsNone(contended)
+        self.assertIsNotNone(reclaimed)
+        self.assertEqual(reclaimed["sync_lease_owner"], "worker-2")
+
+    def test_report_sync_lease_release_requires_owner(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.save_report({"issue_identifier": "SYM-1", "linear_sync_status": "pending"})
+        store.claim_report_sync("SYM-1", owner="worker-1", now=10.0, lease_seconds=30.0)
+
+        self.assertFalse(store.release_report_sync("SYM-1", owner="worker-2"))
+        self.assertTrue(store.release_report_sync("SYM-1", owner="worker-1"))
+        self.assertIsNotNone(store.claim_report_sync("SYM-1", owner="worker-2", now=11.0, lease_seconds=30.0))
+
+    def test_report_sync_lease_renewal_and_state_writes_require_current_owner(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.save_report(
+            {
+                "issue_identifier": "SYM-1",
+                "json_path": "report-current.json",
+                "linear_sync_status": "pending",
+            }
+        )
+        store.claim_report_sync("SYM-1", owner="worker-1", now=10.0, lease_seconds=30.0)
+
+        self.assertFalse(store.renew_report_sync("SYM-1", owner="worker-2", now=11.0, lease_seconds=30.0))
+        self.assertTrue(store.renew_report_sync("SYM-1", owner="worker-1", now=11.0, lease_seconds=30.0))
+        self.assertFalse(
+            store.update_report_sync_state(
+                "SYM-1",
+                expected_json_path="report-current.json",
+                owner="worker-2",
+                linear_sync_status="synced",
+                linear_comment_id="comment-1",
+                retry_count=0,
+                next_retry_at=None,
+                updated_at=12.0,
+            )
+        )
+        self.assertTrue(
+            store.update_report_sync_state(
+                "SYM-1",
+                expected_json_path="report-current.json",
+                owner="worker-1",
+                linear_sync_status="synced",
+                linear_comment_id="comment-1",
+                retry_count=0,
+                next_retry_at=None,
+                updated_at=12.0,
+            )
+        )
+
+    def test_report_sync_lease_checks_and_fenced_writes_use_current_wall_clock(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.save_report(
+            {
+                "issue_identifier": "SYM-1",
+                "json_path": "report-current.json",
+                "linear_sync_status": "pending",
+            }
+        )
+        lease_started_at = time.time()
+        store.claim_report_sync("SYM-1", owner="old-owner", now=lease_started_at, lease_seconds=0.05)
+
+        time.sleep(0.1)
+
+        self.assertFalse(
+            store.owns_report_sync_lease("SYM-1", owner="old-owner", now=lease_started_at)
+        )
+        self.assertFalse(
+            store.update_report_sync_state(
+                "SYM-1",
+                expected_json_path="report-current.json",
+                owner="old-owner",
+                linear_sync_status="synced",
+                linear_comment_id="comment-1",
+                retry_count=0,
+                next_retry_at=None,
+                updated_at=lease_started_at,
+                lease_checked_at=lease_started_at,
+            )
+        )
+
+    def test_report_sync_state_update_cannot_replace_a_newer_authoritative_bundle(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        store.save_report(
+            {
+                "issue_identifier": "SYM-1",
+                "json_path": "/artifacts/SYM-1/report-new.json",
+                "html_path": "/artifacts/SYM-1/report-new.html",
+                "linear_sync_status": "pending",
+            }
+        )
+        store.claim_report_sync("SYM-1", owner="worker-1", now=10.0, lease_seconds=30.0)
+
+        stale = store.update_report_sync_state(
+            "SYM-1",
+            expected_json_path="/artifacts/SYM-1/report-old.json",
+            owner="worker-1",
+            linear_sync_status="synced",
+            linear_comment_id="comment-old",
+            retry_count=0,
+            next_retry_at=None,
+            updated_at=20.0,
+        )
+        current = store.get_report("SYM-1")
+
+        self.assertFalse(stale)
+        self.assertEqual(current["json_path"], "/artifacts/SYM-1/report-new.json")
+        self.assertEqual(current["linear_sync_status"], "pending")
+
+    def test_failed_login_attempts_increment_and_lock_atomically_under_concurrency(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        now = 100.0
+        barrier = threading.Barrier(5)
+        results = []
+        failures = []
+
+        def record_failure():
+            try:
+                barrier.wait()
+                results.append(
+                    RuntimeStore(self.path).record_failed_login_attempt(
+                        "admin:127.0.0.1", now=now, max_failures=5, window_seconds=300, lock_seconds=900
+                    )
+                )
+            except Exception as error:  # pragma: no cover - asserted below
+                failures.append(error)
+
+        workers = [threading.Thread(target=record_failure) for _ in range(5)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        attempt = store.get_login_attempt("admin:127.0.0.1")
+        self.assertEqual(failures, [])
+        self.assertEqual(len(results), 5)
+        self.assertEqual(attempt["failures"], 5)
+        self.assertEqual(attempt["locked_until"], now + 900)
+        self.assertTrue(any(result["locked"] for result in results))
+
+    def test_login_attempt_reservations_allow_only_five_concurrent_kdf_slots(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        now = 100.0
+        barrier = threading.Barrier(10)
+
+        def reserve():
+            barrier.wait()
+            return RuntimeStore(self.path).reserve_login_attempt(
+                "admin:127.0.0.1", now=now, max_attempts=5, window_seconds=300, lock_seconds=900
+            )
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            results = list(executor.map(lambda _unused: reserve(), range(10)))
+
+        attempt = store.get_login_attempt("admin:127.0.0.1")
+        self.assertEqual(sum(result["reserved"] for result in results), 5)
+        self.assertTrue(all("reservation_id" in result for result in results if result["reserved"]))
+        self.assertEqual(len({result["reservation_id"] for result in results if result["reserved"]}), 5)
+        self.assertEqual(attempt["failures"], 5)
+        self.assertEqual(attempt["locked_until"], now + 900)
+
+    def test_failed_client_reservation_releases_global_slot(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        first = store.reserve_login_attempt("account:client:1", now=100.0, max_attempts=1)
+        rejected = store.reserve_login_attempt("account:client:1", now=100.0, max_attempts=1)
+        replacement = store.reserve_login_attempt("account:client:2", now=100.0, max_attempts=1)
+
+        self.assertTrue(first["reserved"])
+        self.assertFalse(rejected["reserved"])
+        self.assertTrue(replacement["reserved"])
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM login_attempt_reservations").fetchone()[0],
+                2,
+            )
+
+    def test_login_attempt_completion_is_conditional_on_unique_reservation(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        reservations = [store.reserve_login_attempt("account:client:1", now=100.0) for _ in range(5)]
+
+        self.assertTrue(all("reservation_id" in reservation for reservation in reservations))
+        self.assertTrue(hasattr(store, "complete_login_attempt"))
+        self.assertTrue(store.complete_login_attempt(reservations[0]["reservation_id"], succeeded=True, now=101.0))
+        self.assertFalse(store.complete_login_attempt(reservations[0]["reservation_id"], succeeded=True, now=101.0))
+        replacement = store.reserve_login_attempt("account:client:1", now=101.0)
+        blocked = store.reserve_login_attempt("account:client:1", now=101.0)
+
+        self.assertTrue(replacement["reserved"])
+        self.assertFalse(blocked["reserved"])
+        self.assertEqual(store.get_login_attempt("account:client:1")["failures"], 5)
+
+    def test_expired_login_reservations_and_buckets_are_cleaned(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        expired = store.reserve_login_attempt("expired-bucket", now=100.0)
+        self.assertIn("reservation_id", expired)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "UPDATE login_attempts SET window_started_at = 0, locked_until = 1, updated_at = 0 "
+                "WHERE rate_limit_key = ?",
+                ("expired-bucket",),
+            )
+            connection.execute(
+                "UPDATE login_attempt_reservations SET expires_at = 1 WHERE reservation_id = ?",
+                (expired["reservation_id"],),
+            )
+
+        current = store.reserve_login_attempt("current-bucket", now=2_000.0)
+
+        self.assertTrue(current["reserved"])
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM login_attempt_reservations WHERE reservation_id = ?",
+                    (expired["reservation_id"],),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM login_attempts WHERE rate_limit_key = 'expired-bucket'"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_composite_event_sink_continues_after_a_sink_fails(self):
+        from symphonz.service.event_log import CompositeEventSink, JsonlEventLog
+        from symphonz.service.models import RuntimeEvent
+
+        class FailingSink:
+            def write(self, event):
+                raise RuntimeError("sink unavailable")
+
+        path = self.path.parent / "runtime.jsonl"
+
+        CompositeEventSink(FailingSink(), JsonlEventLog(path)).write(RuntimeEvent("started", "Started"))
+
+        self.assertEqual(json.loads(path.read_text().strip())["message"], "Started")
+
+    def test_invalid_pagination_inputs_raise_clear_errors(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        with self.assertRaisesRegex(ValueError, "Invalid pagination cursor"):
+            store.list_tasks(cursor=-1)
+        with self.assertRaisesRegex(ValueError, "Invalid pagination cursor"):
+            store.list_events(cursor="not-a-cursor")
+        with self.assertRaisesRegex(ValueError, "Invalid pagination limit"):
+            store.list_errors(limit=0)
+
+    def test_legacy_not_null_sync_status_reports_table_accepts_new_writes(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        self.path.parent.mkdir(parents=True)
+        with sqlite3.connect(self.path) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE reports (
+                    issue_identifier TEXT NOT NULL,
+                    report_version INTEGER NOT NULL,
+                    json_path TEXT,
+                    html_path TEXT,
+                    url TEXT,
+                    review_metadata_json TEXT NOT NULL DEFAULT '{}',
+                    linear_comment_id TEXT,
+                    sync_status TEXT NOT NULL,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at REAL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (issue_identifier, report_version)
+                );
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO reports (issue_identifier, report_version, sync_status, created_at, updated_at)
+                VALUES ('SYM-OLD', 1, 'failed', 1, 1)
+                """
+            )
+
+        store = RuntimeStore(self.path)
+        store.save_report({"issue_identifier": "SYM-NEW", "linear_sync_status": "synced"})
+
+        self.assertEqual(store.get_report("SYM-OLD")["linear_sync_status"], "failed")
+        self.assertEqual(store.get_report("SYM-NEW")["linear_sync_status"], "synced")
+
+    def test_task_cursor_keeps_an_unread_task_after_its_activity_changes(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        for identifier, updated_at in (("SYM-1", 30.0), ("SYM-2", 20.0), ("SYM-3", 10.0)):
+            store.upsert_issue({"issue_identifier": identifier, "status": "running", "updated_at": updated_at})
+
+        first_page = store.list_tasks(limit=1)
+        store.upsert_issue({"issue_identifier": "SYM-2", "status": "running", "updated_at": 40.0})
+        second_page = store.list_tasks(cursor=first_page["next_cursor"], limit=1)
+        third_page = store.list_tasks(cursor=second_page["next_cursor"], limit=1)
+
+        self.assertEqual(first_page["items"][0]["issue_identifier"], "SYM-1")
+        self.assertEqual(second_page["items"][0]["issue_identifier"], "SYM-2")
+        self.assertEqual(third_page["items"][0]["issue_identifier"], "SYM-3")
+
+    def test_malformed_base64_cursor_raises_runtime_store_input_error(self):
+        from symphonz.service.runtime_store import RuntimeStore, RuntimeStoreInputError
+
+        with self.assertRaisesRegex(RuntimeStoreInputError, "Invalid pagination cursor"):
+            RuntimeStore(self.path).list_tasks(cursor="a")
+
+    def test_expired_task_cursor_raises_and_using_it_cleans_snapshot(self):
+        from symphonz.service.runtime_store import RuntimeStore, RuntimeStoreInputError
+
+        store = RuntimeStore(self.path)
+        snapshot_ttl_seconds = 300.0
+        for identifier in ("SYM-1", "SYM-2"):
+            store.upsert_issue({"issue_identifier": identifier, "status": "running"})
+
+        first_page = store.list_tasks(limit=1)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                "UPDATE task_page_snapshots SET created_at = ?",
+                (time.time() - snapshot_ttl_seconds - 1,),
+            )
+
+        with self.assertRaisesRegex(RuntimeStoreInputError, "Expired pagination cursor"):
+            store.list_tasks(cursor=first_page["next_cursor"], limit=1)
+
+        with sqlite3.connect(self.path) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM task_page_snapshots").fetchone()[0], 0)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM task_page_snapshot_entries").fetchone()[0], 0
+            )
+
+    def test_creating_task_snapshot_performs_bounded_expiry_cleanup(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        store = RuntimeStore(self.path)
+        snapshot_ttl_seconds = 300.0
+        cleanup_batch_size = 100
+        for identifier in ("SYM-1", "SYM-2"):
+            store.upsert_issue({"issue_identifier": identifier, "status": "running"})
+
+        now = time.time()
+        expired_count = cleanup_batch_size + 2
+        with sqlite3.connect(self.path) as connection:
+            connection.executemany(
+                "INSERT INTO task_page_snapshots (created_at) VALUES (?)",
+                [(now - snapshot_ttl_seconds - 1,)] * expired_count,
+            )
+            connection.execute("INSERT INTO task_page_snapshots (created_at) VALUES (?)", (now,))
+
+        store.list_tasks(limit=1)
+
+        with sqlite3.connect(self.path) as connection:
+            remaining_expired = connection.execute(
+                "SELECT COUNT(*) FROM task_page_snapshots WHERE created_at < ?",
+                (now - snapshot_ttl_seconds,),
+            ).fetchone()[0]
+            self.assertEqual(remaining_expired, 2)
+
+
+class RunnerCompositionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.logs_root = self.root / "logs"
+
+    def test_runtime_collaborators_persist_direct_report_error_once_per_sink(self):
+        from symphonz.service.models import Issue
+        from symphonz.service.runner import build_runtime_collaborators
+        from symphonz.service.runtime_store import RuntimeStore
+
+        class FailingLinear:
+            def graphql(self, query, variables):
+                raise RuntimeError("Linear is temporarily unavailable")
+
+        issue = Issue(id="issue-1", identifier="SYM-1", title="Publish report", state="Todo")
+        artifacts_root = self.root / "direct-artifacts"
+        collaborators = build_runtime_collaborators(
+            self.logs_root,
+            FailingLinear(),
+            artifacts_root=artifacts_root,
+        )
+        publisher = collaborators.report_publisher_factory(issue)
+        try:
+            result = publisher.publish(self._report_payload(issue))
+        finally:
+            publisher.close()
+
+        reopened = RuntimeStore(self.logs_root / "runtime.sqlite3")
+        errors = reopened.list_errors(issue_identifier=issue.identifier, stage="report_sync")["items"]
+        error_lines = (self.logs_root / "errors.jsonl").read_text().splitlines()
+        report = reopened.get_report(issue.identifier)
+
+        self.assertEqual(result["linear_sync_status"], "pending")
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(len(error_lines), 1)
+        self.assertEqual(json.loads(error_lines[0])["message"], "Linear is temporarily unavailable")
+        self.assertEqual(report["url"], "http://127.0.0.1/issues/SYM-1/report")
+        self.assertEqual(collaborators.artifacts_root, artifacts_root)
+        self.assertTrue((collaborators.artifacts_root / "SYM-1" / report["json_path"]).is_file())
+
+    def test_runtime_collaborators_only_derive_artifact_sibling_for_installed_logs(self):
+        from symphonz.service.runner import build_runtime_collaborators
+
+        with self.assertRaisesRegex(ValueError, "artifacts_root"):
+            build_runtime_collaborators(self.logs_root, mock.Mock())
+
+        installed_logs = self.root / ".symphonz" / "logs"
+        collaborators = build_runtime_collaborators(installed_logs, mock.Mock())
+
+        self.assertEqual(collaborators.artifacts_root, self.root / ".symphonz" / "artifacts")
+
+    def test_dashboard_composes_real_auth_store_and_loopback_url_before_start(self):
+        from symphonz.service.auth import AuthService, verify_password
+        from symphonz.service.runtime_store import RuntimeStore
+
+        self._write_auth()
+        result = self._run_dashboard(
+            host="localhost",
+            port=4000,
+            public_base_url=None,
+            dashboard_username="operator",
+            session_days=7,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(self.dashboard_constructor.call_count, 1)
+        arguments = self.dashboard_constructor.call_args.args
+        self.assertEqual(self.dashboard_constructor.call_args.kwargs, {})
+        self.assertEqual(len(arguments), 6)
+        self.assertEqual(arguments[:2], ("localhost", 4000))
+        self.assertIsInstance(arguments[2], RuntimeStore)
+        self.assertEqual(arguments[2].path, self.logs_root / "runtime.sqlite3")
+        self.assertIsInstance(arguments[3], AuthService)
+        self.assertIs(arguments[3].store, arguments[2])
+        self.assertEqual(arguments[3].username, "operator")
+        self.assertEqual(arguments[3].session_days, 7)
+        self.assertFalse(arguments[3].secure_cookie)
+        self.assertTrue(verify_password("secret", arguments[3].password_record))
+        self.assertEqual(arguments[4], self.root / ".symphonz" / "artifacts")
+        self.assertIs(arguments[5], True)
+        self.dashboard.start.assert_called_once_with()
+        self.dashboard.stop.assert_called_once_with()
+        self.assertEqual(
+            self.orchestrator.report_synchronizer.public_base_url,
+            "http://127.0.0.1:4000",
+        )
+        self.assertIn("Symphonz dashboard: http://localhost:4000", self.stdout)
+
+    def test_dashboard_auth_load_failure_prevents_server_construction(self):
+        with self.assertRaisesRegex(RuntimeError, "configure-dashboard"):
+            self._run_dashboard(host="127.0.0.1", port=4000)
+
+        self.dashboard_constructor.assert_not_called()
+
+    def test_dashboard_derives_public_url_from_exact_ipv4_loopback_bind(self):
+        self._write_auth()
+        expected_urls = (
+            ("127.0.0.1", "http://127.0.0.1:4000"),
+            ("127.0.0.2", "http://127.0.0.2:4000"),
+            ("localhost", "http://127.0.0.1:4000"),
+        )
+
+        for host, expected_url in expected_urls:
+            with self.subTest(host=host):
+                result = self._run_dashboard(host=host, port=4000)
+
+                self.assertEqual(result, 0)
+                self.assertEqual(
+                    self.orchestrator.report_synchronizer.public_base_url,
+                    expected_url,
+                )
+
+    def test_dashboard_rejects_ipv6_bind_hosts_before_auth_or_bind(self):
+        invalid_bind_hosts = (
+            ("::1", None),
+            ("::", "https://reports.example.test"),
+            ("2001:db8::10", "https://[2001:db8::20]/proxy"),
+        )
+
+        for host, public_base_url in invalid_bind_hosts:
+            with self.subTest(host=host):
+                with mock.patch(
+                    "symphonz.service.runner.read_dashboard_auth",
+                    side_effect=AssertionError("dashboard auth must not be loaded"),
+                ) as auth_loader:
+                    with self.assertRaisesRegex(ValueError, "IPv4 bind host"):
+                        self._run_dashboard(
+                            host=host,
+                            port=4000,
+                            public_base_url=public_base_url,
+                        )
+                auth_loader.assert_not_called()
+                self.dashboard_constructor.assert_not_called()
+
+    def test_dashboard_rejects_invalid_effective_settings_before_server_construction(self):
+        self._write_auth()
+        invalid_settings = (
+            ({"host": ""}, "host"),
+            ({"host": "bad host"}, "host"),
+            ({"port": 0}, "port"),
+            ({"port": 65536}, "port"),
+            ({"port": True}, "port"),
+            ({"dashboard_username": "  "}, "username"),
+            ({"session_days": 0}, "session"),
+            ({"session_days": True}, "session"),
+            ({"public_base_url": "ftp://reports.example.test"}, "public_base_url"),
+        )
+
+        for overrides, message in invalid_settings:
+            with self.subTest(overrides=overrides):
+                settings = {"host": "127.0.0.1", "port": 4000}
+                settings.update(overrides)
+                with self.assertRaisesRegex((TypeError, ValueError), message):
+                    self._run_dashboard(**settings)
+                self.dashboard_constructor.assert_not_called()
+
+    def test_non_loopback_dashboard_requires_usable_explicit_public_url(self):
+        self._write_auth()
+        unusable_urls = (
+            None,
+            "http://2130706433:4000",
+            "http://127.1:4000",
+            "http://0x7f000001:4000",
+            "http://127.0.0.1:4000",
+            "http://localhost:4000",
+            "http://reports.localhost:4000",
+            "http://0.0.0.0:4000",
+            "http://0.0.0.0.:4000",
+            "http://[::1]:4000",
+            "http://[::]:4000",
+            "http://[::ffff:127.0.0.1]:4000",
+            "http://[::ffff:0.0.0.0]:4000",
+            "https://[fe80::1]:4000/proxy",
+            "https://[fe80::1%25eth0]:4000/proxy",
+            "https://-bad.example",
+            "https://reports..example",
+            "https://operator:secret@reports.example.test",
+            "https://operator@reports.example.test",
+            "https://:4000",
+            "https://reports.example.test:",
+            "https://reports.example.test:0",
+            "https://reports.example.test:65536",
+            "https://2001:db8::20",
+            "https:///reports.example.test",
+        )
+
+        for public_base_url in unusable_urls:
+            with self.subTest(public_base_url=public_base_url):
+                with self.assertRaisesRegex(ValueError, "public_base_url"):
+                    self._run_dashboard(
+                        host="0.0.0.0",
+                        port=4000,
+                        public_base_url=public_base_url,
+                    )
+                self.dashboard_constructor.assert_not_called()
+
+    def test_non_loopback_dashboard_preserves_safe_public_urls(self):
+        self._write_auth()
+        valid_urls = (
+            (
+                "http://reports.example.test:4000/base/",
+                "http://reports.example.test:4000/base",
+                False,
+            ),
+            (
+                "https://reports.example.test./base/",
+                "https://reports.example.test./base",
+                True,
+            ),
+            (
+                "https://[2001:db8::20]:4000/proxy/",
+                "https://[2001:db8::20]:4000/proxy",
+                True,
+            ),
+        )
+
+        for public_base_url, expected_url, secure_cookie in valid_urls:
+            with self.subTest(public_base_url=public_base_url):
+                result = self._run_dashboard(
+                    host="0.0.0.0",
+                    port=4000,
+                    public_base_url=public_base_url,
+                )
+
+                self.assertEqual(result, 0)
+                self.assertEqual(
+                    self.orchestrator.report_synchronizer.public_base_url,
+                    expected_url,
+                )
+                self.assertIs(
+                    self.dashboard_constructor.call_args.args[3].secure_cookie,
+                    secure_cookie,
+                )
+
+    def test_wildcard_bind_uses_public_url_and_persists_effective_port_mismatch_warning(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        self._write_auth()
+        result = self._run_dashboard(
+            host="0.0.0.0",
+            port=4000,
+            public_base_url="http://192.168.1.20:4000/base/",
+            effective_port=4444,
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(self.dashboard_constructor.call_args.args[:2], ("0.0.0.0", 4000))
+        self.assertEqual(
+            self.orchestrator.report_synchronizer.public_base_url,
+            "http://192.168.1.20:4000/base",
+        )
+        self.assertNotIn("0.0.0.0", self.orchestrator.report_synchronizer.public_base_url)
+        events = RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"]
+        warnings = [event for event in events if event["type"] == "dashboard_url_warning"]
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0]["severity"], "warning")
+        self.assertEqual(warnings[0]["data"]["effective_port"], 4444)
+        self.assertEqual(warnings[0]["data"]["public_url_port"], 4000)
+        self.assertIn("public_base_url", warnings[0]["message"])
+        self.assertIn("Warning:", self.stderr)
+        self.assertIn("Symphonz dashboard: http://0.0.0.0:4444", self.stdout)
+
+    def test_https_public_url_enables_secure_cookie_and_hides_http_warning(self):
+        self._write_auth()
+        result = self._run_dashboard(
+            host="192.168.1.20",
+            port=443,
+            public_base_url="https://reports.example.test/base/",
+        )
+
+        self.assertEqual(result, 0)
+        arguments = self.dashboard_constructor.call_args.args
+        self.assertEqual(len(arguments), 6)
+        self.assertTrue(arguments[3].secure_cookie)
+        self.assertIs(arguments[5], False)
+        self.assertEqual(
+            self.orchestrator.report_synchronizer.public_base_url,
+            "https://reports.example.test/base",
+        )
+        self.assertNotIn("Warning:", self.stderr)
+
+    def test_run_service_once_persists_lifecycle_task_and_report_without_dashboard(self):
+        from dataclasses import replace
+        from symphonz.service.models import Issue
+        from symphonz.service.runner import run_service
+        from symphonz.service.runtime_store import RuntimeStore
+
+        issue = Issue(id="issue-1", identifier="SYM-1", title="Run once", state="Todo")
+
+        class FakeLinear:
+            def fetch_candidate_issues(self, active_states):
+                return [issue]
+
+            def fetch_issues_by_ids(self, ids):
+                return [replace(issue, state="Done")]
+
+            def fetch_issues_by_states(self, states):
+                return []
+
+            def graphql(self, query, variables):
+                if "SymphonzFindReportComment" in query:
+                    return {
+                        "data": {
+                            "issue": {
+                                "comments": {
+                                    "nodes": [],
+                                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                }
+                            }
+                        }
+                    }
+                if "SymphonzCreateReportComment" in query:
+                    return {
+                        "data": {
+                            "commentCreate": {
+                                "success": True,
+                                "comment": {"id": "comment-1"},
+                            }
+                        }
+                    }
+                raise AssertionError(query)
+
+        class FakeCodexAppServer:
+            constructor_arguments = None
+            tool_names = None
+
+            def __init__(self, command, **kwargs):
+                type(self).constructor_arguments = {"command": command, **kwargs}
+
+            def run_turns(self, **kwargs):
+                type(self).tool_names = [spec["name"] for spec in kwargs["dynamic_tool_specs"]]
+                report_result = kwargs["dynamic_tool_executor"](
+                    "symphonz_report",
+                    RunnerCompositionTests._report_payload(issue),
+                )
+                if not report_result["success"]:
+                    raise AssertionError(report_result["output"])
+                kwargs["on_event"](
+                    {
+                        "type": "session_started",
+                        "session_id": "session-1",
+                        "thread_id": "thread-1",
+                        "turn_id": "turn-1",
+                        "turn_count": 1,
+                        "process_id": 123,
+                    }
+                )
+                return {
+                    "session_id": "session-1",
+                    "thread_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "turn_count": 1,
+                    "result": {},
+                }
+
+        workflow_path = self._write_workflow()
+        linear = FakeLinear()
+        with (
+            mock.patch("symphonz.service.runner.build_linear_client", return_value=linear),
+            mock.patch("symphonz.service.runner.CodexAppServer", FakeCodexAppServer),
+            mock.patch("symphonz.service.runner.DashboardServer") as dashboard_server,
+        ):
+            result = run_service(
+                project_root=self.root,
+                workflow_path=workflow_path,
+                logs_root=self.logs_root,
+                port=None,
+                once=True,
+                host="localhost",
+                public_base_url="https://reports.example.test/base/",
+                dashboard_username="admin",
+                session_days=30,
+            )
+
+        reopened = RuntimeStore(self.logs_root / "runtime.sqlite3")
+        task = reopened.get_task(issue.identifier)
+        report = reopened.get_report(issue.identifier)
+        event_types = [item["type"] for item in reopened.list_events(limit=50)["items"]]
+        runtime_types = [
+            json.loads(line)["type"]
+            for line in (self.logs_root / "runtime.jsonl").read_text().splitlines()
+        ]
+
+        self.assertEqual(result, 0)
+        dashboard_server.assert_not_called()
+        self.assertNotIn("dynamic_tool_executor", FakeCodexAppServer.constructor_arguments)
+        self.assertEqual(FakeCodexAppServer.tool_names, ["linear_graphql", "symphonz_report"])
+        self.assertEqual(task["status"], "completed")
+        self.assertEqual(task["codex_session_id"], "session-1")
+        self.assertEqual(report["linear_sync_status"], "synced")
+        self.assertEqual(
+            report["url"],
+            "https://reports.example.test/base/issues/SYM-1/report",
+        )
+        self.assertIn("service_started", event_types)
+        self.assertIn("service_stopped", event_types)
+        self.assertEqual(runtime_types.count("service_started"), 1)
+        self.assertEqual(runtime_types.count("service_stopped"), 1)
+
+    def test_dashboard_start_failure_preserves_primary_through_all_cleanup_failures(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        startup_error = RuntimeError("dashboard start failed")
+        shutdown_error = RuntimeError("orchestrator shutdown failed")
+        stop_error = RuntimeError("dashboard stop failed")
+
+        with self.assertRaises(RuntimeError) as raised:
+            self._run_lifecycle(
+                dashboard_start_error=startup_error,
+                orchestrator_shutdown_error=shutdown_error,
+                dashboard_stop_error=stop_error,
+            )
+
+        events = list(
+            reversed(RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"])
+        )
+        cleanup_errors = RuntimeStore(self.logs_root / "runtime.sqlite3").list_errors(
+            stage="cleanup"
+        )["items"]
+        cleanup_events = [event for event in events if event["type"] == "service_cleanup_failed"]
+        self.assertIs(raised.exception, startup_error)
+        self.assertEqual(
+            self.lifecycle_order,
+            ["orchestrator.startup_cleanup", "dashboard.start", "orchestrator.shutdown", "dashboard.stop"],
+        )
+        self.assertEqual(self.lifecycle_orchestrator.shutdown_calls, 1)
+        self.dashboard.stop.assert_called_once_with()
+        self.assertEqual(
+            [event["data"]["operation"] for event in cleanup_events],
+            ["orchestrator.shutdown", "dashboard.stop"],
+        )
+        self.assertEqual(
+            [(event["data"]["error_type"], event["data"]["error"]) for event in cleanup_events],
+            [
+                ("RuntimeError", "orchestrator shutdown failed"),
+                ("RuntimeError", "dashboard stop failed"),
+            ],
+        )
+        self.assertEqual(
+            {error["context"]["operation"] for error in cleanup_errors},
+            {"orchestrator.shutdown", "dashboard.stop"},
+        )
+        self.assertEqual(events[-1]["type"], "service_stopped")
+
+    def test_service_started_persistence_base_exception_still_runs_lifecycle_cleanup(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        class FatalPersistenceError(BaseException):
+            pass
+
+        persistence_error = FatalPersistenceError("service_started persistence failed")
+
+        try:
+            self._run_lifecycle(
+                event_persistence_errors={"service_started": [persistence_error]},
+            )
+        except FatalPersistenceError as raised:
+            propagated_error = raised
+            traceback_frames = traceback.extract_tb(raised.__traceback__)
+        else:
+            self.fail("service_started persistence failure did not propagate")
+
+        events = list(
+            reversed(RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"])
+        )
+        self.assertIs(propagated_error, persistence_error)
+        self.assertIn("record_event", [frame.name for frame in traceback_frames])
+        self.assertEqual(self.lifecycle_order, ["orchestrator.shutdown"])
+        self.assertEqual(self.lifecycle_orchestrator.shutdown_calls, 1)
+        self.dashboard.stop.assert_not_called()
+        self.assertEqual(
+            self.event_persistence_attempts,
+            ["service_started", "service_stopped"],
+        )
+        self.assertEqual([event["type"] for event in events], ["service_stopped"])
+
+    def test_poll_once_failure_preserves_primary_when_shutdown_fails(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        poll_error = ValueError("poll once failed")
+        shutdown_error = RuntimeError("shutdown after poll failed")
+
+        with self.assertRaises(ValueError) as raised:
+            self._run_lifecycle(
+                port=None,
+                poll_once_error=poll_error,
+                orchestrator_shutdown_error=shutdown_error,
+            )
+
+        events = list(
+            reversed(RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"])
+        )
+        self.assertIs(raised.exception, poll_error)
+        self.assertEqual(
+            self.lifecycle_order,
+            ["orchestrator.startup_cleanup", "orchestrator.poll_once", "orchestrator.shutdown"],
+        )
+        self.assertEqual(self.lifecycle_orchestrator.shutdown_calls, 1)
+        self.assertEqual(
+            [event["data"]["operation"] for event in events if event["type"] == "service_cleanup_failed"],
+            ["orchestrator.shutdown"],
+        )
+        self.assertEqual(events[-1]["type"], "service_stopped")
+
+    def test_cleanup_diagnostic_base_exception_does_not_mask_primary_or_skip_cleanup(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        class FatalPersistenceError(BaseException):
+            pass
+
+        poll_error = ValueError("poll once failed")
+        diagnostic_error = FatalPersistenceError("cleanup diagnostic persistence failed")
+
+        try:
+            self._run_lifecycle(
+                poll_once_error=poll_error,
+                orchestrator_shutdown_error=RuntimeError("orchestrator shutdown failed"),
+                dashboard_stop_error=RuntimeError("dashboard stop failed"),
+                event_persistence_errors={
+                    "service_cleanup_failed": [diagnostic_error, None],
+                },
+            )
+        except ValueError as raised:
+            propagated_error = raised
+            traceback_frames = traceback.extract_tb(raised.__traceback__)
+        else:
+            self.fail("primary polling failure did not propagate")
+
+        reopened = RuntimeStore(self.logs_root / "runtime.sqlite3")
+        events = list(reversed(reopened.list_events(limit=50)["items"]))
+        cleanup_events = [event for event in events if event["type"] == "service_cleanup_failed"]
+        cleanup_errors = reopened.list_errors(stage="cleanup")["items"]
+
+        self.assertIs(propagated_error, poll_error)
+        self.assertIn("poll_once", [frame.name for frame in traceback_frames])
+        self.assertEqual(
+            self.lifecycle_order,
+            [
+                "orchestrator.startup_cleanup",
+                "dashboard.start",
+                "orchestrator.poll_once",
+                "orchestrator.shutdown",
+                "dashboard.stop",
+            ],
+        )
+        self.assertEqual(self.lifecycle_orchestrator.shutdown_calls, 1)
+        self.dashboard.stop.assert_called_once_with()
+        self.assertEqual(
+            self.event_persistence_attempts[-3:],
+            ["service_cleanup_failed", "service_cleanup_failed", "service_stopped"],
+        )
+        self.assertEqual(
+            [event["data"]["operation"] for event in cleanup_events],
+            ["dashboard.stop"],
+        )
+        self.assertEqual(len(cleanup_errors), 1)
+        self.assertEqual(cleanup_errors[0]["context"]["operation"], "dashboard.stop")
+        self.assertEqual(events[-1]["type"], "service_stopped")
+        self.assertIn("cleanup diagnostic persistence failed", self.lifecycle_stderr)
+
+    def test_service_stopped_persistence_base_exception_does_not_mask_primary(self):
+        class FatalPersistenceError(BaseException):
+            pass
+
+        poll_error = ValueError("poll once failed")
+        stopped_error = FatalPersistenceError("service_stopped persistence failed")
+
+        try:
+            self._run_lifecycle(
+                poll_once_error=poll_error,
+                event_persistence_errors={"service_stopped": [stopped_error]},
+            )
+        except ValueError as raised:
+            propagated_error = raised
+            traceback_frames = traceback.extract_tb(raised.__traceback__)
+        else:
+            self.fail("primary polling failure did not propagate")
+
+        self.assertIs(propagated_error, poll_error)
+        self.assertIn("poll_once", [frame.name for frame in traceback_frames])
+        self.assertEqual(
+            self.lifecycle_order,
+            [
+                "orchestrator.startup_cleanup",
+                "dashboard.start",
+                "orchestrator.poll_once",
+                "orchestrator.shutdown",
+                "dashboard.stop",
+            ],
+        )
+        self.assertEqual(self.lifecycle_orchestrator.shutdown_calls, 1)
+        self.dashboard.stop.assert_called_once_with()
+        self.assertEqual(self.event_persistence_attempts[-1], "service_stopped")
+        self.assertIn("service_stopped persistence failed", self.lifecycle_stderr)
+
+    def test_service_stopped_persistence_base_exception_is_raised_when_it_is_only_failure(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        class FatalPersistenceError(BaseException):
+            pass
+
+        stopped_error = FatalPersistenceError("service_stopped persistence failed")
+
+        try:
+            self._run_lifecycle(
+                event_persistence_errors={"service_stopped": [stopped_error]},
+            )
+        except FatalPersistenceError as raised:
+            propagated_error = raised
+            traceback_frames = traceback.extract_tb(raised.__traceback__)
+        else:
+            self.fail("service_stopped persistence failure did not propagate")
+
+        events = list(
+            reversed(RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"])
+        )
+        self.assertIs(propagated_error, stopped_error)
+        self.assertIn("record_event", [frame.name for frame in traceback_frames])
+        self.assertEqual(
+            self.lifecycle_order,
+            [
+                "orchestrator.startup_cleanup",
+                "dashboard.start",
+                "orchestrator.poll_once",
+                "orchestrator.shutdown",
+                "dashboard.stop",
+            ],
+        )
+        self.assertEqual(self.lifecycle_orchestrator.shutdown_calls, 1)
+        self.dashboard.stop.assert_called_once_with()
+        self.assertEqual(self.event_persistence_attempts[-1], "service_stopped")
+        self.assertNotIn("service_stopped", [event["type"] for event in events])
+        self.assertIn("service_stopped persistence failed", self.lifecycle_stderr)
+
+    def test_successful_once_raises_first_cleanup_failure_after_later_cleanup(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        shutdown_error = RuntimeError("shutdown failed first")
+        stop_error = ValueError("stop failed second")
+
+        with self.assertRaises(RuntimeError) as raised:
+            self._run_lifecycle(
+                orchestrator_shutdown_error=shutdown_error,
+                dashboard_stop_error=stop_error,
+            )
+
+        events = list(
+            reversed(RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"])
+        )
+        self.assertIs(raised.exception, shutdown_error)
+        self.assertEqual(
+            self.lifecycle_order,
+            [
+                "orchestrator.startup_cleanup",
+                "dashboard.start",
+                "orchestrator.poll_once",
+                "orchestrator.shutdown",
+                "dashboard.stop",
+            ],
+        )
+        self.assertEqual(
+            [event["data"]["operation"] for event in events if event["type"] == "service_cleanup_failed"],
+            ["orchestrator.shutdown", "dashboard.stop"],
+        )
+        self.assertEqual(events[-1]["type"], "service_stopped")
+
+    def test_keyboard_interrupt_returns_zero_only_after_cleanup(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        result = self._run_lifecycle(once=False, tick_error=KeyboardInterrupt())
+
+        events = list(
+            reversed(RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"])
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            self.lifecycle_order,
+            [
+                "orchestrator.startup_cleanup",
+                "dashboard.start",
+                "orchestrator.tick",
+                "orchestrator.shutdown",
+                "dashboard.stop",
+            ],
+        )
+        self.assertEqual(self.lifecycle_orchestrator.shutdown_calls, 1)
+        self.dashboard.stop.assert_called_once_with()
+        self.assertEqual(events[-1]["type"], "service_stopped")
+
+    def test_successful_once_returns_after_orchestrator_owned_publisher_cleanup(self):
+        from symphonz.service.runtime_store import RuntimeStore
+
+        result = self._run_lifecycle(own_publisher=True)
+
+        events = list(
+            reversed(RuntimeStore(self.logs_root / "runtime.sqlite3").list_events(limit=50)["items"])
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            self.lifecycle_order,
+            [
+                "orchestrator.startup_cleanup",
+                "dashboard.start",
+                "orchestrator.poll_once",
+                "orchestrator.shutdown",
+                "publisher.close",
+                "dashboard.stop",
+            ],
+        )
+        self.assertEqual(self.lifecycle_orchestrator.shutdown_calls, 1)
+        self.publisher.close.assert_called_once_with()
+        self.dashboard.stop.assert_called_once_with()
+        self.assertEqual(events[-1]["type"], "service_stopped")
+
+    def _write_workflow(self):
+        path = self.root / "WORKFLOW.md"
+        path.write_text(
+            """---
+tracker:
+  active_states:
+    - Todo
+  terminal_states:
+    - Done
+  required_labels: []
+workspace:
+  root: workspace
+hooks: {}
+agent:
+  max_concurrent_agents: 1
+  max_turns: 1
+  max_attempts: 1
+codex:
+  command: ignored app-server
+---
+Work on {{ issue.identifier }}.
+"""
+        )
+        return path
+
+    def _write_auth(self):
+        from symphonz.install import write_auth_config
+
+        write_auth_config(self.root / ".symphonz" / "auth.toml", "secret")
+
+    def _run_dashboard(self, *, effective_port=None, **overrides):
+        from symphonz.service import runner
+
+        class FakeLinear:
+            def fetch_candidate_issues(self, active_states):
+                return []
+
+            def fetch_issues_by_ids(self, ids):
+                return []
+
+            def fetch_issues_by_states(self, states):
+                return []
+
+        self.dashboard = mock.Mock()
+        self.dashboard.port = effective_port if effective_port is not None else overrides.get("port", 4000)
+        self.dashboard_constructor = mock.Mock(return_value=self.dashboard)
+        output = io.StringIO()
+        errors = io.StringIO()
+        workflow_path = self._write_workflow()
+        arguments = {
+            "project_root": self.root,
+            "workflow_path": workflow_path,
+            "logs_root": self.logs_root,
+            "port": 4000,
+            "once": True,
+            "host": "127.0.0.1",
+            "public_base_url": None,
+            "dashboard_username": "admin",
+            "session_days": 30,
+        }
+        arguments.update(overrides)
+
+        real_orchestrator = runner.Orchestrator
+
+        def capture_orchestrator(*constructor_args, **constructor_kwargs):
+            self.orchestrator = real_orchestrator(*constructor_args, **constructor_kwargs)
+            return self.orchestrator
+
+        try:
+            with (
+                mock.patch("symphonz.service.runner.build_linear_client", return_value=FakeLinear()),
+                mock.patch("symphonz.service.runner.CodexAppServer"),
+                mock.patch("symphonz.service.runner.DashboardServer", self.dashboard_constructor),
+                mock.patch("symphonz.service.runner.Orchestrator", side_effect=capture_orchestrator),
+                redirect_stdout(output),
+                redirect_stderr(errors),
+            ):
+                return runner.run_service(**arguments)
+        finally:
+            self.stdout = output.getvalue()
+            self.stderr = errors.getvalue()
+
+    def _run_lifecycle(
+        self,
+        *,
+        once=True,
+        port=4000,
+        dashboard_start_error=None,
+        poll_once_error=None,
+        tick_error=None,
+        orchestrator_shutdown_error=None,
+        dashboard_stop_error=None,
+        own_publisher=False,
+        event_persistence_errors=None,
+    ):
+        from symphonz.service import runner
+
+        if port is not None:
+            self._write_auth()
+        self.lifecycle_order = []
+        self.event_persistence_attempts = []
+        self.publisher = mock.Mock()
+        order = self.lifecycle_order
+        publisher = self.publisher
+        persistence_errors = {
+            event_type: list(errors)
+            for event_type, errors in (event_persistence_errors or {}).items()
+        }
+        real_record_event = runner.RuntimeStore.record_event
+
+        def record_event(store, event):
+            self.event_persistence_attempts.append(event.type)
+            queued_errors = persistence_errors.get(event.type, [])
+            if queued_errors:
+                error = queued_errors.pop(0)
+                if error is not None:
+                    raise error
+            return real_record_event(store, event)
+
+        class FakeOrchestrator:
+            def __init__(inner_self, *args, **kwargs):
+                inner_self.shutdown_calls = 0
+                inner_self.publisher = publisher if own_publisher else None
+                self.lifecycle_orchestrator = inner_self
+
+            def startup_cleanup(inner_self):
+                order.append("orchestrator.startup_cleanup")
+
+            def poll_once(inner_self):
+                order.append("orchestrator.poll_once")
+                if poll_once_error is not None:
+                    raise poll_once_error
+
+            def tick(inner_self):
+                order.append("orchestrator.tick")
+                if tick_error is not None:
+                    raise tick_error
+
+            def shutdown(inner_self):
+                inner_self.shutdown_calls += 1
+                order.append("orchestrator.shutdown")
+                if inner_self.publisher is not None:
+                    order.append("publisher.close")
+                    inner_self.publisher.close()
+                if orchestrator_shutdown_error is not None:
+                    raise orchestrator_shutdown_error
+
+        self.dashboard = mock.Mock()
+        self.dashboard.port = port
+
+        def start_dashboard():
+            order.append("dashboard.start")
+            if dashboard_start_error is not None:
+                raise dashboard_start_error
+
+        def stop_dashboard():
+            order.append("dashboard.stop")
+            if dashboard_stop_error is not None:
+                raise dashboard_stop_error
+
+        self.dashboard.start.side_effect = start_dashboard
+        self.dashboard.stop.side_effect = stop_dashboard
+        workflow_path = self._write_workflow()
+        output = io.StringIO()
+        errors = io.StringIO()
+        try:
+            with (
+                mock.patch("symphonz.service.runner.build_linear_client", return_value=mock.Mock()),
+                mock.patch("symphonz.service.runner.CodexAppServer"),
+                mock.patch("symphonz.service.runner.Orchestrator", FakeOrchestrator),
+                mock.patch("symphonz.service.runner.DashboardServer", return_value=self.dashboard),
+                mock.patch.object(runner.RuntimeStore, "record_event", new=record_event),
+                redirect_stdout(output),
+                redirect_stderr(errors),
+            ):
+                return runner.run_service(
+                    project_root=self.root,
+                    workflow_path=workflow_path,
+                    logs_root=self.logs_root,
+                    port=port,
+                    once=once,
+                )
+        finally:
+            self.lifecycle_stdout = output.getvalue()
+            self.lifecycle_stderr = errors.getvalue()
+
+    @staticmethod
+    def _report_payload(issue):
+        return {
+            "operation": "publish",
+            "issue_id": issue.id,
+            "issue_identifier": issue.identifier,
+            "title": issue.title,
+            "summary": "The implementation report is ready.",
+            "goal": "Persist a structured implementation report.",
+            "scope": "Runner composition.",
+            "architecture": {
+                "nodes": [{"id": "runner", "label": "Runner"}],
+                "edges": [],
+            },
+            "implementation": ["Compose runtime collaborators."],
+            "decisions": [],
+            "changed_files": ["symphonz/service/runner.py"],
+            "validation": [
+                {
+                    "command": "python3 -m unittest tests.test_symphonz_service",
+                    "result": "passed",
+                    "evidence": "Focused service tests passed.",
+                }
+            ],
+            "risks": [],
+            "follow_ups": [],
+            "review": {
+                "provider": "gitlab",
+                "url": "https://git.example.test/group/project/-/merge_requests/1",
+                "branch": "codex/task-5e1",
+                "commit": "0123456789abcdef",
+                "target": "main",
+            },
+        }
 
 
 class OrchestratorAndDashboardTests(unittest.TestCase):

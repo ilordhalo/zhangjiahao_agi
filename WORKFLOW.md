@@ -91,7 +91,7 @@ Runtime context:
 4. Treat ticket-provided `Validation`, `Test Plan`, or `Testing` sections as required acceptance criteria.
 5. Reproduce or inspect the current behavior before changing code whenever the ticket describes a bug or behavior change.
 6. Keep Linear status, workpad checklist, branch, commit, and review request state synchronized.
-7. Do not mark the ticket ready for review until implementation, validation, push, and review request creation are complete.
+7. Do not mark the ticket ready for review until implementation, validation, push, review request creation, report publication, and Linear link synchronization are complete.
 8. Final response must report completed actions and blockers only. Do not include user next steps.
 
 ## Required Tools and Auth
@@ -102,15 +102,16 @@ The agent should have:
 - Git credentials that can push branches to the configured project remote.
 - Git provider access through `gh` or `GITHUB_TOKEN` for GitHub, and `glab` or `GITLAB_TOKEN` plus `GITLAB_BASE_URL` for GitLab.
 - Codex app-server support from the configured `codex.command`.
+- The injected `symphonz_report` tool for publishing the implementation report after a review request exists.
 
-If a required tool is missing, first try documented fallbacks. If all fallbacks fail, update the workpad with a concise blocker and move the issue to `Human Review`.
+If a required tool is missing, first try documented fallbacks. If all fallbacks fail, update the workpad with a concise blocker. A missing or failed `symphonz_report` call is a publication blocker: keep the issue in `Ready to Publish` and do not move it to `Human Review`.
 
 ## Status Map
 
 - `Backlog` -> out of scope. Do not modify the issue or workspace.
 - `Todo` -> queued. Move immediately to `In Progress`, create/update the workpad, then execute.
 - `In Progress` -> implementation is underway. Continue from the existing workpad and workspace.
-- `Ready to Publish` -> implementation is complete. Push the issue branch, create/update a GitHub pull request or GitLab merge request, attach it to Linear, then move to `Human Review`.
+- `Ready to Publish` -> implementation is complete. Push the issue branch, create/update a GitHub pull request or GitLab merge request, publish the Symphonz report, synchronize both links to Linear, then move to `Human Review`.
 - `Human Review` -> review request is ready and waiting for human review. Do not change code unless review feedback arrives.
 - `Rework` -> review requested changes. Re-open execution from the current branch unless the existing review request is closed or merged.
 - `Merging` -> approved for integration. Update from the configured base branch, ensure checks are green, merge the review request, then move the Linear issue to `Done`.
@@ -180,6 +181,10 @@ Rules:
 - Branch: `<branch>`
 - URL: `<url or pending>`
 
+### Implementation Report
+
+- URL: `<url or pending>`
+
 ### Notes
 
 - <timestamped concise note>
@@ -240,10 +245,14 @@ git push -u origin "<issue-branch>"
    - If `gh` is unavailable and `GITHUB_TOKEN` is present, use the GitHub API.
    - For GitLab, prefer `glab mr create` / `glab mr view` when available.
    - If `glab` is unavailable and `GITLAB_TOKEN` is present, use the GitLab API.
-   - If neither is available, document the blocker in the workpad and move to `Human Review`.
+   - If neither is available, document the blocker in the workpad and keep the issue in `Ready to Publish` because no review request or implementation report can be published.
 5. Attach the review request URL to the Linear issue when the tool allows it. If attachment is unavailable, record the URL in the workpad `Review Request` section.
-6. Update the workpad so all plan, acceptance, and validation items reflect reality.
-7. Move the issue to `Human Review`.
+6. Call `symphonz_report` after the review request exists, using `operation: publish` and the complete implementation report, including the review provider, URL, branch, commit, and target branch.
+7. Require a successful report result with a report URL. A missing or failed report publication is a publication blocker; record it in the workpad and keep the issue in `Ready to Publish`.
+8. Confirm the runtime-owned Linear implementation-report comment contains the report URL and review request URL. If synchronization is pending or failed, treat publication as blocked until both links are synchronized to Linear.
+9. Record the report URL in the workpad `Implementation Report` section and keep the report URL and review request URL synchronized to Linear.
+10. Update the workpad so all plan, acceptance, and validation items reflect reality.
+11. Move the issue to `Human Review` only after report publication and Linear synchronization succeed.
 
 ## Step 4: Human Review and Rework
 
@@ -260,7 +269,7 @@ When the issue is `Rework`:
 2. Update the workpad with the rework plan.
 3. Implement changes on the existing branch if the MR is open.
 4. If the review request is closed or merged, create a fresh branch from the latest base branch.
-5. Re-run validation, push updates, refresh the review request, and move back to `Human Review`.
+5. Re-run validation, push updates, refresh the review request, republish the implementation report, confirm both URLs are synchronized to Linear, and only then move back to `Human Review`.
 
 ## Step 5: Merge Handling
 
@@ -282,7 +291,9 @@ Do not merge if validation or required pipeline checks are failing.
 - Never use multiple workpad comments for one issue.
 - Never leave completed checklist items unchecked.
 - Never push unvalidated changes.
+- Never move to `Human Review` without a successful `symphonz_report` publication after the review request exists.
+- Never leave the Linear implementation-report comment with a stale report URL or review request URL.
 - Never expand scope silently.
 - Never delete the workspace manually; terminal cleanup is owned by Symphony after terminal issue states.
-- If provider publishing is blocked, keep the implementation committed locally, record the blocker, and move to `Human Review`.
+- If provider publishing is blocked, keep the implementation committed locally, record the blocker, and keep the issue in `Ready to Publish`.
 - If required Linear access is missing, record the blocker and stop.

@@ -2,10 +2,66 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import re
 import sys
 import threading
 
-from symphonz.service.models import RuntimeEvent
+from symphonz.service.models import RuntimeErrorRecord, RuntimeEvent, runtime_error_from_event
+
+
+_REDACTED = "[REDACTED]"
+_MAX_DETAIL_BYTES = 16 * 1024
+_EXACT_SECRET_KEYS = {
+    "authorization",
+    "api_key",
+    "apikey",
+    "access_key",
+    "client_key",
+    "cookie",
+    "credentials",
+    "passwd",
+    "password",
+    "private_key",
+    "refresh_token",
+    "session_token",
+    "set_cookie",
+}
+_QUIET_CODEX_EVENT_MARKERS = ("text", "token", "delta", "usage")
+
+
+def redact_sensitive_data(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            str(key): _REDACTED if _is_secret_key(str(key)) else redact_sensitive_data(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact_sensitive_data(item) for item in value]
+    if isinstance(value, str) and value.lower().startswith("bearer "):
+        return _REDACTED
+    return value
+
+
+def bounded_redacted_data(value: object, maximum_bytes: int = _MAX_DETAIL_BYTES) -> object:
+    redacted = redact_sensitive_data(value)
+    encoded = json.dumps(redacted, sort_keys=True, default=str).encode("utf-8")
+    if len(encoded) <= maximum_bytes:
+        return redacted
+    return {"truncated": True, "original_bytes": len(encoded)}
+
+
+def _is_secret_key(key: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+    compact = normalized.replace("_", "")
+    return (
+        normalized in _EXACT_SECRET_KEYS
+        or compact in _EXACT_SECRET_KEYS
+        or "secret" in normalized
+        or normalized.endswith("_api_key")
+        or normalized.endswith("_authorization")
+        or normalized.endswith("_token")
+        or normalized == "token"
+    )
 
 
 class JsonlEventLog:
@@ -19,8 +75,11 @@ class JsonlEventLog:
             "message": event.message,
             "issue_identifier": event.issue_identifier,
             "timestamp": event.timestamp,
-            "data": event.data,
+            "data": bounded_redacted_data(event.data),
         }
+        self._write_payload(payload)
+
+    def _write_payload(self, payload: dict) -> None:
         try:
             with self._lock:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -28,3 +87,87 @@ class JsonlEventLog:
                     output.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
         except OSError as error:
             print(f"Symphonz event log write failed: {error}", file=sys.stderr)
+
+
+class ErrorJsonlLog(JsonlEventLog):
+    def write(self, record: RuntimeErrorRecord | RuntimeEvent) -> None:
+        if isinstance(record, RuntimeEvent):
+            record = runtime_error_from_event(record)
+            if record is None:
+                return
+        payload = {
+            "issue_identifier": record.issue_identifier,
+            "session_id": record.session_id,
+            "stage": record.stage,
+            "error_type": record.error_type,
+            "message": record.message,
+            "retryable": record.retryable,
+            "attempt": record.attempt,
+            "timestamp": record.timestamp,
+            "context": bounded_redacted_data(record.context),
+        }
+        self._write_payload(payload)
+
+
+class CompositeEventSink:
+    def __init__(self, *sinks):
+        self._sinks = tuple(sink for sink in sinks if sink is not None)
+
+    def __call__(self, event: RuntimeEvent) -> None:
+        self.write(event)
+
+    def write(self, event: RuntimeEvent) -> None:
+        for sink in self._sinks:
+            writer = sink.write if hasattr(sink, "write") else sink
+            try:
+                writer(event)
+            except Exception as error:
+                print(f"Symphonz event sink failed: {error}", file=sys.stderr)
+
+
+class RuntimeEventRouter:
+    """Route complete diagnostics and significant milestones to their sinks."""
+
+    def __init__(self, event_log, runtime_store, error_log):
+        self._event_log = _sink_writer(event_log, "write")
+        self._record_event = _sink_writer(runtime_store, "record_event")
+        self._error_log = _sink_writer(error_log, "write")
+
+    def __call__(self, event: RuntimeEvent) -> None:
+        self.write(event)
+
+    def write(self, event: RuntimeEvent) -> None:
+        self._write_isolated(self._event_log, event)
+
+        derived_error = None
+        try:
+            derived_error = runtime_error_from_event(event)
+        except Exception as error:
+            print(f"Symphonz runtime error normalization failed: {error}", file=sys.stderr)
+
+        if _is_significant_event(event) or derived_error is not None:
+            self._write_isolated(self._record_event, event)
+        if derived_error is not None:
+            self._write_isolated(self._error_log, derived_error)
+
+    @staticmethod
+    def _write_isolated(writer, payload) -> None:
+        try:
+            writer(payload)
+        except Exception as error:
+            print(f"Symphonz event sink failed: {error}", file=sys.stderr)
+
+
+def _sink_writer(sink, method_name: str):
+    writer = getattr(sink, method_name, None)
+    return writer if writer is not None else sink
+
+
+def _is_significant_event(event: RuntimeEvent) -> bool:
+    outer_type = str(event.type or "").lower()
+    if not (outer_type == "codex_event" or outer_type.startswith("codex_")):
+        return True
+    nested_event = event.data.get("event")
+    nested_type = nested_event.get("type") if isinstance(nested_event, dict) else None
+    event_type = str(nested_type or outer_type).lower()
+    return not any(marker in event_type for marker in _QUIET_CODEX_EVENT_MARKERS)
