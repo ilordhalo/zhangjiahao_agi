@@ -14,9 +14,13 @@ Target release: `0.4.0`
 - Expanded developer-guide tests to enforce version, required sections,
   diagram semantics, realistic PAY-214 turns, ownership boundaries,
   accessibility, offline resources, safe inline scripting, and privacy.
+- Made the file-backed Linear fixture persist comment identity and reject
+  updates to unknown comment IDs.
+- Contained wide task tables inside their own scroll region so the Dashboard
+  does not overflow the viewport on mobile.
 
-No runtime source change was required. The existing 0.4.0 interfaces support
-the requested process-level flow.
+The production service flow remains unchanged; runtime source changes are
+limited to the deterministic file fixture and responsive Dashboard CSS.
 
 ## E2E Coverage
 
@@ -32,10 +36,12 @@ the requested process-level flow.
 4. The first report-comment mutation fails locally, leaving a queryable
    `report_sync` error and a `pending` report in RuntimeStore.
 5. The fake Agent observes `linear_sync_status=pending`, leaves Linear in Ready
-   to Publish, and retries only after the fixture becomes available. The retry
-   syncs the comment before the Human Review transition and resolves the error.
-6. A service restart preserves the authenticated session, task history, and
-   report artifact. Rework then republishes and updates the same runtime-owned
+   to Publish, and is terminated with the first service while the report is
+   pending. The restarted service recovers synchronization before the Human
+   Review transition and resolves the error.
+6. The service restart preserves the authenticated session, task, timeline,
+   error history, and report artifact through authenticated APIs. Rework then
+   republishes and updates the same runtime-owned
    Linear comment. The final fake Linear state contains one Workpad heading and
    one implementation-report heading.
 7. Task, timeline, error, review, report, and synchronization state survive
@@ -82,7 +88,7 @@ semantics, and ownership content; the existing offline/privacy test remained
 green. After replacing the page, all five guide tests passed.
 
 The E2E initially stopped at the managed sandbox's local-socket restriction.
-With local-only escalation it exercised the complete flow. Two test-contract
+With local-only escalation it exercised the complete flow. Three test-contract
 issues were then corrected before final verification:
 
 - Linear deliberately Markdown-neutralizes the Agent-supplied review URL in
@@ -100,8 +106,11 @@ issues were then corrected before final verification:
 - `python3 -m unittest -v tests.test_developer_guide`: 5 tests passed.
 - `python3 -m unittest -v tests.test_symphonz_e2e`: 1 test passed with
   local-socket escalation.
-- `python3 -m unittest -v tests.test_symphonz_auth tests.test_symphonz_cli
-  tests.test_symphonz_reporting tests.test_symphonz_service`: 283 tests passed.
+- `python3 -m unittest tests.test_symphonz_auth tests.test_symphonz_cli
+  tests.test_symphonz_reporting tests.test_symphonz_service
+  tests.test_developer_guide`: 289 tests passed.
+- `python3 -m unittest tests.test_symphonz_dashboard`: 26 tests passed.
+- Split deterministic verification: 316 tests passed in total.
 - `python3 -m unittest discover -v`: 314 of 315 tests passed. The existing
   `test_issue_publish_lock_serializes_cross_process_publication` forked child
   terminated with `SIGSEGV` only in the full-suite order. The same test passes
@@ -115,8 +124,9 @@ issues were then corrected before final verification:
 - Offline/privacy scan of `docs/index.html`: passed.
 - `git diff --check`: passed.
 
-The controller explicitly owns final browser visual QA at 1440x1000,
-1024x768, and 390x844; no browser screenshot or visual-QA artifact was created.
+Browser visual QA passed at 1440x1000, 1024x768, and 390x844. Overview, task,
+report, and error pages have no document-level horizontal overflow; the mobile
+task table scrolls inside its bounded region. No screenshot was committed.
 
 ## Self-Review and Concern
 
@@ -124,13 +134,13 @@ The controller explicitly owns final browser visual QA at 1440x1000,
   recovery, stable artifact reads, terminal cleanup timing, and child-process
   termination through observable interfaces.
 - Checked the worktree for generated auth, database, report, log, screenshot,
-  and temporary files; only the owned tests, guide, and this report are in
-  scope.
+  and temporary files; only the files listed below are in scope.
 - The implementation intentionally neutralizes the Agent-supplied review URL
   in the Linear report comment. The stable report URL remains clickable, and
-  the actual review link remains available in task metadata and the rendered
-  report. This differs from a literal reading of "both links are clickable in
-  the Linear comment" and is documented in the guide rather than hidden.
+  the actual review link remains available in the Agent-owned Workpad, task
+  metadata, and the rendered report. This differs from a literal reading of
+  "both links are clickable in the Runtime-owned Linear comment" and is
+  documented in the guide rather than hidden.
 - Full discovery on Apple system Python 3.9 retains the fork-after-runtime
   platform crash described above. Focused E2E, focused fork-lock, the complete
   reporting module, and all requested non-Dashboard modules pass independently.
@@ -138,6 +148,10 @@ The controller explicitly owns final browser visual QA at 1440x1000,
 ## Files
 
 - `tests/test_symphonz_e2e.py`
+- `tests/test_symphonz_service.py`
+- `tests/test_symphonz_dashboard.py`
+- `symphonz/service/linear.py`
+- `symphonz/service/web_templates.py`
 - `tests/test_developer_guide.py`
 - `docs/index.html`
 - `.superpowers/sdd/task-7-report.md`

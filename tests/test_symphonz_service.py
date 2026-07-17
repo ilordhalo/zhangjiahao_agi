@@ -410,6 +410,52 @@ class LinearAndWorkspaceTests(unittest.TestCase):
             self.assertEqual(requests[0]["operation"], "SymphonzPoll")
             self.assertEqual(requests[0]["variables"]["projectSlug"], "quality-project")
 
+    def test_stateful_linear_file_fixture_persists_comments_and_rejects_unknown_update_ids(self):
+        from symphonz.service.linear import LinearClient
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = Path(tmp)
+            (fixture / "state.json").write_text(
+                json.dumps(
+                    {
+                        "issue": {"id": "issue-1", "state": {"name": "Todo"}},
+                        "comments": [],
+                        "reportSyncSuccess": True,
+                    }
+                )
+            )
+            client = LinearClient(api_key="test-key", project_slug="quality-project", endpoint=fixture.as_uri())
+            create = client.graphql(
+                "mutation SymphonzCreateWorkpadComment($input: CommentCreateInput!) { "
+                "commentCreate(input: $input) { success comment { id } } }",
+                {"input": {"issueId": "issue-1", "body": "## Symphonz Workpad\ncreated"}},
+            )
+            comment_id = create["data"]["commentCreate"]["comment"]["id"]
+            self.assertEqual(comment_id, "workpad-QA-1")
+
+            unknown = client.graphql(
+                "mutation SymphonzUpdateWorkpadComment($id: String!, $input: CommentUpdateInput!) { "
+                "commentUpdate(id: $id, input: $input) { success comment { id } } }",
+                {"id": "wrong-id", "input": {"body": "wrong"}},
+            )
+            self.assertEqual(unknown["errors"][0]["message"], "unknown comment id: wrong-id")
+
+            updated = client.graphql(
+                "mutation SymphonzUpdateWorkpadComment($id: String!, $input: CommentUpdateInput!) { "
+                "commentUpdate(id: $id, input: $input) { success comment { id } } }",
+                {"id": comment_id, "input": {"body": "## Symphonz Workpad\nupdated"}},
+            )
+            self.assertTrue(updated["data"]["commentUpdate"]["success"])
+            found = client.graphql(
+                "query SymphonzFindReportComment($issueId: String!) { "
+                "issue(id: $issueId) { comments { nodes { id body } } } }",
+                {"issueId": "issue-1"},
+            )
+            self.assertEqual(
+                found["data"]["issue"]["comments"]["nodes"],
+                [{"id": comment_id, "body": "## Symphonz Workpad\nupdated"}],
+            )
+
     def test_build_linear_client_uses_endpoint_override_from_environment(self):
         from symphonz.service.runner import build_linear_client
 

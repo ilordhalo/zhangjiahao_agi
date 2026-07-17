@@ -601,7 +601,7 @@ Current status: Ready to Publish
                 <div class="linear-sync"><h3 class="sync-heading">Linear 同步</h3><p>Agent 更新原 Workpad；Runtime 另建一个 Runtime-owned 评论，不覆盖 Workpad。</p><pre class="workpad-preview">## Symphonz Implementation Report
 
 Report: https://symphonz.example/issues/PAY-214/report
-Review target: https：／／github.example/acme/payments/pull/482
+Review: https：／／github.example/acme/payments/pull/482
 Branch: symphonz/PAY-214-prevent-duplicate-payment
 Commit: a13c9f2
 Summary: Shared guard prevents duplicate payment requests.</pre><div class="sync-state">Sync state · linear_sync_status: synced</div></div>
@@ -748,7 +748,7 @@ Current status: Merging
       "report-tool": ["09 · symphonz_report", "Runtime 校验 issue identity 和报告 schema；Agent 永远不能提交任意 HTML 或脚本。"],
       persist: ["10 · Persist", "任务、结构化里程碑、错误、报告元数据和 session 写入 WAL SQLite；完整事件另写 JSONL。"],
       "report-sync": ["11 · Linear sync", "issue-scoped lease 保护一个 Runtime-owned 评论；失败保留 pending，并由后台 synchronizer 重试。"],
-      "human-review": ["12 · Human Review", "报告和 review 链接 synced 后进入人工审核门；该状态默认不触发 Codex。"],
+      "human-review": ["12 · Human Review", "Runtime 报告评论 synced 且 Workpad 已记录 review URL 后进入人工审核门；该状态默认不触发 Codex。"],
       "terminal-cleanup": ["13 · Terminal cleanup", "Done/Closed/Cancelled/Canceled/Duplicate 触发 workspace 清理，Store 与报告 artifact 继续保留。"]
     };
 

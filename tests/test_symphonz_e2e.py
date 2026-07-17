@@ -27,7 +27,6 @@ class StatefulLinearFixture:
     def __init__(self, root: Path):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
-        self._failed_report_creates = 0
         self.set_state("Todo")
         self.set_report_sync_success(False)
 
@@ -48,71 +47,48 @@ class StatefulLinearFixture:
 
     @property
     def report_comments(self) -> dict[str, str]:
-        comment = ""
-        create_index = 0
-        for request in self.requests:
-            operation = request["operation"]
-            if operation == "SymphonzCreateReportComment":
-                create_index += 1
-                if create_index <= self._failed_report_creates:
-                    continue
-                comment = request["variables"]["input"]["body"]
-            elif operation == "SymphonzUpdateReportComment":
-                comment = request["variables"]["input"]["body"]
-        return {"issue-1": comment} if comment else {}
+        return self._comments_with_heading(REPORT_HEADING)
 
     @property
     def workpad_comments(self) -> dict[str, str]:
-        comment = ""
-        for request in self.requests:
-            if request["operation"] in {"SymphonzCreateWorkpadComment", "SymphonzUpdateWorkpadComment"}:
-                comment = request["variables"]["input"]["body"]
-        return {"issue-1": comment} if comment else {}
+        return self._comments_with_heading(WORKPAD_HEADING)
+
+    @property
+    def comments(self) -> list[dict]:
+        state_path = self.root / "state.json"
+        if not state_path.exists():
+            return []
+        comments = json.loads(state_path.read_text()).get("comments", [])
+        return comments if isinstance(comments, list) else []
+
+    def _comments_with_heading(self, heading: str) -> dict[str, str]:
+        return {
+            comment["issueId"]: comment["body"]
+            for comment in self.comments
+            if isinstance(comment, dict)
+            and isinstance(comment.get("issueId"), str)
+            and isinstance(comment.get("body"), str)
+            and comment["body"].startswith(heading)
+        }
 
     def set_state(self, state: str) -> None:
-        payload = {"issue": self.issue(state)}
+        state_path = self.root / "state.json"
+        payload = json.loads(state_path.read_text()) if state_path.exists() else {}
+        payload["issue"] = self.issue(state)
+        payload.setdefault("comments", [])
         temporary = self.root / ".actor-state.tmp"
         temporary.write_text(json.dumps(payload))
-        temporary.replace(self.root / "state.json")
+        temporary.replace(state_path)
 
     def set_report_sync_success(self, success: bool) -> None:
-        if success:
-            self._failed_report_creates = sum(
-                request["operation"] == "SymphonzCreateReportComment" for request in self.requests
-            )
+        state_path = self.root / "state.json"
+        payload = json.loads(state_path.read_text())
+        payload["reportSyncSuccess"] = success
+        temporary_state = self.root / ".actor-report-state.tmp"
+        temporary_state.write_text(json.dumps(payload))
+        temporary_state.replace(state_path)
         responses = {
-            "SymphonzCreateWorkpadComment": {
-                "data": {"commentCreate": {"success": True, "comment": {"id": "workpad-QA-1"}}}
-            },
-            "SymphonzUpdateWorkpadComment": {
-                "data": {"commentUpdate": {"success": True, "comment": {"id": "workpad-QA-1"}}}
-            },
-            "SymphonzFindReportComment": {
-                "data": {
-                    "issue": {
-                        "comments": {
-                            "nodes": [],
-                            "pageInfo": {"hasNextPage": False, "endCursor": None},
-                        }
-                    }
-                }
-            },
-            "SymphonzCreateReportComment": {
-                "data": {
-                    "commentCreate": {
-                        "success": success,
-                        "comment": {"id": "report-comment-QA-1"},
-                    }
-                }
-            },
-            "SymphonzUpdateReportComment": {
-                "data": {
-                    "commentUpdate": {
-                        "success": success,
-                        "comment": {"id": "report-comment-QA-1"},
-                    }
-                }
-            },
+            "default": {"errors": [{"message": "unexpected fixture operation"}]},
         }
         temporary = self.root / ".responses.tmp"
         temporary.write_text(json.dumps(responses))
@@ -182,7 +158,15 @@ class InstalledCliE2ETests(unittest.TestCase):
 
             first_service = self.start_service(prefix, project, env, port)
             try:
-                self.wait_for(lambda: fixture.state_name == "In Progress", "Todo mutation")
+                try:
+                    self.wait_for(lambda: fixture.state_name == "In Progress", "Todo mutation")
+                except AssertionError as error:
+                    diagnostics = RuntimeStore(runtime_db).list_errors(issue_identifier="QA-1", limit=20)["items"]
+                    protocol_diagnostics = protocol_path.read_text() if protocol_path.exists() else "<no protocol>"
+                    self.fail(f"{error}; runtime errors={diagnostics!r}; protocol={protocol_diagnostics!r}")
+                todo_run = self.wait_for_audit_state(audit_path, "Todo", occurrence=1)
+                self.assert_process_gone(todo_run["process_id"])
+                self.assert_process_gone(todo_run["child_process_id"])
                 self.assertTrue(workspace.exists())
                 self.assertEqual((workspace / "workpad-id.txt").read_text(), "workpad-QA-1")
                 self.assertEqual((workspace / "branch.txt").read_text(), "symphonz/QA-1-sandbox-quality-run")
@@ -240,28 +224,32 @@ class InstalledCliE2ETests(unittest.TestCase):
                     "report_sync",
                     (project / ".symphonz" / "logs" / "errors.jsonl").read_text(),
                 )
-
-                fixture.set_report_sync_success(True)
-                report_retry_path.write_text("retry")
-                self.wait_for(lambda: fixture.state_name == "Human Review", "publication mutation")
-                self.wait_for(
-                    lambda: RuntimeStore(runtime_db).get_report("QA-1")["linear_sync_status"] == "synced",
-                    "report sync recovery",
+                pending_task_api = self.authenticated_json(port, "/api/issues/QA-1", session_cookie)
+                pending_events_api = self.authenticated_json(
+                    port, "/api/issues/QA-1/events?limit=200", session_cookie
                 )
+                pending_errors_api = self.authenticated_json(
+                    port, "/api/issues/QA-1/errors?limit=200", session_cookie
+                )
+                self.assertEqual(pending_task_api["report"]["linear_sync_status"], "pending")
+                self.assertTrue(pending_events_api["items"])
+                self.assertEqual(len(pending_errors_api["items"]), 1)
             finally:
                 self.stop_service(first_service)
 
             persisted = RuntimeStore(runtime_db)
             published = persisted.get_report("QA-1")
-            self.assertEqual(published["linear_sync_status"], "synced")
+            self.assertEqual(published["linear_sync_status"], "pending")
             self.assertEqual(persisted.list_tasks(query="QA-1")["items"][0]["report_url"], f"{public_base_url}/issues/QA-1/report")
-            resolved_errors = persisted.list_errors(
+            unresolved_errors = persisted.list_errors(
                 issue_identifier="QA-1",
                 stage="report_sync",
-                resolved=True,
+                resolved=False,
             )["items"]
-            self.assertEqual(len(resolved_errors), 1)
-            self.assertEqual(resolved_errors[0]["resolving_event"], "report_sync_succeeded")
+            self.assertEqual(len(unresolved_errors), 1)
+            interrupted_publish = self.wait_for_audit_state(audit_path, "Ready to Publish", occurrence=1)
+            self.assert_process_gone(interrupted_publish["process_id"])
+            self.assert_process_gone(interrupted_publish["child_process_id"])
 
             second_service = self.start_service(prefix, project, env, port)
             try:
@@ -278,18 +266,58 @@ class InstalledCliE2ETests(unittest.TestCase):
                 self.assertEqual(task_page[0], 200)
                 self.assertIn("QA-1", task_page[2])
 
+                restarted_task_api = self.authenticated_json(port, "/api/issues/QA-1", session_cookie)
+                restarted_events_api = self.authenticated_json(
+                    port, "/api/issues/QA-1/events?limit=200", session_cookie
+                )
+                restarted_errors_api = self.authenticated_json(
+                    port, "/api/issues/QA-1/errors?limit=200", session_cookie
+                )
+                self.assertEqual(restarted_task_api["task"]["issue_identifier"], "QA-1")
+                self.assertEqual(restarted_task_api["report"]["url"], pending_task_api["report"]["url"])
+                self.assertTrue(
+                    {item["id"] for item in pending_events_api["items"]}.issubset(
+                        {item["id"] for item in restarted_events_api["items"]}
+                    )
+                )
+                self.assertTrue(
+                    {item["id"] for item in pending_errors_api["items"]}.issubset(
+                        {item["id"] for item in restarted_errors_api["items"]}
+                    )
+                )
+
+                self.wait_for_audit_state(audit_path, "Ready to Publish", occurrence=2)
+                fixture.set_report_sync_success(True)
+                report_retry_path.write_text("retry")
+                self.wait_for(lambda: fixture.state_name == "Human Review", "publication mutation after restart")
+                self.wait_for(
+                    lambda: RuntimeStore(runtime_db).get_report("QA-1")["linear_sync_status"] == "synced",
+                    "report sync recovery after restart",
+                )
+                recovered_publish = self.wait_for_audit_state(audit_path, "Ready to Publish", occurrence=2)
+                self.assert_process_gone(recovered_publish["process_id"])
+                self.assert_process_gone(recovered_publish["child_process_id"])
+
+                updates_before_rework = self.report_update_count(fixture)
                 fixture.set_state("Rework")
                 self.wait_for(
-                    lambda: fixture.state_name == "Human Review" and self.report_update_count(fixture) == 1,
+                    lambda: fixture.state_name == "Human Review"
+                    and self.report_update_count(fixture) == updates_before_rework + 1,
                     "rework report update",
                 )
                 self.wait_for(
                     lambda: "Rework validation incorporated" in fixture.report_comments.get("issue-1", ""),
                     "runtime-owned report comment update",
                 )
+                rework_run = self.wait_for_audit_state(audit_path, "Rework", occurrence=1)
+                self.assert_process_gone(rework_run["process_id"])
+                self.assert_process_gone(rework_run["child_process_id"])
 
                 fixture.set_state("Merging")
                 self.wait_for(lambda: fixture.state_name == "Done", "merge mutation")
+                merging_run = self.wait_for_audit_state(audit_path, "Merging", occurrence=1)
+                self.assert_process_gone(merging_run["process_id"])
+                self.assert_process_gone(merging_run["child_process_id"])
                 self.wait_for(lambda: not workspace.exists(), "terminal workspace cleanup")
                 self.wait_for(
                     lambda: "workspace_removed"
@@ -333,6 +361,16 @@ class InstalledCliE2ETests(unittest.TestCase):
             self.assertEqual(len(resolved_errors), 1)
             self.assertEqual(resolved_errors[0]["resolving_event"], "report_sync_succeeded")
 
+            report_comment_objects = [
+                comment for comment in fixture.comments if str(comment.get("body") or "").startswith(REPORT_HEADING)
+            ]
+            workpad_comment_objects = [
+                comment for comment in fixture.comments if str(comment.get("body") or "").startswith(WORKPAD_HEADING)
+            ]
+            self.assertEqual(len(report_comment_objects), 1)
+            self.assertEqual(report_comment_objects[0]["id"], "report-comment-QA-1")
+            self.assertEqual(len(workpad_comment_objects), 1)
+            self.assertEqual(workpad_comment_objects[0]["id"], "workpad-QA-1")
             self.assertEqual(fixture.report_comments["issue-1"].count(REPORT_HEADING), 1)
             self.assertIn(f"Report: {public_base_url}/issues/QA-1/report", fixture.report_comments["issue-1"])
             self.assertIn("Review: ", fixture.report_comments["issue-1"])
@@ -341,24 +379,28 @@ class InstalledCliE2ETests(unittest.TestCase):
             self.assertIn("State: Done", fixture.workpad_comments["issue-1"])
 
             audit = [json.loads(line) for line in audit_path.read_text().splitlines()]
-            self.assertEqual([entry["state"] for entry in audit], ["Todo", "Ready to Publish", "Rework", "Merging"])
+            self.assertEqual(
+                [entry["state"] for entry in audit],
+                ["Todo", "Ready to Publish", "Ready to Publish", "Rework", "Merging"],
+            )
             self.assertEqual({entry["branch"] for entry in audit}, {"symphonz/QA-1-sandbox-quality-run"})
             self.assertEqual({entry["review"] for entry in audit}, {"https://github.local/pull/42"})
-            self.assertEqual(len({entry["process_id"] for entry in audit}), 4)
+            self.assertEqual(len({entry["process_id"] for entry in audit}), 5)
             for entry in audit:
                 self.assert_process_gone(entry["process_id"])
                 self.assert_process_gone(entry["child_process_id"])
-            time.sleep(1.1)
             self.assertFalse(leak_path.exists(), "Codex descendant survived process-group cleanup")
 
-            protocol = protocol_path.read_text().splitlines()
+            protocol = [json.loads(line) for line in protocol_path.read_text().splitlines()]
             self.assertEqual(
-                protocol,
-                ["initialize", "initialized", "thread/start", "turn/start"] * 4,
+                [entry["method"] for entry in protocol],
+                ["initialize", "initialized", "thread/start", "turn/start"] * 5,
             )
+            self.assertTrue(all(entry["jsonrpc"] == "2.0" for entry in protocol))
+            self.assertTrue(all(entry["contract_valid"] is True for entry in protocol))
 
             provider = [json.loads(line) for line in provider_path.read_text().splitlines()]
-            self.assertEqual([record["action"] for record in provider], ["pull_request", "merge"])
+            self.assertEqual([record["action"] for record in provider], ["pull_request", "pull_request", "merge"])
             mutations = [request for request in fixture.requests if request["operation"] == "SymphonzSetState"]
             self.assertEqual(
                 [mutation["variables"]["stateName"] for mutation in mutations],
@@ -468,6 +510,28 @@ class InstalledCliE2ETests(unittest.TestCase):
     def report_update_count(self, fixture: StatefulLinearFixture) -> int:
         return sum(request["operation"] == "SymphonzUpdateReportComment" for request in fixture.requests)
 
+    def authenticated_json(self, port: int, path: str, session_cookie: str) -> dict:
+        status, _, body = self.http_request(port, "GET", path, headers={"Cookie": session_cookie})
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertIsInstance(payload, dict)
+        return payload
+
+    def wait_for_audit_state(self, audit_path: Path, state: str, *, occurrence: int) -> dict:
+        def matching_entries() -> list[dict]:
+            if not audit_path.exists():
+                return []
+            return [
+                entry
+                for line in audit_path.read_text().splitlines()
+                if line
+                for entry in [json.loads(line)]
+                if entry.get("state") == state
+            ]
+
+        self.wait_for(lambda: len(matching_entries()) >= occurrence, f"{state} audit entry {occurrence}")
+        return matching_entries()[occurrence - 1]
+
     def wait_for(self, predicate, label: str, timeout: float = 16) -> None:
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -524,12 +588,79 @@ def fake_codex_source(
         f"public_base_url = {public_base_url!r}\n"
     )
     return prefix + r'''
-child_code = "import pathlib,sys,time; time.sleep(1); pathlib.Path(sys.argv[1]).write_text('leaked')"
+child_code = "import pathlib,sys,time; time.sleep(60); pathlib.Path(sys.argv[1]).write_text('leaked')"
 child = subprocess.Popen([sys.executable, "-c", child_code, str(leak_path)])
 pending = None
 actions = []
 state = None
 next_tool_id = 900
+thread_id = "thread-QA-1"
+turn_id = None
+
+
+def require_contract(condition, message):
+    if not condition:
+        with protocol_path.open("a") as protocol:
+            protocol.write(json.dumps({"contract_valid": False, "error": message}) + "\n")
+        raise SystemExit("protocol contract violation: " + message)
+
+
+def same_path(left, right):
+    return isinstance(left, str) and isinstance(right, str) and os.path.realpath(left) == os.path.realpath(right)
+
+
+def validate_protocol_message(msg):
+    method = msg.get("method")
+    require_contract(msg.get("jsonrpc") == "2.0", f"{method} missing jsonrpc 2.0")
+    params = msg.get("params")
+    require_contract(isinstance(params, dict), f"{method} params must be an object")
+    if method == "initialize":
+        require_contract(params.get("clientInfo") == {"name": "symphonz", "version": "0.4.0"}, "invalid clientInfo")
+        require_contract(params.get("capabilities") == {"experimentalApi": True}, "invalid capabilities")
+    elif method == "initialized":
+        require_contract("id" not in msg and params == {}, "initialized must be an empty notification")
+    elif method == "thread/start":
+        require_contract(params.get("approvalPolicy") == "never", "invalid thread approval policy")
+        require_contract(params.get("sandbox") == "workspace-write", "invalid thread sandbox")
+        require_contract(same_path(params.get("cwd"), os.getcwd()), "thread cwd does not match workspace")
+        tool_by_name = {tool.get("name"): tool for tool in params.get("dynamicTools", [])}
+        require_contract(set(tool_by_name) == {"linear_graphql", "symphonz_report"}, "unexpected dynamic tools")
+        linear_schema = tool_by_name["linear_graphql"].get("inputSchema", {})
+        report_schema = tool_by_name["symphonz_report"].get("inputSchema", {})
+        require_contract(linear_schema.get("required") == ["query"], "invalid Linear tool schema")
+        require_contract(linear_schema.get("additionalProperties") is False, "Linear schema must be closed")
+        require_contract("review" in report_schema.get("required", []), "report tool must require review metadata")
+        require_contract(report_schema.get("additionalProperties") is False, "report schema must be closed")
+    elif method == "turn/start":
+        require_contract(params.get("threadId") == thread_id, "turn is not linked to the created thread")
+        require_contract(same_path(params.get("cwd"), os.getcwd()), "turn cwd does not match workspace")
+        require_contract(params.get("approvalPolicy") == "never", "invalid turn approval policy")
+        require_contract(params.get("title") == "QA-1: Sandbox quality run", "invalid turn title")
+        sandbox_policy = params.get("sandboxPolicy")
+        require_contract(isinstance(sandbox_policy, dict), "turn sandbox policy must be an object")
+        writable_roots = sandbox_policy.get("writableRoots")
+        require_contract(sandbox_policy.get("type") == "workspaceWrite", "invalid turn sandbox type")
+        if writable_roots is None:
+            require_contract(sandbox_policy.get("networkAccess") is True, "invalid configured turn sandbox policy")
+        else:
+            require_contract(
+                isinstance(writable_roots, list)
+                and len(writable_roots) == 1
+                and same_path(writable_roots[0], os.getcwd()),
+                "invalid turn writable roots",
+            )
+        inputs = params.get("input")
+        require_contract(
+            isinstance(inputs, list)
+            and len(inputs) == 1
+            and inputs[0].get("type") == "text"
+            and isinstance(inputs[0].get("text"), str),
+            "turn input must contain exactly one text prompt",
+        )
+    else:
+        require_contract(False, f"unexpected runtime method {method}")
+    with protocol_path.open("a") as protocol:
+        protocol.write(json.dumps({"method": method, "jsonrpc": msg["jsonrpc"], "contract_valid": True}) + "\n")
 
 
 def report_payload(summary):
@@ -597,23 +728,20 @@ def send_next():
         print(json.dumps({"jsonrpc": "2.0", "id": pending["id"], "method": "item/tool/call", "params": {"tool": tool, "arguments": arguments}}), flush=True)
         return
     pending = None
-    print(json.dumps({"method": "turn/completed", "params": {"usage": {"totalTokens": 17}}}), flush=True)
+    print(json.dumps({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": thread_id, "turnId": turn_id, "status": "completed", "usage": {"totalTokens": 17}}}), flush=True)
 
 
 for line in sys.stdin:
     msg = json.loads(line)
     method = msg.get("method")
     if method:
-        with protocol_path.open("a") as protocol:
-            protocol.write(method + "\n")
+        validate_protocol_message(msg)
     if method == "initialize":
-        print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"serverInfo": {"name": "fake-codex", "version": "1.0"}}}), flush=True)
     elif method == "thread/start":
-        tools = {tool.get("name") for tool in msg.get("params", {}).get("dynamicTools", [])}
-        if tools != {"linear_graphql", "symphonz_report"}:
-            raise SystemExit(f"unexpected dynamic tools: {tools}")
-        print(json.dumps({"id": msg["id"], "result": {"thread": {"id": "thread-QA-1"}}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": thread_id}}}), flush=True)
     elif method == "turn/start":
+        turn_id = "turn-" + str(os.getpid())
         prompt = msg["params"]["input"][0]["text"]
         state = re.search(r"Current status: (.+)", prompt).group(1).strip()
         target = {"Todo": "In Progress", "Ready to Publish": "Human Review", "Rework": "Human Review", "Merging": "Done"}[state]
@@ -627,7 +755,7 @@ for line in sys.stdin:
                 provider.write(json.dumps({"action": "pull_request" if state == "Ready to Publish" else "merge", "branch": branch, "review": review}) + "\n")
         with audit_path.open("a") as audit:
             audit.write(json.dumps({"state": state, "target": target, "workpad": "workpad-QA-1", "branch": branch, "review": review, "process_id": os.getpid(), "child_process_id": child.pid}) + "\n")
-        print(json.dumps({"id": msg["id"], "result": {"turn": {"id": "turn-" + state.replace(" ", "-")}}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"turn": {"id": turn_id, "threadId": thread_id}}}), flush=True)
 
         workpad = "\n".join([
             "## Symphonz Workpad",
@@ -649,6 +777,9 @@ for line in sys.stdin:
         actions.append(state_action(target))
         send_next()
     elif pending is not None and msg.get("id") == pending["id"]:
+        require_contract(msg.get("jsonrpc") == "2.0", "dynamic tool response missing jsonrpc 2.0")
+        require_contract(isinstance(msg.get("result"), dict), "dynamic tool response result must be an object")
+        require_contract(isinstance(msg["result"].get("contentItems"), list), "dynamic tool response missing contentItems")
         if not msg.get("result", {}).get("success"):
             raise SystemExit(f"{pending['tool']} failed: {msg}")
         tool_output = json.loads(msg["result"].get("output", "{}"))

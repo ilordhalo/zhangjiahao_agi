@@ -86,11 +86,12 @@ h3 { font-size: 13px; letter-spacing: 0; }
 .metric-label { color: var(--muted); font-size: 11px; font-weight: 650; }
 .metric-value { font-size: 27px; font-weight: 720; line-height: 1; margin-top: 15px; }
 .grid-two { align-items: start; display: grid; gap: 14px; grid-template-columns: minmax(0, 1.45fr) minmax(300px, .75fr); }
+.grid-two > *, .section { min-width: 0; }
 .section { margin-top: 18px; }
 .section-head { align-items: center; display: flex; justify-content: space-between; margin-bottom: 9px; }
 .section-head h2 { margin: 0; }
 .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
-.table-wrap { overflow-x: auto; }
+.table-wrap { max-width: 100%; overflow-x: auto; }
 table { border-collapse: collapse; min-width: 800px; width: 100%; }
 th, td { border-bottom: 1px solid var(--line); padding: 11px 13px; text-align: left; vertical-align: top; }
 th { background: var(--surface-raised); color: var(--muted); font-size: 10px; font-weight: 700; text-transform: uppercase; }
@@ -139,7 +140,7 @@ pre { background: #f4f4f6; border: 1px solid var(--line); border-radius: 5px; fo
 .login-warning { border: 1px solid #ead38c; border-radius: 6px; margin-bottom: 12px; }
 @media (max-width: 1060px) {
   .metrics { grid-template-columns: repeat(3, minmax(112px, 1fr)); }
-  .grid-two { grid-template-columns: 1fr; }
+  .grid-two { grid-template-columns: minmax(0, 1fr); }
   .detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 760px) {
