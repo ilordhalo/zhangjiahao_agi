@@ -10,7 +10,7 @@ import sys
 import time
 from urllib.parse import urlsplit
 
-from symphonz.install import read_config, read_dashboard_auth
+from symphonz.install import classify_dashboard_config, read_dashboard_auth
 from symphonz.service.auth import AuthService, DashboardAuth
 from symphonz.service.codex_app_server import CodexAppServer
 from symphonz.service.attempt_store import AttemptStore
@@ -128,7 +128,10 @@ def run_service(
     dashboard_auth = None
     if _legacy_unauthenticated_dashboard:
         installed_config_path = project_root / ".symphonz" / "config.toml"
-        if not installed_config_path.is_file() or "dashboard" in read_config(installed_config_path):
+        if (
+            not installed_config_path.is_file()
+            or classify_dashboard_config(installed_config_path.read_text()) != "legacy"
+        ):
             raise ValueError(
                 "Legacy unauthenticated dashboard requires an installed config without [dashboard]"
             )

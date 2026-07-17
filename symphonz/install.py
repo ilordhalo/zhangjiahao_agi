@@ -35,6 +35,29 @@ _ARRAY_TABLE_HEADER = re.compile(
     rf"^[ \t]*\[\[[ \t]*(?P<name>{_TOML_KEY_PATH})"
     r"[ \t]*\]\][ \t]*(?:#.*)?$"
 )
+_GENERATED_TOML_STRING = re.compile(r'^"(?:\\["\\]|[^"\\\r\n])*"$')
+_LEGACY_CONFIG_LAYOUT = (
+    "[runtime]",
+    "mode",
+    "command",
+    "",
+    "[linear]",
+    "api_key_env",
+    "project_slug",
+    "",
+    "[git]",
+    "provider",
+    "remote",
+    "base_branch",
+    "mr_target",
+    "gitlab_base_url",
+    "",
+    "[workspace]",
+    "root",
+    "",
+    "[logs]",
+    "root",
+)
 
 
 @dataclass(frozen=True)
@@ -106,6 +129,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = -1
     temporary_path: Path | None = None
+    primary_error: BaseException | None = None
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
         for _unused in range(100):
@@ -132,18 +156,36 @@ def _atomic_write_text(path: Path, content: str) -> None:
             os.fsync(directory_descriptor)
         finally:
             os.close(directory_descriptor)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        if temporary_path is not None:
-            try:
-                temporary_path.unlink()
-            except FileNotFoundError:
-                pass
+    except BaseException as error:
+        primary_error = error
+
+    if descriptor >= 0:
+        os.close(descriptor)
+    cleanup_error = None
+    if temporary_path is not None:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+        except BaseException as error:
+            cleanup_error = error
+    if primary_error is not None:
+        if cleanup_error is not None:
+            raise RuntimeError(
+                f"{primary_error}; temporary file cleanup also failed: {cleanup_error}"
+            ) from primary_error
+        raise primary_error.with_traceback(primary_error.__traceback__)
+    if cleanup_error is not None:
+        raise cleanup_error
 
 
 def read_config(path: Path) -> dict[str, dict[str, str]]:
     return _parse_config(path.read_text())
+
+
+def read_installed_config(path: Path) -> tuple[dict[str, dict[str, str]], str]:
+    content = path.read_text()
+    return _parse_config(content), classify_dashboard_config(content)
 
 
 def _parse_config(content: str) -> dict[str, dict[str, str]]:
@@ -169,18 +211,118 @@ def _parse_config(content: str) -> dict[str, dict[str, str]]:
 
 
 def _table_header_name(line: str) -> str | None:
-    match = _TABLE_HEADER.fullmatch(line.rstrip("\r\n"))
+    header = _table_header_path(line)
+    if header is None or header[0]:
+        return None
+    return ".".join(header[1])
+
+
+def _table_header_path(line: str) -> tuple[bool, tuple[str, ...]] | None:
+    candidate = line.rstrip("\r\n")
+    match = _TABLE_HEADER.fullmatch(candidate)
+    is_array = False
+    if match is None:
+        match = _ARRAY_TABLE_HEADER.fullmatch(candidate)
+        is_array = True
     if match is None:
         return None
+
     parts = []
     for key_match in _TOML_KEY_PART_PATTERN.finditer(match.group("name")):
         value = key_match.group(0)
         if value.startswith('"'):
-            value = parse_toml_string(value)
+            decoded = _decode_basic_toml_key(value)
+            if decoded is None:
+                return None
+            value = decoded
         elif value.startswith("'"):
             value = value[1:-1]
         parts.append(value)
-    return ".".join(parts)
+    return is_array, tuple(parts)
+
+
+def _decode_basic_toml_key(value: str) -> str | None:
+    escapes = {
+        '"': '"',
+        "\\": "\\",
+        "b": "\b",
+        "t": "\t",
+        "n": "\n",
+        "f": "\f",
+        "r": "\r",
+    }
+    body = value[1:-1]
+    result = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char != "\\":
+            result.append(char)
+            index += 1
+            continue
+        if index + 1 >= len(body):
+            return None
+        escape = body[index + 1]
+        if escape in escapes:
+            result.append(escapes[escape])
+            index += 2
+            continue
+        if escape not in {"u", "U"}:
+            return None
+        width = 4 if escape == "u" else 8
+        digits = body[index + 2 : index + 2 + width]
+        if len(digits) != width or re.fullmatch(r"[0-9A-Fa-f]+", digits) is None:
+            return None
+        codepoint = int(digits, 16)
+        if codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+            return None
+        result.append(chr(codepoint))
+        index += 2 + width
+    return "".join(result)
+
+
+def classify_dashboard_config(content: str) -> str:
+    dashboard_headers = []
+    for line in content.splitlines():
+        header = _table_header_path(line)
+        if header is not None and header[1] and header[1][0] == "dashboard":
+            dashboard_headers.append(header)
+
+    direct_tables = [header for header in dashboard_headers if not header[0] and header[1] == ("dashboard",)]
+    if len(direct_tables) > 1 and len(direct_tables) == len(dashboard_headers):
+        raise RuntimeError(
+            "Configuration contains multiple [dashboard] sections; resolve the duplicate definitions, "
+            "then run `symphonz configure-dashboard`"
+        )
+    if dashboard_headers:
+        if len(dashboard_headers) == 1 and direct_tables:
+            return "configured"
+        raise RuntimeError(
+            "Dashboard configuration uses a noncanonical dashboard-related table; "
+            "run `symphonz configure-dashboard` after resolving it"
+        )
+    if _is_generated_legacy_config(content):
+        return "legacy"
+    raise RuntimeError(
+        "Dashboard configuration is missing or ambiguous; run `symphonz configure-dashboard` to regenerate it"
+    )
+
+
+def _is_generated_legacy_config(content: str) -> bool:
+    if not content.endswith("\n"):
+        return False
+    lines = content.splitlines()
+    if len(lines) != len(_LEGACY_CONFIG_LAYOUT):
+        return False
+    for line, expected in zip(lines, _LEGACY_CONFIG_LAYOUT):
+        if expected == "" or expected.startswith("["):
+            if line != expected:
+                return False
+            continue
+        prefix = f"{expected} = "
+        if not line.startswith(prefix) or _GENERATED_TOML_STRING.fullmatch(line[len(prefix) :]) is None:
+            return False
+    return True
 
 
 def _is_table_header(line: str) -> bool:
@@ -216,8 +358,11 @@ def write_auth_config(path: Path, password: str) -> DashboardAuth:
     directory_descriptor = _open_auth_parent(path)
     descriptor = -1
     temporary_name: str | None = None
+    primary_error: BaseException | None = None
+    result: DashboardAuth | None = None
     try:
         _validate_auth_destination(path, directory_descriptor)
+        previous = _snapshot_auth_destination(path.name, directory_descriptor)
         record = hash_password(password)
         session_secret = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
         content = "\n".join(
@@ -246,17 +391,123 @@ def write_auth_config(path: Path, password: str) -> DashboardAuth:
             dst_dir_fd=directory_descriptor,
         )
         temporary_name = None
-        os.fsync(directory_descriptor)
-        return DashboardAuth(password_record=record, session_secret=session_secret)
+        try:
+            os.fsync(directory_descriptor)
+        except BaseException as commit_error:
+            try:
+                _restore_auth_destination(path.name, directory_descriptor, previous)
+            except BaseException as rollback_error:
+                raise RuntimeError(
+                    f"{commit_error}; auth rollback also failed: {rollback_error}"
+                ) from commit_error
+            raise
+        result = DashboardAuth(password_record=record, session_secret=session_secret)
+    except BaseException as error:
+        primary_error = error
+
+    cleanup_error = None
+    if descriptor >= 0:
+        os.close(descriptor)
+    if temporary_name is not None:
+        cleanup_error = _cleanup_auth_temp(temporary_name, directory_descriptor)
+    os.close(directory_descriptor)
+
+    if primary_error is not None:
+        if cleanup_error is not None:
+            raise RuntimeError(
+                f"{primary_error}; temporary auth cleanup also failed: {cleanup_error}"
+            ) from primary_error
+        raise primary_error.with_traceback(primary_error.__traceback__)
+    if cleanup_error is not None:
+        raise cleanup_error
+    assert result is not None
+    return result
+
+
+def _snapshot_auth_destination(
+    filename: str,
+    directory_descriptor: int,
+) -> tuple[bytes, int] | None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            filename,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_descriptor,
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("Dashboard auth configuration destination must be a regular file")
+        auth_file = os.fdopen(descriptor, "rb")
+        descriptor = -1
+        with auth_file:
+            return auth_file.read(), stat.S_IMODE(metadata.st_mode)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        if temporary_name is not None:
-            try:
-                os.unlink(temporary_name, dir_fd=directory_descriptor)
-            except FileNotFoundError:
-                pass
-        os.close(directory_descriptor)
+
+
+def _restore_auth_destination(
+    filename: str,
+    directory_descriptor: int,
+    previous: tuple[bytes, int] | None,
+) -> None:
+    if previous is None:
+        os.unlink(filename, dir_fd=directory_descriptor)
+        os.fsync(directory_descriptor)
+        return
+
+    content, mode = previous
+    descriptor = -1
+    temporary_name: str | None = None
+    primary_error: BaseException | None = None
+    try:
+        descriptor, temporary_name = _create_auth_temp(filename, directory_descriptor)
+        os.fchmod(descriptor, mode)
+        auth_file = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with auth_file:
+            auth_file.write(content)
+            auth_file.flush()
+            os.fsync(auth_file.fileno())
+        _validate_auth_destination(Path(filename), directory_descriptor)
+        os.replace(
+            temporary_name,
+            filename,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        temporary_name = None
+        os.fsync(directory_descriptor)
+    except BaseException as error:
+        primary_error = error
+
+    cleanup_error = None
+    if descriptor >= 0:
+        os.close(descriptor)
+    if temporary_name is not None:
+        cleanup_error = _cleanup_auth_temp(temporary_name, directory_descriptor)
+    if primary_error is not None:
+        if cleanup_error is not None:
+            raise RuntimeError(
+                f"{primary_error}; auth rollback temporary cleanup also failed: {cleanup_error}"
+            ) from primary_error
+        raise primary_error.with_traceback(primary_error.__traceback__)
+    if cleanup_error is not None:
+        raise cleanup_error
+
+
+def _cleanup_auth_temp(temporary_name: str, directory_descriptor: int) -> BaseException | None:
+    try:
+        os.unlink(temporary_name, dir_fd=directory_descriptor)
+    except FileNotFoundError:
+        return None
+    except BaseException as error:
+        return error
+    return None
 
 
 def read_dashboard_auth(project_root: Path) -> DashboardAuth:
@@ -615,10 +866,8 @@ def _render_gitignore(project_root: Path) -> str:
         ".symphonz/workspace/",
         ".symphonz/auth.toml",
     ]
-    updated = existing[:]
-    for item in additions:
-        if item not in updated:
-            updated.append(item)
+    updated = [line for line in existing if line not in additions]
+    updated.extend(additions)
     return "\n".join(updated).rstrip() + "\n"
 
 
@@ -731,6 +980,7 @@ def configure_dashboard(
 
     environ = os.environ if environ is None else environ
     content = config_path.read_text()
+    classify_dashboard_config(content)
     _dashboard_section_bounds(content.splitlines(keepends=True))
     current = _parse_config(content).get("dashboard", {})
     resolved_host = (host if host is not None else current.get("host", DEFAULT_DASHBOARD_HOST)).strip()

@@ -4,7 +4,7 @@ from pathlib import Path
 import os
 import shlex
 
-from symphonz.install import read_config
+from symphonz.install import read_installed_config
 
 
 def _dashboard_values(
@@ -60,9 +60,9 @@ def build_run_command(
     host: str | None = None,
     port: int | None = None,
 ) -> tuple[list[str], dict[str, str]]:
-    config = read_config(project_root / ".symphonz" / "config.toml")
+    config, dashboard_mode = read_installed_config(project_root / ".symphonz" / "config.toml")
     command = ["symphonz", "service", ".symphonz/WORKFLOW.md", "--logs-root", config["logs"]["root"]]
-    if "dashboard" in config:
+    if dashboard_mode == "configured":
         dashboard_values = _dashboard_values(config, host, port)
         _extend_dashboard_command(command, *dashboard_values)
     else:
@@ -97,8 +97,8 @@ def run_installed(
 
     from symphonz.service.runner import run_service
 
-    config = read_config(root / ".symphonz" / "config.toml")
-    legacy_unauthenticated_dashboard = "dashboard" not in config and port is not None
+    config, dashboard_mode = read_installed_config(root / ".symphonz" / "config.toml")
+    legacy_unauthenticated_dashboard = dashboard_mode == "legacy" and port is not None
     dashboard_host, dashboard_port, public_base_url, dashboard_username, session_days = (
         _dashboard_values(config, host, port)
     )

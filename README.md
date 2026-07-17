@@ -75,7 +75,7 @@ Configured host and port are used by `symphonz run`. `--host` and `--port` tempo
 symphonz run --host 127.0.0.1 --port 4100
 ```
 
-Report links always use `public_base_url`, even when a temporary port differs; startup warns about that mismatch. Legacy configs without `[dashboard]` retain the existing explicit `symphonz run --port 4000` flow through a temporary migration bridge. That bridge is unauthenticated, requires an explicit port, and is restricted to a loopback bind; wildcard and LAN hosts are rejected. Configs containing `[dashboard]` never use the bridge and always require `auth.toml`. Run `symphonz configure-dashboard` promptly to remove the legacy exception and enable authentication.
+Report links always use `public_base_url`, even when a temporary port differs; startup warns about that mismatch. Configs matching the generated pre-0.4 layout exactly retain the existing explicit `symphonz run --port 4000` flow through a temporary migration bridge. That bridge is unauthenticated, requires an explicit port, and is restricted to a loopback bind; wildcard and LAN hosts are rejected. Configured, modified, or ambiguous files never use the bridge: dashboard configurations require `auth.toml`, while other noncanonical files fail closed with instructions to run `symphonz configure-dashboard`. Run that command promptly to remove the legacy exception and enable authentication.
 
 ## Workflow
 

@@ -183,3 +183,45 @@ messages while the complete suite exited successfully.
 9. `./bin/symphonz version`: PASS, exact output `symphonz 0.4.0`.
 10. `sh -n install.sh` and `git diff --check`: PASS.
 11. Changed-file scope check: PASS; `docs/index.html` is unchanged.
+
+## Re-review Fixes
+
+- Replaced the dictionary-presence legacy decision with a shared conservative
+  classifier. Only the exact generated pre-0.4 table/key layout can activate
+  the loopback bridge. Semantic quoted dashboard roots, including Unicode
+  basic-key escapes, remain configured and authenticated; dotted/implicit,
+  array-table, duplicate, modified, and otherwise ambiguous shapes fail closed
+  with `configure-dashboard` guidance.
+- Made auth replacement transactional across the post-replace directory fsync.
+  The pinned auth directory now snapshots the prior bytes and mode, restores
+  them atomically after a durability failure, or removes a newly created auth
+  file when no prior state existed. Commit and rollback failures are both
+  surfaced, while the original commit failure remains the exception cause.
+- Made temporary cleanup failures secondary to write/replace failures for both
+  secret and non-secret atomic writers.
+- Re-rendered the four protected `.symphonz` ignore patterns as the final
+  matching rules on every update. Existing copies are removed first, making
+  the result idempotent and preventing earlier negations from winning.
+
+### Re-review TDD and Validation
+
+1. Classifier RED tests reproduced unauthenticated legacy activation for
+   `["dash\\u0062oard"]`, dotted/implicit dashboard tables, dashboard array
+   tables, and modified no-dashboard configs. Focused GREEN plus surrounding
+   config/runtime tests: PASS, 37 tests.
+2. Auth RED tests proved post-replace fsync failure retained the rotated auth,
+   configure restored only config, and cleanup could mask replace failure.
+   Focused GREEN: PASS, 8 auth transaction tests and 7 combined durability and
+   cleanup tests.
+3. A real `git init` + `git check-ignore -q` RED test showed trailing
+   negations overriding all four protected paths. GREEN confirms auth,
+   artifacts, logs, and workspace files are effectively ignored and a second
+   render is byte-identical.
+4. Complete CLI and service modules: PASS, 208 tests in 16.086s.
+5. Dashboard non-socket handler, startup, and template suites: PASS, 10 tests.
+6. Python 3.9-compatible `py_compile`, `symphonz 0.4.0`, `sh -n
+   install.sh`, and `git diff --check`: PASS.
+7. Added production/report lines contain no local paths, personal endpoints, or
+   plaintext test passwords. Test-only password fixtures remain confined to
+   the injected failure cases.
+8. `docs/index.html` remains intentionally deferred and unchanged.
