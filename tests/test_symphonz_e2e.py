@@ -1,21 +1,35 @@
 from __future__ import annotations
 
+from http.client import HTTPConnection
 from pathlib import Path
+from urllib.parse import urlencode
 import json
 import os
 import re
 import signal
+import socket
+import stat
 import subprocess
 import tempfile
 import time
 import unittest
+
+from symphonz.service.runtime_store import RuntimeStore
+
+
+DASHBOARD_USERNAME = "admin"
+DASHBOARD_PASSWORD = "local-e2e-dashboard-password"
+REPORT_HEADING = "## Symphonz Implementation Report"
+WORKPAD_HEADING = "## Symphonz Workpad"
 
 
 class StatefulLinearFixture:
     def __init__(self, root: Path):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
+        self._failed_report_creates = 0
         self.set_state("Todo")
+        self.set_report_sync_success(False)
 
     @property
     def url(self) -> str:
@@ -32,11 +46,77 @@ class StatefulLinearFixture:
             return []
         return [json.loads(line) for line in path.read_text().splitlines() if line]
 
+    @property
+    def report_comments(self) -> dict[str, str]:
+        comment = ""
+        create_index = 0
+        for request in self.requests:
+            operation = request["operation"]
+            if operation == "SymphonzCreateReportComment":
+                create_index += 1
+                if create_index <= self._failed_report_creates:
+                    continue
+                comment = request["variables"]["input"]["body"]
+            elif operation == "SymphonzUpdateReportComment":
+                comment = request["variables"]["input"]["body"]
+        return {"issue-1": comment} if comment else {}
+
+    @property
+    def workpad_comments(self) -> dict[str, str]:
+        comment = ""
+        for request in self.requests:
+            if request["operation"] in {"SymphonzCreateWorkpadComment", "SymphonzUpdateWorkpadComment"}:
+                comment = request["variables"]["input"]["body"]
+        return {"issue-1": comment} if comment else {}
+
     def set_state(self, state: str) -> None:
         payload = {"issue": self.issue(state)}
         temporary = self.root / ".actor-state.tmp"
         temporary.write_text(json.dumps(payload))
         temporary.replace(self.root / "state.json")
+
+    def set_report_sync_success(self, success: bool) -> None:
+        if success:
+            self._failed_report_creates = sum(
+                request["operation"] == "SymphonzCreateReportComment" for request in self.requests
+            )
+        responses = {
+            "SymphonzCreateWorkpadComment": {
+                "data": {"commentCreate": {"success": True, "comment": {"id": "workpad-QA-1"}}}
+            },
+            "SymphonzUpdateWorkpadComment": {
+                "data": {"commentUpdate": {"success": True, "comment": {"id": "workpad-QA-1"}}}
+            },
+            "SymphonzFindReportComment": {
+                "data": {
+                    "issue": {
+                        "comments": {
+                            "nodes": [],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            },
+            "SymphonzCreateReportComment": {
+                "data": {
+                    "commentCreate": {
+                        "success": success,
+                        "comment": {"id": "report-comment-QA-1"},
+                    }
+                }
+            },
+            "SymphonzUpdateReportComment": {
+                "data": {
+                    "commentUpdate": {
+                        "success": success,
+                        "comment": {"id": "report-comment-QA-1"},
+                    }
+                }
+            },
+        }
+        temporary = self.root / ".responses.tmp"
+        temporary.write_text(json.dumps(responses))
+        temporary.replace(self.root / "responses.json")
 
     @staticmethod
     def issue(state: str) -> dict:
@@ -57,87 +137,238 @@ class StatefulLinearFixture:
 
 
 class InstalledCliE2ETests(unittest.TestCase):
-    def test_one_service_process_drives_stateful_linear_and_terminal_cleanup(self):
+    def test_installed_service_persists_report_restart_auth_and_terminal_cleanup(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             prefix = root / "prefix"
             project = root / "project"
             project.mkdir()
             fixture = StatefulLinearFixture(root / "fake-linear")
-            self.install_cli_and_project(prefix, project)
+            port = self.free_port()
+            public_base_url = f"http://127.0.0.1:{port}"
+            self.install_cli_and_project(prefix, project, port, public_base_url)
+
+            auth_path = project / ".symphonz" / "auth.toml"
+            self.assertTrue(auth_path.is_file())
+            self.assertEqual(stat.S_IMODE(auth_path.stat().st_mode), 0o600)
+            config = (project / ".symphonz" / "config.toml").read_text()
+            self.assertIn(f'port = "{port}"', config)
+            self.assertIn(f'public_base_url = "{public_base_url}"', config)
+            self.assertNotIn(DASHBOARD_PASSWORD, config)
 
             audit_path = root / "codex-audit.jsonl"
+            protocol_path = root / "codex-protocol.jsonl"
             provider_path = root / "provider-records.jsonl"
+            leak_path = root / "codex-child-leaked.txt"
+            report_retry_path = root / "allow-report-retry"
             fake_codex = root / "fake_codex.py"
-            fake_codex.write_text(fake_codex_source(audit_path, provider_path))
+            fake_codex.write_text(
+                fake_codex_source(
+                    audit_path,
+                    protocol_path,
+                    provider_path,
+                    leak_path,
+                    report_retry_path,
+                    public_base_url,
+                )
+            )
             self.configure_workflow(project, fake_codex)
             env = os.environ.copy()
             env.update({"LINEAR_API_KEY": "fake-linear-key", "SYMPHONZ_LINEAR_ENDPOINT": fixture.url})
 
-            service = subprocess.Popen(
-                [
-                    str(prefix / "bin" / "symphonz"),
-                    "service",
-                    ".symphonz/WORKFLOW.md",
-                    "--logs-root",
-                    ".symphonz/logs",
-                ],
-                cwd=project,
-                env=env,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
+            workspace = project / ".symphonz" / "workspace" / "QA-1"
+            runtime_db = project / ".symphonz" / "logs" / "runtime.sqlite3"
+            artifacts = project / ".symphonz" / "artifacts" / "QA-1"
+
+            first_service = self.start_service(prefix, project, env, port)
             try:
                 self.wait_for(lambda: fixture.state_name == "In Progress", "Todo mutation")
-                fixture.set_state("Ready to Publish")
-                self.wait_for(
-                    lambda: fixture.state_name == "Human Review" and self.mutation_count(fixture) >= 2,
-                    "publication mutation",
-                )
-                fixture.set_state("Rework")
-                self.wait_for(
-                    lambda: fixture.state_name == "Human Review" and self.mutation_count(fixture) >= 3,
-                    "rework mutation",
-                )
-
-                workspace = project / ".symphonz" / "workspace" / "QA-1"
                 self.assertTrue(workspace.exists())
                 self.assertEqual((workspace / "workpad-id.txt").read_text(), "workpad-QA-1")
                 self.assertEqual((workspace / "branch.txt").read_text(), "symphonz/QA-1-sandbox-quality-run")
-                self.assertEqual((workspace / "review.txt").read_text(), "https://github.local/pull/42")
+
+                fixture.set_state("Ready to Publish")
+                self.wait_for(
+                    lambda: RuntimeStore(runtime_db).get_report("QA-1")["linear_sync_status"] == "pending",
+                    "pending report sync",
+                )
+                self.assertEqual(fixture.state_name, "Ready to Publish")
+                report = RuntimeStore(runtime_db).get_report("QA-1")
+                report_path = artifacts / report["html_path"]
+                self.assertTrue(report_path.is_file())
+                self.assertIn("Initial QA implementation report", report_path.read_text())
+
+                unauthenticated = self.http_request(port, "GET", "/issues/QA-1/report")
+                self.assertEqual(unauthenticated[0], 303)
+                self.assertEqual(
+                    unauthenticated[1]["Location"],
+                    "/login?next=%2Fissues%2FQA-1%2Freport",
+                )
+                login = self.http_request(
+                    port,
+                    "POST",
+                    "/login",
+                    body=urlencode(
+                        {
+                            "username": DASHBOARD_USERNAME,
+                            "password": DASHBOARD_PASSWORD,
+                            "next": "/issues/QA-1/report",
+                        }
+                    ),
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+                self.assertEqual(login[0], 303)
+                session_cookie = login[1]["Set-Cookie"].split(";", 1)[0]
+                self.assertIn("symphonz_session=", session_cookie)
+                authenticated_report = self.http_request(
+                    port,
+                    "GET",
+                    "/issues/QA-1/report",
+                    headers={"Cookie": session_cookie},
+                )
+                self.assertEqual(authenticated_report[0], 200)
+                self.assertIn("Initial QA implementation report", authenticated_report[2])
+
+                pending_errors = RuntimeStore(runtime_db).list_errors(
+                    issue_identifier="QA-1",
+                    stage="report_sync",
+                    resolved=False,
+                )["items"]
+                self.assertEqual(len(pending_errors), 1)
+                self.assertIn("commentCreate", pending_errors[0]["message"])
+                self.assertIn(
+                    "report_sync",
+                    (project / ".symphonz" / "logs" / "errors.jsonl").read_text(),
+                )
+
+                fixture.set_report_sync_success(True)
+                report_retry_path.write_text("retry")
+                self.wait_for(lambda: fixture.state_name == "Human Review", "publication mutation")
+                self.wait_for(
+                    lambda: RuntimeStore(runtime_db).get_report("QA-1")["linear_sync_status"] == "synced",
+                    "report sync recovery",
+                )
+            finally:
+                self.stop_service(first_service)
+
+            persisted = RuntimeStore(runtime_db)
+            published = persisted.get_report("QA-1")
+            self.assertEqual(published["linear_sync_status"], "synced")
+            self.assertEqual(persisted.list_tasks(query="QA-1")["items"][0]["report_url"], f"{public_base_url}/issues/QA-1/report")
+            resolved_errors = persisted.list_errors(
+                issue_identifier="QA-1",
+                stage="report_sync",
+                resolved=True,
+            )["items"]
+            self.assertEqual(len(resolved_errors), 1)
+            self.assertEqual(resolved_errors[0]["resolving_event"], "report_sync_succeeded")
+
+            second_service = self.start_service(prefix, project, env, port)
+            try:
+                report_page = self.http_request(
+                    port,
+                    "GET",
+                    "/issues/QA-1/report",
+                    headers={"Cookie": session_cookie},
+                )
+                self.assertEqual(report_page[0], 200)
+                self.assertIn("Initial QA implementation report", report_page[2])
+                self.assertIn("https://github.local/pull/42", report_page[2])
+                task_page = self.http_request(port, "GET", "/tasks", headers={"Cookie": session_cookie})
+                self.assertEqual(task_page[0], 200)
+                self.assertIn("QA-1", task_page[2])
+
+                fixture.set_state("Rework")
+                self.wait_for(
+                    lambda: fixture.state_name == "Human Review" and self.report_update_count(fixture) == 1,
+                    "rework report update",
+                )
+                self.wait_for(
+                    lambda: "Rework validation incorporated" in fixture.report_comments.get("issue-1", ""),
+                    "runtime-owned report comment update",
+                )
 
                 fixture.set_state("Merging")
                 self.wait_for(lambda: fixture.state_name == "Done", "merge mutation")
                 self.wait_for(lambda: not workspace.exists(), "terminal workspace cleanup")
+                self.wait_for(
+                    lambda: "workspace_removed"
+                    in {
+                        event["type"]
+                        for event in RuntimeStore(runtime_db).list_events(
+                            issue_identifier="QA-1", limit=200
+                        )["items"]
+                    },
+                    "persisted terminal cleanup",
+                )
+                surviving_report_page = self.http_request(
+                    port,
+                    "GET",
+                    "/issues/QA-1/report",
+                    headers={"Cookie": session_cookie},
+                )
+                self.assertEqual(surviving_report_page[0], 200)
+                self.assertIn("Rework validation incorporated", surviving_report_page[2])
             finally:
-                if service.poll() is None:
-                    service.send_signal(signal.SIGINT)
-                stdout, stderr = service.communicate(timeout=8)
-            self.assertEqual(service.returncode, 0, f"stdout:\n{stdout}\nstderr:\n{stderr}")
+                self.stop_service(second_service)
+
+            final_store = RuntimeStore(runtime_db)
+            final_report = final_store.get_report("QA-1")
+            final_report_path = artifacts / final_report["html_path"]
+            final_report_json = artifacts / final_report["json_path"]
+            self.assertTrue(final_report_path.is_file())
+            self.assertTrue(final_report_json.is_file())
+            self.assertIn("Rework validation incorporated", final_report_path.read_text())
+            self.assertFalse(workspace.exists())
+
+            tasks = final_store.list_tasks(query="QA-1")["items"]
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0]["linear_state"], "Done")
+            self.assertEqual(tasks[0]["workspace_cleanup_status"], "removed")
+            self.assertEqual(tasks[0]["review_url"], "https://github.local/pull/42")
+            self.assertEqual(tasks[0]["report_url"], f"{public_base_url}/issues/QA-1/report")
+            event_types = {event["type"] for event in final_store.list_events(issue_identifier="QA-1", limit=200)["items"]}
+            self.assertTrue({"issue_started", "codex_event", "workspace_removed"}.issubset(event_types))
+            resolved_errors = final_store.list_errors(issue_identifier="QA-1", stage="report_sync", resolved=True)["items"]
+            self.assertEqual(len(resolved_errors), 1)
+            self.assertEqual(resolved_errors[0]["resolving_event"], "report_sync_succeeded")
+
+            self.assertEqual(fixture.report_comments["issue-1"].count(REPORT_HEADING), 1)
+            self.assertIn(f"Report: {public_base_url}/issues/QA-1/report", fixture.report_comments["issue-1"])
+            self.assertIn("Review: ", fixture.report_comments["issue-1"])
+            self.assertIn("github.local/pull/42", fixture.report_comments["issue-1"])
+            self.assertEqual(fixture.workpad_comments["issue-1"].count(WORKPAD_HEADING), 1)
+            self.assertIn("State: Done", fixture.workpad_comments["issue-1"])
 
             audit = [json.loads(line) for line in audit_path.read_text().splitlines()]
             self.assertEqual([entry["state"] for entry in audit], ["Todo", "Ready to Publish", "Rework", "Merging"])
-            self.assertEqual({entry["workpad"] for entry in audit}, {"workpad-QA-1"})
             self.assertEqual({entry["branch"] for entry in audit}, {"symphonz/QA-1-sandbox-quality-run"})
             self.assertEqual({entry["review"] for entry in audit}, {"https://github.local/pull/42"})
             self.assertEqual(len({entry["process_id"] for entry in audit}), 4)
+            for entry in audit:
+                self.assert_process_gone(entry["process_id"])
+                self.assert_process_gone(entry["child_process_id"])
+            time.sleep(1.1)
+            self.assertFalse(leak_path.exists(), "Codex descendant survived process-group cleanup")
+
+            protocol = protocol_path.read_text().splitlines()
+            self.assertEqual(
+                protocol,
+                ["initialize", "initialized", "thread/start", "turn/start"] * 4,
+            )
 
             provider = [json.loads(line) for line in provider_path.read_text().splitlines()]
             self.assertEqual([record["action"] for record in provider], ["pull_request", "merge"])
-            self.assertEqual({record["branch"] for record in provider}, {"symphonz/QA-1-sandbox-quality-run"})
-
             mutations = [request for request in fixture.requests if request["operation"] == "SymphonzSetState"]
             self.assertEqual(
                 [mutation["variables"]["stateName"] for mutation in mutations],
                 ["In Progress", "Human Review", "Human Review", "Done"],
             )
             self.assertTrue(all(request["authorization"] == "fake-linear-key" for request in fixture.requests))
-            log = project / ".symphonz" / "logs" / "runtime.jsonl"
-            self.assertIn("workspace_removed", log.read_text())
-            self.assertIn("issue_continuing", log.read_text())
+            runtime_log = project / ".symphonz" / "logs" / "runtime.jsonl"
+            self.assertGreaterEqual(runtime_log.read_text().count('"type": "service_started"'), 2)
 
-    def install_cli_and_project(self, prefix: Path, project: Path) -> None:
+    def install_cli_and_project(self, prefix: Path, project: Path, port: int, public_base_url: str) -> None:
         install = subprocess.run(
             ["sh", "install.sh", "--prefix", str(prefix), "--source", str(Path.cwd())],
             text=True,
@@ -152,6 +383,14 @@ class InstalledCliE2ETests(unittest.TestCase):
             cwd=project,
             check=True,
         )
+        install_env = os.environ.copy()
+        install_env.update(
+            {
+                "SYMPHONZ_DASHBOARD_PASSWORD": DASHBOARD_PASSWORD,
+                "SYMPHONZ_DASHBOARD_PORT": str(port),
+                "SYMPHONZ_DASHBOARD_PUBLIC_BASE_URL": public_base_url,
+            }
+        )
         project_install = subprocess.run(
             [
                 str(prefix / "bin" / "symphonz"),
@@ -164,6 +403,7 @@ class InstalledCliE2ETests(unittest.TestCase):
                 "github",
             ],
             cwd=project,
+            env=install_env,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -186,64 +426,240 @@ class InstalledCliE2ETests(unittest.TestCase):
         content = re.sub(r"  command: .* app-server", f"  command: python3 {fake_codex}", content, count=1)
         workflow.write_text(content)
 
-    def mutation_count(self, fixture: StatefulLinearFixture) -> int:
-        return sum(request["operation"] == "SymphonzSetState" for request in fixture.requests)
+    def start_service(self, prefix: Path, project: Path, env: dict[str, str], port: int) -> subprocess.Popen:
+        service = subprocess.Popen(
+            [str(prefix / "bin" / "symphonz"), "run"],
+            cwd=project,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            self.wait_for(lambda: self.http_request(port, "GET", "/healthz")[0] == 200, "dashboard health")
+        except BaseException:
+            self.stop_service(service)
+            raise
+        return service
 
-    def wait_for(self, predicate, label: str, timeout: float = 12) -> None:
+    def stop_service(self, service: subprocess.Popen) -> None:
+        if service.poll() is None:
+            service.send_signal(signal.SIGINT)
+        stdout, stderr = service.communicate(timeout=12)
+        self.assertEqual(service.returncode, 0, f"stdout:\n{stdout}\nstderr:\n{stderr}")
+
+    def http_request(
+        self,
+        port: int,
+        method: str,
+        path: str,
+        *,
+        body: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, dict[str, str], str]:
+        connection = HTTPConnection("127.0.0.1", port, timeout=2)
+        try:
+            connection.request(method, path, body=body, headers=headers or {})
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read().decode("utf-8")
+        finally:
+            connection.close()
+
+    def report_update_count(self, fixture: StatefulLinearFixture) -> int:
+        return sum(request["operation"] == "SymphonzUpdateReportComment" for request in fixture.requests)
+
+    def wait_for(self, predicate, label: str, timeout: float = 16) -> None:
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
                 if predicate():
                     return
-            except (FileNotFoundError, json.JSONDecodeError):
+            except (ConnectionError, FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
                 pass
             time.sleep(0.05)
         self.fail(f"Timed out waiting for {label}")
 
+    def assert_process_gone(self, process_id: int) -> None:
+        if os.name != "posix":
+            return
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            try:
+                os.kill(process_id, 0)
+            except ProcessLookupError:
+                return
+            except PermissionError:
+                self.fail(f"Process {process_id} still exists but cannot be inspected")
+            time.sleep(0.05)
+        self.fail(f"Process {process_id} is still alive")
 
-def fake_codex_source(audit_path: Path, provider_path: Path) -> str:
-    return f'''import json
-import os
-import pathlib
-import re
-import sys
+    @staticmethod
+    def free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            return int(listener.getsockname()[1])
 
-audit_path = pathlib.Path({str(audit_path)!r})
-provider_path = pathlib.Path({str(provider_path)!r})
+
+def fake_codex_source(
+    audit_path: Path,
+    protocol_path: Path,
+    provider_path: Path,
+    leak_path: Path,
+    report_retry_path: Path,
+    public_base_url: str,
+) -> str:
+    prefix = (
+        "import json\n"
+        "import os\n"
+        "import pathlib\n"
+        "import re\n"
+        "import subprocess\n"
+        "import sys\n"
+        "import time\n"
+        f"audit_path = pathlib.Path({str(audit_path)!r})\n"
+        f"protocol_path = pathlib.Path({str(protocol_path)!r})\n"
+        f"provider_path = pathlib.Path({str(provider_path)!r})\n"
+        f"leak_path = pathlib.Path({str(leak_path)!r})\n"
+        f"report_retry_path = pathlib.Path({str(report_retry_path)!r})\n"
+        f"public_base_url = {public_base_url!r}\n"
+    )
+    return prefix + r'''
+child_code = "import pathlib,sys,time; time.sleep(1); pathlib.Path(sys.argv[1]).write_text('leaked')"
+child = subprocess.Popen([sys.executable, "-c", child_code, str(leak_path)])
 pending = None
+actions = []
+state = None
+next_tool_id = 900
+
+
+def report_payload(summary):
+    return {
+        "operation": "publish",
+        "issue_id": "issue-1",
+        "issue_identifier": "QA-1",
+        "title": "Sandbox quality run",
+        "summary": summary,
+        "goal": "Verify the installed Symphonz lifecycle without external services.",
+        "scope": "Fake Linear, fake Codex, report publication, restart, auth, and cleanup.",
+        "architecture": {
+            "nodes": [
+                {"id": "codex", "label": "Fake Codex", "description": "Issues dynamic tool calls."},
+                {"id": "runtime", "label": "Symphonz Runtime", "description": "Persists and publishes."},
+            ],
+            "edges": [{"from": "codex", "to": "runtime", "label": "symphonz_report"}],
+        },
+        "implementation": ["Drive the complete deterministic lifecycle through local fakes."],
+        "decisions": [
+            {
+                "decision": "Use local deterministic fixtures.",
+                "rationale": "The E2E must not use real credentials or network services.",
+                "alternatives": ["Live Linear and GitHub"],
+                "tradeoffs": ["Provider behavior is simulated."],
+            }
+        ],
+        "changed_files": ["tests/test_symphonz_e2e.py"],
+        "validation": [
+            {"command": "python3 -m unittest tests.test_symphonz_e2e", "result": "passed", "evidence": "Deterministic local flow."}
+        ],
+        "risks": ["Socket creation can be restricted by a test sandbox."],
+        "follow_ups": ["Controller performs browser visual QA."],
+        "review": {
+            "provider": "github",
+            "url": "https://github.local/pull/42",
+            "branch": "symphonz/QA-1-sandbox-quality-run",
+            "commit": "a13c9f2",
+            "target": "main",
+        },
+    }
+
+
+def graphql_action(operation, body, *, create=False):
+    mutation = "commentCreate(input: $input)" if create else "commentUpdate(id: $id, input: $input)"
+    declaration = "$input: CommentCreateInput!" if create else "$id: String!, $input: CommentUpdateInput!"
+    variables = {"input": {"issueId": "issue-1", "body": body}} if create else {"id": "workpad-QA-1", "input": {"body": body}}
+    return (
+        "linear_graphql",
+        {"query": f"mutation {operation}({declaration}) {{ {mutation} {{ success comment {{ id }} }} }}", "variables": variables},
+    )
+
+
+def state_action(target):
+    query = "mutation SymphonzSetState($issueId: String!, $stateName: String!) { issueUpdate(id: $issueId, input: {stateName: $stateName}) { success } }"
+    return "linear_graphql", {"query": query, "variables": {"issueId": "issue-1", "stateName": target}}
+
+
+def send_next():
+    global pending, next_tool_id
+    if actions:
+        tool, arguments = actions.pop(0)
+        pending = {"id": next_tool_id, "tool": tool}
+        next_tool_id += 1
+        print(json.dumps({"jsonrpc": "2.0", "id": pending["id"], "method": "item/tool/call", "params": {"tool": tool, "arguments": arguments}}), flush=True)
+        return
+    pending = None
+    print(json.dumps({"method": "turn/completed", "params": {"usage": {"totalTokens": 17}}}), flush=True)
+
+
 for line in sys.stdin:
     msg = json.loads(line)
     method = msg.get("method")
+    if method:
+        with protocol_path.open("a") as protocol:
+            protocol.write(method + "\n")
     if method == "initialize":
-        print(json.dumps({{"id": msg["id"], "result": {{}}}}), flush=True)
+        print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
     elif method == "thread/start":
-        tools = msg.get("params", {{}}).get("dynamicTools", [])
-        if not any(tool.get("name") == "linear_graphql" for tool in tools):
-            raise SystemExit("linear_graphql was not advertised")
-        print(json.dumps({{"id": msg["id"], "result": {{"thread": {{"id": "thread-QA-1"}}}}}}), flush=True)
+        tools = {tool.get("name") for tool in msg.get("params", {}).get("dynamicTools", [])}
+        if tools != {"linear_graphql", "symphonz_report"}:
+            raise SystemExit(f"unexpected dynamic tools: {tools}")
+        print(json.dumps({"id": msg["id"], "result": {"thread": {"id": "thread-QA-1"}}}), flush=True)
     elif method == "turn/start":
         prompt = msg["params"]["input"][0]["text"]
         state = re.search(r"Current status: (.+)", prompt).group(1).strip()
-        target = {{"Todo": "In Progress", "Ready to Publish": "Human Review", "Rework": "Human Review", "Merging": "Done"}}[state]
+        target = {"Todo": "In Progress", "Ready to Publish": "Human Review", "Rework": "Human Review", "Merging": "Done"}[state]
         branch = "symphonz/QA-1-sandbox-quality-run"
         review = "https://github.local/pull/42"
         pathlib.Path("workpad-id.txt").write_text("workpad-QA-1")
         pathlib.Path("branch.txt").write_text(branch)
         pathlib.Path("review.txt").write_text(review)
-        if state in {{"Ready to Publish", "Merging"}}:
+        if state in {"Ready to Publish", "Merging"}:
             with provider_path.open("a") as provider:
-                provider.write(json.dumps({{"action": "pull_request" if state == "Ready to Publish" else "merge", "branch": branch, "review": review}}) + "\\n")
+                provider.write(json.dumps({"action": "pull_request" if state == "Ready to Publish" else "merge", "branch": branch, "review": review}) + "\n")
         with audit_path.open("a") as audit:
-            audit.write(json.dumps({{"state": state, "target": target, "workpad": "workpad-QA-1", "branch": branch, "review": review, "process_id": os.getpid()}}) + "\\n")
-        print(json.dumps({{"id": msg["id"], "result": {{"turn": {{"id": "turn-" + state.replace(" ", "-")}}}}}}), flush=True)
-        pending = 900
-        query = "mutation SymphonzSetState($issueId: String!, $stateName: String!) {{ issueUpdate(id: $issueId, input: {{stateName: $stateName}}) {{ success }} }}"
-        print(json.dumps({{"jsonrpc": "2.0", "id": pending, "method": "item/tool/call", "params": {{"tool": "linear_graphql", "arguments": {{"query": query, "variables": {{"issueId": "issue-1", "stateName": target}}}}}}}}), flush=True)
-    elif pending is not None and msg.get("id") == pending:
-        if not msg.get("result", {{}}).get("success"):
-            raise SystemExit("linear_graphql failed")
-        pending = None
-        print(json.dumps({{"method": "turn/completed", "params": {{"usage": {{"totalTokens": 7}}}}}}), flush=True)
+            audit.write(json.dumps({"state": state, "target": target, "workpad": "workpad-QA-1", "branch": branch, "review": review, "process_id": os.getpid(), "child_process_id": child.pid}) + "\n")
+        print(json.dumps({"id": msg["id"], "result": {"turn": {"id": "turn-" + state.replace(" ", "-")}}}), flush=True)
+
+        workpad = "\n".join([
+            "## Symphonz Workpad",
+            "",
+            f"State: {target}",
+            f"Branch: {branch}",
+            f"Review: {review if state != 'Todo' else 'pending'}",
+            f"Report: {public_base_url}/issues/QA-1/report" if state != "Todo" else "Report: pending",
+        ])
+        actions = []
+        if state == "Todo":
+            actions.append(graphql_action("SymphonzCreateWorkpadComment", workpad, create=True))
+        else:
+            actions.append(graphql_action("SymphonzUpdateWorkpadComment", workpad))
+        if state == "Ready to Publish":
+            actions.insert(0, ("symphonz_report", report_payload("Initial QA implementation report")))
+        elif state == "Rework":
+            actions.insert(0, ("symphonz_report", report_payload("Rework validation incorporated")))
+        actions.append(state_action(target))
+        send_next()
+    elif pending is not None and msg.get("id") == pending["id"]:
+        if not msg.get("result", {}).get("success"):
+            raise SystemExit(f"{pending['tool']} failed: {msg}")
+        tool_output = json.loads(msg["result"].get("output", "{}"))
+        if pending["tool"] == "symphonz_report" and tool_output.get("linear_sync_status") == "pending":
+            deadline = time.time() + 12
+            while not report_retry_path.exists() and time.time() < deadline:
+                time.sleep(0.02)
+            if not report_retry_path.exists():
+                raise SystemExit("report retry was not released")
+            actions.insert(0, ("symphonz_report", report_payload("Initial QA implementation report")))
+        send_next()
 '''
 
 

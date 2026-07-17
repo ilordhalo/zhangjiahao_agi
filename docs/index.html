@@ -3,39 +3,36 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="面向开发者的 Symphonz 服务机制说明：Linear 监听、Codex 触发、Issue Workspace 与代码发布链路。">
-  <title>Symphonz 服务机制</title>
+  <meta name="description" content="Symphonz 0.4.0 中文开发者指南：Linear 调度、Codex app-server、结构化报告、运行历史与 Dashboard 认证。">
+  <title>Symphonz 0.4.0 开发者指南</title>
   <style>
     :root {
       color-scheme: light;
       --page: #f7f8fa;
       --surface: #ffffff;
-      --surface-subtle: #fafbfc;
-      --ink: #181a1f;
-      --ink-soft: #3f4652;
-      --muted: #697180;
-      --faint: #626c7b;
-      --line: #e1e4e9;
-      --line-strong: #cfd4dc;
+      --surface-muted: #f1f3f6;
+      --ink: #202124;
+      --ink-soft: #3e434c;
+      --muted: #68707d;
+      --line: #dfe3e8;
+      --line-strong: #c7cdd6;
       --accent: #5e6ad2;
-      --accent-strong: #4b56bd;
-      --accent-soft: #eef0ff;
-      --green: #16825d;
-      --green-soft: #eaf7f1;
-      --amber: #9b6015;
-      --amber-soft: #fff4df;
-      --red: #bd3c34;
-      --red-soft: #fff0ef;
-      --blue: #2765d7;
+      --accent-soft: #eff0ff;
+      --green: #18794e;
+      --green-soft: #eaf7f0;
+      --amber: #946200;
+      --amber-soft: #fff5dc;
+      --red: #b42318;
+      --red-soft: #fff0ee;
+      --blue: #2463c7;
       --blue-soft: #edf4ff;
-      --code: #1f232b;
-      --code-line: #363c47;
-      --shadow: 0 1px 2px rgba(16, 24, 40, .04);
-      --max-width: 1180px;
+      --code: #242830;
+      --code-muted: #aeb6c3;
+      --max: 1180px;
     }
 
     * { box-sizing: border-box; }
-    html { scroll-behavior: smooth; scroll-padding-top: 76px; }
+    html { scroll-behavior: smooth; scroll-padding-top: 72px; }
     body {
       margin: 0;
       background: var(--page);
@@ -44,1093 +41,266 @@
       font-size: 15px;
       line-height: 1.65;
     }
-    button, a { font: inherit; }
+    button, input { font: inherit; }
     button { color: inherit; }
     a { color: inherit; text-decoration: none; }
     h1, h2, h3, p, pre { margin: 0; }
-    code, pre, .mono {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-    }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
     code {
       border: 1px solid var(--line);
       border-radius: 4px;
-      background: var(--surface-subtle);
+      background: var(--surface-muted);
       padding: 1px 5px;
-      color: var(--ink-soft);
+      overflow-wrap: anywhere;
       font-size: .9em;
+    }
+    a:focus-visible, button:focus-visible, summary:focus-visible {
+      outline: 3px solid rgba(94, 106, 210, .3);
+      outline-offset: 2px;
     }
 
     .topbar {
       position: sticky;
-      z-index: 50;
+      z-index: 30;
       top: 0;
-      border-bottom: 1px solid rgba(207, 212, 220, .85);
-      background: rgba(255, 255, 255, .92);
-      backdrop-filter: blur(14px);
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, .96);
     }
     .topbar-inner {
       display: flex;
       align-items: center;
-      gap: 28px;
+      gap: 24px;
+      width: min(calc(100% - 40px), var(--max));
       min-height: 58px;
-      width: min(calc(100% - 40px), var(--max-width));
       margin: 0 auto;
     }
-    .brand {
-      display: inline-flex;
-      align-items: center;
-      gap: 9px;
-      flex: 0 0 auto;
-      font-weight: 700;
-    }
+    .brand { display: inline-flex; align-items: center; gap: 9px; flex: 0 0 auto; font-weight: 720; }
     .brand-mark {
-      display: inline-grid;
+      display: grid;
       place-items: center;
       width: 28px;
       height: 28px;
-      border-radius: 7px;
+      border-radius: 6px;
       background: var(--ink);
       color: #fff;
       font-size: 13px;
     }
-    .version {
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 2px 7px;
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 600;
-    }
-    .nav-links {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      min-width: 0;
-      margin-left: auto;
-    }
-    .nav-links a {
-      border-radius: 5px;
-      padding: 6px 9px;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 550;
-      white-space: nowrap;
-    }
-    .nav-links a:hover, .nav-links a:focus-visible {
-      background: var(--accent-soft);
-      color: var(--accent-strong);
-      outline: none;
-    }
+    .version { color: var(--muted); font-size: 11px; font-weight: 650; }
+    .nav-links { display: flex; gap: 2px; min-width: 0; margin-left: auto; overflow-x: auto; }
+    .nav-links a { padding: 6px 8px; border-radius: 5px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .nav-links a:hover { background: var(--accent-soft); color: #4b56bd; }
 
-    main { overflow: hidden; }
-    .section {
-      border-bottom: 1px solid var(--line);
-      padding: 76px 0;
-    }
-    .section:last-child { border-bottom: 0; }
-    .section-inner {
-      width: min(calc(100% - 40px), var(--max-width));
-      margin: 0 auto;
-    }
-    .section-kicker {
-      margin-bottom: 8px;
-      color: var(--accent-strong);
-      font-size: 11px;
-      font-weight: 750;
-      letter-spacing: 0;
-      text-transform: uppercase;
-    }
-    .section-heading {
-      max-width: 760px;
-      font-size: 31px;
-      font-weight: 720;
-      line-height: 1.25;
-      letter-spacing: 0;
-    }
-    .section-lead {
-      max-width: 780px;
-      margin-top: 14px;
-      color: var(--muted);
-      font-size: 16px;
-    }
-    .section-rule {
-      width: 42px;
-      height: 2px;
-      margin: 18px 0 0;
-      border: 0;
-      background: var(--accent);
-    }
+    .section { border-bottom: 1px solid var(--line); padding: 72px 0; }
+    .section-inner { width: min(calc(100% - 40px), var(--max)); margin: 0 auto; }
+    .section-kicker { margin-bottom: 7px; color: #4b56bd; font-size: 11px; font-weight: 760; text-transform: uppercase; }
+    .section-heading { max-width: 800px; font-size: 30px; line-height: 1.25; }
+    .section-lead { max-width: 820px; margin-top: 13px; color: var(--muted); font-size: 16px; }
+    .rule { width: 42px; height: 2px; margin: 18px 0 30px; border: 0; background: var(--accent); }
 
-    .overview {
-      min-height: 600px;
-      padding: 80px 0 56px;
-      background: var(--surface);
-    }
-    .overview-grid {
-      display: grid;
-      grid-template-columns: minmax(0, 1.15fr) minmax(360px, .85fr);
-      align-items: center;
-      gap: 70px;
-    }
-    .eyebrow {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 18px;
-      color: var(--accent-strong);
-      font-size: 12px;
-      font-weight: 700;
-    }
-    .eyebrow-dot {
-      width: 7px;
-      height: 7px;
-      border-radius: 50%;
-      background: var(--accent);
-      box-shadow: 0 0 0 4px var(--accent-soft);
-    }
-    h1 {
-      max-width: 680px;
-      font-size: 46px;
-      font-weight: 760;
-      line-height: 1.12;
-      letter-spacing: 0;
-    }
-    .overview-copy {
-      max-width: 650px;
-      margin-top: 22px;
-      color: var(--ink-soft);
-      font-size: 18px;
-      line-height: 1.7;
-    }
-    .fact-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      margin-top: 28px;
-    }
-    .fact {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      min-height: 31px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: var(--surface-subtle);
-      padding: 5px 9px;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 600;
-    }
-    .fact::before {
-      content: "";
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--accent);
-    }
-    .overview-flow {
-      position: relative;
-      display: grid;
-      gap: 13px;
-      padding-left: 34px;
-    }
-    .overview-flow::before {
-      content: "";
-      position: absolute;
-      top: 25px;
-      bottom: 25px;
-      left: 12px;
-      width: 1px;
-      background: var(--line-strong);
-    }
-    .flow-stop {
-      position: relative;
-      display: grid;
-      grid-template-columns: 40px 1fr;
-      align-items: center;
-      gap: 13px;
-      min-height: 72px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--surface);
-      padding: 13px 15px;
-      box-shadow: var(--shadow);
-    }
-    .flow-stop::before {
-      content: "";
-      position: absolute;
-      left: -26px;
-      width: 9px;
-      height: 9px;
-      border: 2px solid var(--surface);
-      border-radius: 50%;
-      background: var(--accent);
-      box-shadow: 0 0 0 1px var(--accent);
-    }
-    .flow-index {
-      display: grid;
-      place-items: center;
-      width: 36px;
-      height: 36px;
-      border-radius: 7px;
-      background: var(--accent-soft);
-      color: var(--accent-strong);
-      font-size: 11px;
-      font-weight: 750;
-    }
-    .flow-stop strong { display: block; font-size: 13px; }
-    .flow-stop span { color: var(--muted); font-size: 11px; }
+    .overview { padding: 72px 0 48px; background: var(--surface); }
+    .overview-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(340px, .75fr); gap: 64px; align-items: center; }
+    .eyebrow { margin-bottom: 12px; color: #4b56bd; font-size: 12px; font-weight: 700; }
+    h1 { max-width: 760px; font-size: 43px; line-height: 1.16; }
+    .overview-copy { max-width: 720px; margin-top: 20px; color: var(--ink-soft); font-size: 18px; }
+    .fact-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
+    .fact { border: 1px solid var(--line); border-radius: 5px; background: var(--page); padding: 5px 9px; color: var(--muted); font-size: 12px; }
+    .chain { border-left: 2px solid var(--line-strong); padding-left: 22px; }
+    .chain-step { position: relative; padding: 10px 0 18px; }
+    .chain-step::before { content: ""; position: absolute; top: 17px; left: -28px; width: 10px; height: 10px; border: 2px solid #fff; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+    .chain-step strong { display: block; font-size: 13px; }
+    .chain-step span { color: var(--muted); font-size: 11px; }
 
-    .map-layout {
-      display: grid;
-      grid-template-columns: minmax(0, 1.5fr) minmax(290px, .5fr);
-      gap: 22px;
-      margin-top: 34px;
-    }
-    .diagram-shell {
-      border: 1px solid var(--line-strong);
-      border-radius: 8px;
-      background: var(--surface);
-      box-shadow: var(--shadow);
-      overflow: hidden;
-    }
-    .diagram-toolbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      min-height: 46px;
-      border-bottom: 1px solid var(--line);
-      background: var(--surface-subtle);
-      padding: 0 14px;
-    }
-    .diagram-title { font-size: 12px; font-weight: 700; }
-    .legend { display: flex; flex-wrap: wrap; gap: 14px; color: var(--muted); font-size: 10px; }
-    .legend-item { display: inline-flex; align-items: center; gap: 6px; }
-    .legend-line { width: 24px; border-top: 2px solid var(--accent); }
-    .legend-line.dashed { border-top-style: dashed; border-color: var(--amber); }
-
-    .system-map {
-      position: relative;
-      display: grid;
-      grid-template-columns: minmax(145px, 1fr) minmax(190px, 1.15fr) minmax(145px, 1fr);
-      grid-template-rows: repeat(3, minmax(118px, auto));
-      gap: 22px 38px;
-      min-height: 480px;
-      padding: 30px;
-      isolation: isolate;
-    }
-    .map-connections {
-      position: absolute;
-      z-index: 0;
-      inset: 0;
-      width: 100%;
-      height: 100%;
-      pointer-events: none;
-    }
-    .map-connections > path { fill: none; stroke-width: 2; }
-    .map-connections .edge-direct { stroke: var(--accent); marker-end: url(#arrow-direct); }
-    .map-connections .edge-delegated { stroke: var(--amber); stroke-dasharray: 6 5; marker-end: url(#arrow-delegated); }
-    .map-connections text { fill: var(--faint); font-size: 11px; font-weight: 650; }
-    .map-node {
-      position: relative;
-      z-index: 2;
-      display: grid;
-      align-content: center;
-      gap: 5px;
-      min-width: 0;
-      border: 1px solid var(--line-strong);
-      border-radius: 7px;
-      background: var(--surface);
-      padding: 14px;
-      text-align: left;
-      cursor: pointer;
-      transition: border-color 140ms ease, background 140ms ease, transform 140ms ease;
-    }
-    .map-node:hover { border-color: var(--accent); transform: translateY(-1px); }
-    .map-node:focus-visible { outline: 3px solid rgba(94, 106, 210, .24); outline-offset: 2px; }
-    .map-node[aria-pressed="true"] {
-      border-color: var(--accent);
-      background: var(--accent-soft);
-    }
-    .map-node .node-type {
-      color: var(--faint);
-      font-size: 9px;
-      font-weight: 750;
-      text-transform: uppercase;
-    }
-    .map-node strong { font-size: 13px; line-height: 1.3; }
-    .map-node small { color: var(--muted); font-size: 10px; line-height: 1.4; }
-    .map-node.linear { grid-column: 1; grid-row: 1; }
-    .map-node.workflow { grid-column: 2; grid-row: 1; }
-    .map-node.codex { grid-column: 3; grid-row: 1; }
-    .map-node.workspace { grid-column: 1; grid-row: 3; }
-    .map-node.state { grid-column: 2; grid-row: 3; }
-    .map-node.provider { grid-column: 3; grid-row: 3; }
-    .map-node.runtime {
-      grid-column: 2;
-      grid-row: 2;
-      border-color: var(--ink);
-      background: var(--ink);
-      color: #fff;
-      text-align: center;
-    }
-    .map-node.runtime .node-type, .map-node.runtime small { color: #b9c0cc; }
-    .map-node.runtime[aria-pressed="true"] { border-color: var(--accent); background: #252a36; }
-
-    .component-detail {
-      display: grid;
-      align-content: start;
-      gap: 16px;
-      min-height: 100%;
-      border-left: 3px solid var(--accent);
-      background: var(--surface);
-      padding: 22px;
-    }
-    .detail-label { color: var(--accent-strong); font-size: 10px; font-weight: 750; text-transform: uppercase; }
-    .component-detail h3 { font-size: 20px; line-height: 1.3; }
+    .map-layout { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(260px, .4fr); gap: 18px; }
+    .diagram-frame { border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); overflow: hidden; }
+    .diagram-head { display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); background: var(--surface-muted); padding: 10px 14px; font-size: 11px; }
+    .diagram-head span:last-child { color: var(--muted); }
+    .system-map { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; padding: 18px; }
+    .map-node { min-height: 92px; border: 1px solid var(--line); border-radius: 6px; background: #fff; padding: 12px; text-align: left; cursor: pointer; }
+    .map-node:hover, .map-node[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+    .map-node.runtime { border-color: var(--ink); background: var(--ink); color: #fff; }
+    .map-node.runtime[aria-pressed="true"] { background: #30343d; }
+    .node-type { display: block; margin-bottom: 4px; color: var(--muted); font-size: 9px; font-weight: 750; text-transform: uppercase; }
+    .runtime .node-type { color: #c6ccd5; }
+    .map-node strong { display: block; font-size: 13px; }
+    .map-node small { display: block; margin-top: 4px; color: var(--muted); font-size: 10px; line-height: 1.4; }
+    .runtime small { color: #c6ccd5; }
+    .edge-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; border-top: 1px solid var(--line); }
+    .edge { display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); padding: 8px 12px; font-size: 10px; }
+    .edge:nth-child(odd) { border-right: 1px solid var(--line); }
+    .edge span { color: var(--muted); }
+    .component-detail { border-left: 3px solid var(--accent); background: var(--surface); padding: 20px; }
+    .component-detail h3 { margin: 6px 0 10px; font-size: 19px; }
     .component-detail > p { color: var(--muted); font-size: 13px; }
-    .io-list { display: grid; gap: 10px; }
-    .io-item { border-top: 1px solid var(--line); padding-top: 10px; }
-    .io-item span { display: block; color: var(--faint); font-size: 9px; font-weight: 750; text-transform: uppercase; }
-    .io-item strong { display: block; margin-top: 3px; color: var(--ink-soft); font-size: 12px; font-weight: 600; }
+    .detail-label { color: #4b56bd; font-size: 10px; font-weight: 750; text-transform: uppercase; }
+    .detail-grid { display: grid; gap: 10px; margin-top: 18px; }
+    .detail-grid div { border-top: 1px solid var(--line); padding-top: 8px; }
+    .detail-grid span { display: block; color: var(--muted); font-size: 9px; text-transform: uppercase; }
+    .detail-grid strong { display: block; margin-top: 2px; font-size: 11px; overflow-wrap: anywhere; }
 
-    .poll-grid {
-      display: grid;
-      grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr);
-      gap: 42px;
-      align-items: start;
-      margin-top: 34px;
-    }
-    .poll-loop { display: grid; gap: 0; }
-    .poll-stage {
-      position: relative;
-      display: grid;
-      grid-template-columns: 34px 1fr;
-      gap: 13px;
-      padding: 0 0 26px;
-    }
-    .poll-stage:not(:last-child)::after {
-      content: "";
-      position: absolute;
-      top: 30px;
-      bottom: 0;
-      left: 16px;
-      width: 1px;
-      background: var(--line-strong);
-    }
-    .poll-stage:last-child { padding-bottom: 0; }
-    .poll-number {
-      position: relative;
-      z-index: 1;
-      display: grid;
-      place-items: center;
-      width: 33px;
-      height: 33px;
-      border: 1px solid var(--line-strong);
-      border-radius: 50%;
-      background: var(--surface);
-      color: var(--accent-strong);
-      font-size: 11px;
-      font-weight: 750;
-    }
-    .poll-stage h3 { font-size: 14px; }
-    .poll-stage p { margin-top: 4px; color: var(--muted); font-size: 12px; }
-    .code-panel {
-      border-radius: 8px;
-      background: var(--code);
-      color: #f2f4f8;
-      overflow: hidden;
-    }
-    .code-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      border-bottom: 1px solid var(--code-line);
-      padding: 10px 14px;
-      color: #aab2c0;
-      font-size: 10px;
-    }
-    .code-panel pre {
-      overflow-x: auto;
-      padding: 18px;
-      font-size: 11px;
-      line-height: 1.7;
-      white-space: pre;
-    }
-    .code-key { color: #aeb6ff; }
-    .code-string { color: #99d6ba; }
-    .code-comment { color: #7f8998; }
-    .poll-note {
-      margin-top: 14px;
-      border: 1px solid #efd5aa;
-      border-radius: 7px;
-      background: var(--amber-soft);
-      padding: 13px 15px;
-      color: #71460f;
-      font-size: 12px;
-    }
+    .two-column { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 26px; }
+    .step-list { display: grid; gap: 0; }
+    .step { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 12px; border-bottom: 1px solid var(--line); padding: 12px 0; }
+    .step-index { display: grid; place-items: center; width: 30px; height: 30px; border: 1px solid var(--line-strong); border-radius: 50%; color: #4b56bd; font-size: 10px; font-weight: 750; }
+    .step h3 { font-size: 13px; }
+    .step p { margin-top: 3px; color: var(--muted); font-size: 12px; }
+    .code-panel { border-radius: 7px; background: var(--code); color: #f3f5f8; overflow: hidden; }
+    .code-head { display: flex; justify-content: space-between; gap: 10px; border-bottom: 1px solid #3b414b; padding: 9px 14px; color: var(--code-muted); font-size: 10px; }
+    .code-panel pre, .prompt-block, .workpad-preview { overflow-x: auto; padding: 16px; font-size: 11px; line-height: 1.65; white-space: pre; }
+    .note { margin-top: 14px; border: 1px solid #e7cf91; border-radius: 6px; background: var(--amber-soft); padding: 12px 14px; color: #6f4c00; font-size: 12px; }
 
-    .sequence-wrap { margin-top: 34px; }
-    .sequence-controls {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      margin-bottom: 12px;
-    }
+    .sequence-controls { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 10px; }
     .sequence-help { color: var(--muted); font-size: 11px; }
-    .play-button {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      min-height: 34px;
-      border: 1px solid var(--line-strong);
-      border-radius: 6px;
-      background: var(--surface);
-      padding: 0 11px;
-      cursor: pointer;
-      font-size: 12px;
-      font-weight: 650;
-    }
-    .play-button:hover { border-color: var(--accent); color: var(--accent-strong); }
-    .play-button:focus-visible { outline: 3px solid rgba(94, 106, 210, .2); }
-    .play-button:disabled { cursor: not-allowed; opacity: .58; }
-    .play-icon { color: var(--accent); font-size: 10px; }
-    .sequence-diagram {
-      border: 1px solid var(--line-strong);
-      border-radius: 8px;
-      background: var(--surface);
-      overflow: hidden;
-    }
-    .sequence-actors {
-      display: grid;
-      grid-template-columns: 58px repeat(6, minmax(105px, 1fr));
-      border-bottom: 1px solid var(--line);
-      background: var(--surface-subtle);
-    }
-    .actor {
-      min-width: 0;
-      border-left: 1px solid var(--line);
-      padding: 12px 8px;
-      text-align: center;
-      font-size: 10px;
-      font-weight: 700;
-    }
+    .play-button { min-height: 34px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--surface); padding: 0 11px; cursor: pointer; }
+    .sequence-diagram { border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); overflow: hidden; }
+    .sequence-actors { display: grid; grid-template-columns: 48px repeat(5, 1fr); border-bottom: 1px solid var(--line); background: var(--surface-muted); }
+    .actor { padding: 9px 6px; border-left: 1px solid var(--line); text-align: center; font-size: 9px; font-weight: 700; }
     .actor:first-child { border-left: 0; }
-    .sequence-steps {
-      position: relative;
-      display: grid;
-      gap: 1px;
-      background: var(--line);
-    }
-    .sequence-step {
-      display: grid;
-      grid-template-columns: 58px repeat(6, minmax(105px, 1fr));
-      min-height: 55px;
-      border: 0;
-      background: var(--surface);
-      padding: 0;
-      text-align: left;
-      cursor: pointer;
-    }
-    .sequence-step:hover { background: #fbfcff; }
-    .sequence-step:focus-visible { position: relative; z-index: 2; outline: 3px solid rgba(94, 106, 210, .22); outline-offset: -3px; }
-    .sequence-step[aria-pressed="true"] { background: var(--accent-soft); }
-    .step-index {
-      display: grid;
-      place-items: center;
-      border-right: 1px solid var(--line);
-      color: var(--faint);
-      font-size: 10px;
-      font-weight: 700;
-    }
-    .step-message {
-      position: relative;
-      display: flex;
-      align-items: center;
-      min-width: 0;
-      padding: 9px 12px;
-      color: var(--ink-soft);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 10px;
-      line-height: 1.35;
-    }
-    .step-message::before {
-      content: "";
-      position: absolute;
-      top: 50%;
-      right: 10px;
-      left: 10px;
-      border-top: 1px solid var(--line-strong);
-    }
-    .step-message::after {
-      content: "";
-      position: absolute;
-      top: calc(50% - 3px);
-      right: 8px;
-      width: 6px;
-      height: 6px;
-      border-top: 1px solid var(--line-strong);
-      border-right: 1px solid var(--line-strong);
-      transform: rotate(45deg);
-    }
-    .step-message.reverse::after {
-      right: auto;
-      left: 8px;
-      border: 0;
-      border-bottom: 1px solid var(--line-strong);
-      border-left: 1px solid var(--line-strong);
-    }
-    .step-label {
-      position: relative;
-      z-index: 1;
-      max-width: 100%;
-      margin: 0 auto;
-      background: inherit;
-      padding: 0 6px;
-      overflow-wrap: anywhere;
-    }
-    .step-route { display: none; }
-    .step-message.runner-orchestrator { grid-column: 2 / 4; }
-    .step-message.orchestrator-linear { grid-column: 3 / 5; }
-    .step-message.orchestrator-workspace { grid-column: 3 / 6; }
-    .step-message.orchestrator-local { grid-column: 3 / 4; }
-    .step-message.orchestrator-local::before, .step-message.orchestrator-local::after { display: none; }
-    .step-message.orchestrator-codex { grid-column: 3 / 7; }
-    .step-message.orchestrator-state { grid-column: 3 / 8; }
-    .sequence-explain {
-      display: grid;
-      grid-template-columns: 160px 1fr;
-      gap: 20px;
-      border-top: 1px solid var(--line);
-      background: var(--surface-subtle);
-      padding: 17px 18px;
-    }
-    .sequence-explain span { color: var(--accent-strong); font-size: 10px; font-weight: 750; text-transform: uppercase; }
+    .sequence-steps { display: grid; gap: 1px; background: var(--line); }
+    .sequence-step { display: grid; grid-template-columns: 48px minmax(0, 1fr); min-height: 45px; border: 0; background: #fff; padding: 0; text-align: left; cursor: pointer; }
+    .sequence-step:hover, .sequence-step[aria-pressed="true"] { background: var(--accent-soft); }
+    .sequence-number { display: grid; place-items: center; border-right: 1px solid var(--line); color: var(--muted); font-size: 9px; font-weight: 700; }
+    .sequence-message { display: grid; grid-template-columns: 190px minmax(0, 1fr); align-items: center; gap: 12px; padding: 7px 12px; }
+    .sequence-route { color: #4b56bd; font-size: 10px; font-weight: 700; }
+    .sequence-label { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; overflow-wrap: anywhere; }
+    .sequence-explain { display: grid; grid-template-columns: 170px minmax(0, 1fr); gap: 18px; border-top: 1px solid var(--line); background: var(--surface-muted); padding: 14px; }
+    .sequence-explain span { font-size: 12px; font-weight: 700; }
     .sequence-explain p { color: var(--muted); font-size: 12px; }
 
-    .protocol-grid {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 10px;
-      margin-top: 18px;
-    }
-    .protocol-step {
-      border: 1px solid var(--line);
-      border-radius: 7px;
-      background: var(--surface);
-      padding: 14px;
-    }
-    .protocol-step strong { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-    .protocol-step p { margin-top: 6px; color: var(--muted); font-size: 11px; }
+    .workflow-layers { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .workflow-layer { border: 1px solid var(--line); border-radius: 6px; background: var(--surface); padding: 16px; }
+    .workflow-layer h3 { font-size: 14px; }
+    .workflow-layer p { margin-top: 5px; color: var(--muted); font-size: 12px; }
+    .workflow-parts { display: grid; gap: 1px; border: 1px solid var(--line); border-radius: 7px; background: var(--line); overflow: hidden; }
+    .workflow-part { display: grid; grid-template-columns: 190px minmax(0, 1fr) 120px; gap: 16px; align-items: start; background: var(--surface); padding: 13px 15px; }
+    .workflow-part h3 { font-size: 12px; }
+    .workflow-part p { color: var(--muted); font-size: 12px; }
+    .owner { justify-self: end; border-radius: 4px; padding: 2px 6px; font-size: 9px; font-weight: 750; }
+    .owner.runtime { background: var(--blue-soft); color: var(--blue); }
+    .owner.agent { background: var(--amber-soft); color: var(--amber); }
 
-    .lifecycle-track {
-      margin-top: 34px;
-      overflow-x: auto;
-      padding: 4px 0 16px;
-    }
-    .lifecycle-main {
-      display: grid;
-      grid-template-columns: repeat(6, minmax(130px, 1fr));
-      min-width: 820px;
-    }
-    .life-state {
-      position: relative;
-      padding-right: 22px;
-    }
-    .life-state:not(:last-child)::after {
-      content: "";
-      position: absolute;
-      top: 17px;
-      right: 4px;
-      width: 14px;
-      border-top: 1px solid var(--line-strong);
-    }
-    .life-state:not(:last-child)::before {
-      content: "";
-      position: absolute;
-      z-index: 1;
-      top: 14px;
-      right: 4px;
-      width: 6px;
-      height: 6px;
-      border-top: 1px solid var(--line-strong);
-      border-right: 1px solid var(--line-strong);
-      transform: rotate(45deg);
-    }
-    .state-pill {
-      display: inline-flex;
-      align-items: center;
-      min-height: 34px;
-      border: 1px solid var(--line-strong);
-      border-radius: 6px;
-      background: var(--surface);
-      padding: 0 10px;
-      font-size: 11px;
-      font-weight: 700;
-      white-space: nowrap;
-    }
-    .state-pill.active { border-color: #c7d9ff; background: var(--blue-soft); color: var(--blue); }
-    .state-pill.publish { border-color: #efd5aa; background: var(--amber-soft); color: var(--amber); }
-    .state-pill.review { border-color: #d5d9ff; background: var(--accent-soft); color: var(--accent-strong); }
-    .state-pill.terminal { border-color: #bee3d2; background: var(--green-soft); color: var(--green); }
-    .life-state p { margin-top: 9px; padding-right: 5px; color: var(--muted); font-size: 10px; line-height: 1.45; }
-    .review-loop {
-      display: grid;
-      grid-template-columns: 1fr auto 1fr auto 1fr;
-      align-items: center;
-      gap: 10px;
-      width: min(100%, 620px);
-      margin: 22px auto 0;
-      border: 1px solid #d5d9ff;
-      border-radius: 7px;
-      background: var(--accent-soft);
-      padding: 13px;
-      color: var(--accent-strong);
-      font-size: 11px;
-      font-weight: 650;
-      text-align: center;
-    }
-    .review-loop .state-pill { justify-self: center; }
-    .terminal-rail {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 12px;
-      margin-top: 12px;
-      border-top: 1px solid var(--line);
-      padding-top: 12px;
-      color: var(--muted);
-      font-size: 11px;
-    }
-    .review-boundary {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-      gap: 16px;
-      margin-top: 24px;
-    }
-    .responsibility {
-      border-top: 2px solid var(--accent);
-      background: var(--surface);
-      padding: 16px 0 0;
-    }
-    .responsibility.codex-owned { border-color: var(--amber); }
-    .responsibility h3 { font-size: 14px; }
-    .responsibility p { margin-top: 6px; color: var(--muted); font-size: 12px; }
-    .responsibility ul { margin: 12px 0 0; padding-left: 18px; color: var(--ink-soft); font-size: 12px; }
+    .lifecycle-track { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 7px; background: var(--surface); overflow: hidden; }
+    .life-state { min-height: 108px; border-right: 1px solid var(--line); padding: 13px; }
+    .life-state:last-child { border-right: 0; }
+    .state-pill { display: inline-block; border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 750; }
+    .state-pill.active { background: var(--blue-soft); color: var(--blue); }
+    .state-pill.publish { background: var(--green-soft); color: var(--green); }
+    .state-pill.review { background: var(--amber-soft); color: var(--amber); }
+    .state-pill.terminal { background: var(--surface-muted); color: var(--muted); }
+    .life-state p { margin-top: 8px; color: var(--muted); font-size: 11px; }
+    .rework-return { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; border: 1px dashed var(--line-strong); border-radius: 6px; padding: 11px; font-size: 11px; }
 
-    .workflow-layers {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 14px;
-      margin-top: 34px;
-    }
-    .workflow-layer {
-      border-top: 2px solid var(--accent);
-      background: var(--surface);
-      padding: 16px 0 0;
-    }
-    .workflow-layer.prompt-layer { border-color: var(--amber); }
-    .workflow-layer h3 { font-size: 15px; }
-    .workflow-layer p { margin-top: 6px; color: var(--muted); font-size: 12px; }
-    .workflow-list {
-      margin-top: 28px;
-      border-top: 1px solid var(--line-strong);
-    }
-    .workflow-row {
-      display: grid;
-      grid-template-columns: minmax(280px, .9fr) minmax(0, 1.1fr);
-      gap: 30px;
-      border-bottom: 1px solid var(--line);
-      padding: 24px 0;
-    }
-    .workflow-row h3 { font-size: 15px; }
-    .workflow-row p { color: var(--muted); font-size: 12px; }
-    .workflow-snippet {
-      margin-top: 11px;
-      overflow-x: auto;
-      border-radius: 6px;
-      background: var(--code);
-      padding: 13px 14px;
-      color: #e8ebf0;
-      font-size: 10px;
-      line-height: 1.65;
-      white-space: pre;
-    }
-    .workflow-rationale { display: grid; align-content: start; gap: 12px; }
-    .rationale-title { color: var(--ink-soft); font-size: 12px; font-weight: 720; }
-    .workflow-meta { display: flex; flex-wrap: wrap; gap: 6px; }
-    .owner-tag {
-      display: inline-flex;
-      align-items: center;
-      min-height: 24px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 0 8px;
-      color: var(--muted);
-      font-size: 9px;
-      font-weight: 720;
-    }
-    .owner-tag.runtime { border-color: #c7d9ff; background: var(--blue-soft); color: var(--blue); }
-    .owner-tag.codex { border-color: #efd5aa; background: var(--amber-soft); color: var(--amber); }
-    .owner-tag.human { border-color: #d5d9ff; background: var(--accent-soft); color: var(--accent-strong); }
-    .workflow-limit {
-      border-left: 2px solid var(--line-strong);
-      padding-left: 10px;
-      color: var(--faint) !important;
-      font-size: 11px !important;
-    }
+    .ops-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 7px; background: var(--surface); overflow: hidden; }
+    .ops-panel { border-right: 1px solid var(--line); padding: 17px; }
+    .ops-panel:last-child { border-right: 0; }
+    .ops-panel h3 { font-size: 14px; }
+    .ops-panel p { margin-top: 6px; color: var(--muted); font-size: 12px; }
+    .ops-panel ul { margin: 12px 0 0; padding-left: 18px; color: var(--ink-soft); font-size: 11px; }
+    .status-line { display: flex; justify-content: space-between; gap: 12px; border-top: 1px solid var(--line); padding: 8px 0; font-size: 10px; }
+    .status-line:first-of-type { margin-top: 12px; }
+    .status-line span { color: var(--muted); }
 
-    .case-disclaimer {
-      margin-top: 24px;
-      border: 1px solid #efd5aa;
-      border-radius: 7px;
-      background: var(--amber-soft);
-      padding: 13px 15px;
-      color: #71460f;
-      font-size: 12px;
-    }
-    .case-overview {
-      display: grid;
-      grid-template-columns: minmax(0, .85fr) minmax(0, 1.15fr);
-      gap: 36px;
-      margin-top: 28px;
-      align-items: start;
-    }
-    .case-facts {
-      margin: 0;
-      border-top: 1px solid var(--line-strong);
-    }
-    .case-fact {
-      display: grid;
-      grid-template-columns: 112px minmax(0, 1fr);
-      gap: 12px;
-      border-bottom: 1px solid var(--line);
-      padding: 10px 0;
-    }
-    .case-fact dt { color: var(--faint); font-size: 10px; font-weight: 720; }
-    .case-fact dd { min-width: 0; margin: 0; color: var(--ink-soft); font-size: 12px; overflow-wrap: anywhere; }
-    .case-state-path {
-      border: 1px solid var(--line-strong);
-      border-radius: 8px;
-      background: var(--surface);
-      padding: 18px;
-    }
-    .case-state-path h3 { font-size: 14px; }
-    .state-path-text {
-      margin-top: 11px;
-      overflow-x: auto;
-      color: var(--accent-strong);
-      font-size: 11px;
-      font-weight: 700;
-      white-space: nowrap;
-    }
-    .simulation-legend { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 15px; }
-    .shared-frame {
-      margin-top: 24px;
-      border-left: 3px solid var(--accent);
-      background: var(--surface);
-      padding: 18px;
-    }
-    .shared-frame h3 { font-size: 15px; }
-    .shared-frame p { margin-top: 7px; color: var(--muted); font-size: 12px; }
-    .shared-frame ul { margin: 12px 0 0; padding-left: 18px; color: var(--ink-soft); font-size: 12px; columns: 2; column-gap: 30px; }
-    .case-turns {
-      position: relative;
-      display: grid;
-      gap: 12px;
-      margin-top: 28px;
-      padding-left: 28px;
-    }
-    .case-turns::before {
-      content: "";
-      position: absolute;
-      top: 22px;
-      bottom: 22px;
-      left: 8px;
-      width: 1px;
-      background: var(--line-strong);
-    }
-    .case-turn {
-      position: relative;
-      border: 1px solid var(--line-strong);
-      border-radius: 8px;
-      background: var(--surface);
-      overflow: visible;
-    }
-    .case-turn::before {
-      content: "";
-      position: absolute;
-      z-index: 2;
-      top: 21px;
-      left: -26px;
-      width: 9px;
-      height: 9px;
-      border: 2px solid var(--page);
-      border-radius: 50%;
-      background: var(--accent);
-      box-shadow: 0 0 0 1px var(--accent);
-    }
-    .case-turn summary {
-      display: grid;
-      grid-template-columns: 54px 104px minmax(0, 1fr) auto;
-      align-items: center;
-      gap: 10px;
-      min-height: 58px;
-      padding: 0 15px;
-      cursor: pointer;
-      list-style: none;
-    }
-    .case-turn summary::-webkit-details-marker { display: none; }
-    .case-turn summary::after { content: "+"; color: var(--faint); font-size: 18px; }
-    .case-turn[open] summary::after { content: "−"; }
-    .case-turn summary:focus-visible { outline: 3px solid rgba(94, 106, 210, .22); outline-offset: -3px; }
-    .turn-index { color: var(--faint); font-size: 10px; font-weight: 750; }
-    .turn-title { min-width: 0; font-size: 13px; font-weight: 700; }
-    .turn-subtitle { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; font-weight: 500; }
-    .turn-body { border-top: 1px solid var(--line); padding: 18px; }
-    .turn-trigger {
-      display: grid;
-      grid-template-columns: 110px minmax(0, 1fr);
-      gap: 14px;
-      border-bottom: 1px solid var(--line);
-      padding-bottom: 14px;
-    }
-    .turn-trigger strong, .sync-heading { font-size: 11px; }
+    .auth-flow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); overflow: hidden; }
+    .auth-step { position: relative; min-height: 120px; border-right: 1px solid var(--line); padding: 15px; }
+    .auth-step:last-child { border-right: 0; }
+    .auth-step h3 { font-size: 13px; }
+    .auth-step p { margin-top: 6px; color: var(--muted); font-size: 11px; }
+    .security-note { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 18px; margin-top: 16px; border-left: 3px solid var(--red); background: var(--red-soft); padding: 14px; color: #7a271a; font-size: 12px; }
+
+    .review-gate { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 7px; background: var(--surface); overflow: hidden; }
+    .gate-stage { border-right: 1px solid var(--line); padding: 18px; }
+    .gate-stage:last-child { border-right: 0; }
+    .gate-stage h3 { font-size: 14px; }
+    .gate-stage p { margin-top: 6px; color: var(--muted); font-size: 12px; }
+
+    .case-disclaimer { border: 1px solid var(--line); border-radius: 6px; background: var(--surface); padding: 13px 15px; color: var(--muted); font-size: 12px; }
+    .case-summary { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 14px 0; }
+    .case-summary > div { border: 1px solid var(--line); border-radius: 6px; background: var(--surface); padding: 13px; }
+    .case-summary strong { display: block; font-size: 11px; }
+    .case-summary span { color: var(--muted); font-size: 11px; }
+    .case-turns { display: grid; gap: 10px; }
+    .case-turn { border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); overflow: hidden; }
+    .case-turn summary { display: grid; grid-template-columns: 58px 105px minmax(0, 1fr); gap: 10px; align-items: center; min-height: 56px; padding: 8px 13px; cursor: pointer; }
+    .turn-index { color: var(--muted); font-size: 9px; font-weight: 750; }
+    .turn-title { font-size: 13px; font-weight: 700; }
+    .turn-subtitle { display: block; color: var(--muted); font-size: 10px; font-weight: 500; }
+    .turn-body { border-top: 1px solid var(--line); padding: 16px; }
+    .turn-trigger { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 14px; margin-bottom: 13px; }
+    .turn-trigger strong { font-size: 11px; }
     .turn-trigger p { color: var(--muted); font-size: 12px; }
-    .prompt-heading { margin-top: 16px; font-size: 11px; }
-    .prompt-block {
-      margin-top: 8px;
-      max-height: 430px;
-      overflow: auto;
-      border-radius: 6px;
-      background: var(--code);
-      padding: 16px;
-      color: #e8ebf0;
-      font-size: 10px;
-      line-height: 1.7;
-      white-space: pre;
-    }
-    .discovered-context {
-      margin-top: 10px;
-      border-left: 3px solid var(--amber);
-      background: var(--amber-soft);
-      padding: 11px 13px;
-      color: #71460f;
-      font-size: 11px;
-    }
-    .discovered-context p { margin-top: 4px; color: #805b2d; }
-    .turn-sync-grid {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 20px;
-      margin-top: 18px;
-    }
-    .linear-sync, .review-sync { border-top: 2px solid var(--accent); padding-top: 13px; min-width: 0; }
-    .review-sync { border-color: var(--amber); }
-    .linear-sync p, .review-sync p { margin-top: 7px; color: var(--muted); font-size: 11px; }
-    .sync-list { margin: 9px 0 0; padding-left: 17px; color: var(--ink-soft); font-size: 11px; }
-    .workpad-preview {
-      margin-top: 10px;
-      max-height: 320px;
-      overflow: auto;
-      border: 1px solid var(--line);
-      border-radius: 5px;
-      background: var(--surface-subtle);
-      padding: 11px;
-      color: var(--ink-soft);
-      font-size: 9px;
-      line-height: 1.6;
-      white-space: pre;
-    }
-    .expected-record {
-      display: inline-flex;
-      margin-bottom: 8px;
-      border-radius: 999px;
-      background: var(--accent-soft);
-      padding: 3px 7px;
-      color: var(--accent-strong);
-      font-size: 9px;
-      font-weight: 750;
-    }
+    .prompt-heading { margin: 13px 0 6px; font-size: 11px; }
+    .prompt-block, .workpad-preview { border-radius: 6px; background: var(--code); color: #f3f5f8; }
+    .turn-sync-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+    .linear-sync, .review-sync { border: 1px solid var(--line); border-radius: 6px; padding: 13px; }
+    .sync-heading { margin-bottom: 6px; font-size: 12px; }
+    .linear-sync p, .review-sync p { color: var(--muted); font-size: 11px; }
+    .workpad-preview { margin-top: 9px; padding: 12px; font-size: 10px; }
+    .sync-list { margin: 8px 0 0; padding-left: 17px; font-size: 11px; }
+    .sync-state { margin-top: 9px; border-top: 1px solid var(--line); padding-top: 8px; color: var(--green); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
 
-    .layout-grid {
-      display: grid;
-      grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr);
-      gap: 34px;
-      margin-top: 34px;
-    }
-    .tree-panel {
-      border: 1px solid var(--line-strong);
-      border-radius: 8px;
-      background: var(--surface);
-      padding: 20px;
-    }
-    .tree-panel pre {
-      overflow-x: auto;
-      color: var(--ink-soft);
-      font-size: 12px;
-      line-height: 1.8;
-    }
-    .command-list { display: grid; gap: 10px; }
-    .command {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(170px, .8fr);
-      align-items: center;
-      gap: 16px;
-      min-height: 62px;
-      border-bottom: 1px solid var(--line);
-    }
-    .command:first-child { border-top: 1px solid var(--line); }
-    .command code {
-      width: fit-content;
-      max-width: 100%;
-      overflow-wrap: anywhere;
-      border-color: #d6d9ff;
-      background: var(--accent-soft);
-      color: var(--accent-strong);
-    }
-    .command span { color: var(--muted); font-size: 12px; }
+    .layout-grid { display: grid; grid-template-columns: 1.1fr .9fr; gap: 22px; }
+    .tree-panel { border-radius: 7px; background: var(--code); color: #f3f5f8; overflow: hidden; }
+    .tree-panel pre { overflow-x: auto; padding: 18px; color: #d9dee7; font-size: 11px; line-height: 1.7; }
+    .command-list { border-top: 1px solid var(--line); }
+    .command { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 12px; border-bottom: 1px solid var(--line); padding: 11px 0; }
+    .command span { color: var(--muted); font-size: 11px; }
+    .boundaries { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 7px; background: var(--surface); overflow: hidden; }
+    .boundary { min-height: 132px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 15px; }
+    .boundary:nth-child(even) { border-right: 0; }
+    .boundary:nth-last-child(-n + 2) { border-bottom: 0; }
+    .boundary-index { color: #4b56bd; font-size: 9px; font-weight: 750; }
+    .boundary h3 { margin-top: 5px; font-size: 13px; }
+    .boundary p { margin-top: 5px; color: var(--muted); font-size: 11px; }
 
-    .boundaries {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 1px;
-      margin-top: 34px;
-      border: 1px solid var(--line-strong);
-      border-radius: 8px;
-      background: var(--line);
-      overflow: hidden;
-    }
-    .boundary {
-      min-height: 142px;
-      background: var(--surface);
-      padding: 20px;
-    }
-    .boundary-index { color: var(--red); font-size: 10px; font-weight: 750; }
-    .boundary h3 { margin-top: 6px; font-size: 14px; }
-    .boundary p { margin-top: 7px; color: var(--muted); font-size: 12px; }
-    .closing-note {
-      display: flex;
-      align-items: flex-start;
-      gap: 12px;
-      margin-top: 22px;
-      border-left: 3px solid var(--red);
-      background: var(--red-soft);
-      padding: 14px 16px;
-      color: #74302a;
-      font-size: 12px;
-    }
-
-    footer {
-      background: var(--ink);
-      color: #fff;
-    }
-    .footer-inner {
-      display: flex;
-      justify-content: space-between;
-      gap: 24px;
-      width: min(calc(100% - 40px), var(--max-width));
-      margin: 0 auto;
-      padding: 30px 0;
-    }
-    .footer-inner strong { font-size: 13px; }
-    .footer-inner span { color: #abb2bf; font-size: 11px; }
+    footer { border-top: 1px solid var(--line); background: var(--surface); }
+    .footer-inner { display: flex; justify-content: space-between; gap: 16px; width: min(calc(100% - 40px), var(--max)); margin: 0 auto; padding: 22px 0; color: var(--muted); font-size: 11px; }
 
     @media (max-width: 980px) {
-      .nav-links { overflow-x: auto; }
-      .overview-grid, .map-layout, .poll-grid, .layout-grid, .workflow-row, .case-overview, .turn-sync-grid { grid-template-columns: 1fr; }
-      .overview { min-height: auto; }
-      .overview-flow { max-width: 620px; }
-      .map-layout { gap: 14px; }
-      .component-detail { min-height: 250px; border-top: 3px solid var(--accent); border-left: 0; }
-      .protocol-grid { grid-template-columns: 1fr; }
-      .workflow-layers { grid-template-columns: 1fr; }
+      .overview-grid, .map-layout, .two-column, .layout-grid { grid-template-columns: 1fr; }
+      .ops-grid { grid-template-columns: 1fr; }
+      .ops-panel { border-right: 0; border-bottom: 1px solid var(--line); }
+      .ops-panel:last-child { border-bottom: 0; }
+      .lifecycle-track { grid-template-columns: repeat(3, 1fr); }
+      .life-state { border-bottom: 1px solid var(--line); }
+      .life-state:nth-child(3) { border-right: 0; }
+      .life-state:nth-last-child(-n + 3) { border-bottom: 0; }
+      .auth-flow { grid-template-columns: repeat(2, 1fr); }
+      .auth-step:nth-child(2) { border-right: 0; }
+      .auth-step:nth-child(-n + 2) { border-bottom: 1px solid var(--line); }
     }
 
     @media (max-width: 760px) {
-      .topbar-inner { width: min(calc(100% - 24px), var(--max-width)); gap: 14px; }
-      .version { display: none; }
-      .nav-links { gap: 0; }
-      .section-inner, .footer-inner { width: min(calc(100% - 28px), var(--max-width)); }
-      .section { padding: 58px 0; }
-      .overview { padding: 58px 0 46px; }
-      h1 { font-size: 37px; }
-      .section-heading { font-size: 27px; }
-      .system-map {
-        grid-template-columns: 1fr 1fr;
-        grid-template-rows: auto;
-        gap: 10px;
-        min-height: 0;
-        padding: 16px;
-      }
-      .map-node.linear, .map-node.workflow, .map-node.codex, .map-node.workspace, .map-node.state, .map-node.provider, .map-node.runtime {
-        grid-column: auto;
-        grid-row: auto;
-      }
-      .map-node.runtime { grid-column: 1 / 3; grid-row: 1; }
-      .map-connections { display: none; }
-      .sequence-diagram { overflow: hidden; }
+      .topbar-inner, .section-inner, .footer-inner { width: min(calc(100% - 28px), var(--max)); }
+      .section { padding: 56px 0; }
+      h1 { font-size: 35px; }
+      .section-heading { font-size: 26px; }
+      .system-map { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .workflow-part { grid-template-columns: 1fr; gap: 5px; }
+      .owner { justify-self: start; }
       .sequence-actors { display: none; }
-      .sequence-step {
-        grid-template-columns: 42px minmax(0, 1fr);
-        min-height: 74px;
-      }
-      .step-index { grid-column: 1; grid-row: 1; }
-      .step-message,
-      .step-message.runner-orchestrator,
-      .step-message.orchestrator-linear,
-      .step-message.orchestrator-workspace,
-      .step-message.orchestrator-local,
-      .step-message.orchestrator-codex,
-      .step-message.orchestrator-state {
-        grid-column: 2 !important;
-        align-items: flex-start;
-        flex-direction: column;
-        justify-content: center;
-        gap: 4px;
-        padding: 10px 12px;
-      }
-      .step-message::before, .step-message::after { display: none; }
-      .step-route {
-        display: block;
-        color: var(--faint);
-        font-family: Inter, ui-sans-serif, system-ui, sans-serif;
-        font-size: 9px;
-        font-weight: 700;
-        text-transform: uppercase;
-      }
-      .step-label { margin: 0; background: transparent; padding: 0; }
-      .sequence-explain { grid-template-columns: 1fr; gap: 5px; min-width: 0; }
-      .review-boundary, .boundaries { grid-template-columns: 1fr; }
-      .command { grid-template-columns: 1fr; gap: 4px; padding: 12px 0; }
-      .shared-frame ul { columns: 1; }
-      .case-turn summary { grid-template-columns: 42px 88px minmax(0, 1fr) auto; padding: 8px 11px; }
+      .sequence-message { grid-template-columns: 1fr; gap: 2px; }
+      .sequence-explain, .security-note { grid-template-columns: 1fr; gap: 5px; }
+      .review-gate { grid-template-columns: 1fr; }
+      .gate-stage { border-right: 0; border-bottom: 1px solid var(--line); }
+      .gate-stage:last-child { border-bottom: 0; }
+      .turn-sync-grid { grid-template-columns: 1fr; }
     }
 
     @media (max-width: 520px) {
-      .topbar-inner { align-items: flex-start; flex-direction: column; gap: 5px; padding: 9px 0 7px; }
+      html { scroll-padding-top: 108px; }
+      .topbar-inner { align-items: flex-start; flex-direction: column; gap: 4px; padding: 8px 0; }
       .nav-links { width: 100%; margin-left: 0; }
-      .nav-links a { padding: 5px 8px; }
-      html { scroll-padding-top: 106px; }
-      .overview-grid { gap: 42px; }
-      h1 { font-size: 32px; }
+      .overview { padding-top: 48px; }
+      h1 { font-size: 31px; }
       .overview-copy { font-size: 16px; }
-      .fact-row { display: grid; grid-template-columns: 1fr; }
-      .system-map { grid-template-columns: 1fr; }
-      .map-node.runtime { grid-column: 1; }
-      .diagram-toolbar { align-items: flex-start; flex-direction: column; padding: 10px 12px; }
-      .sequence-controls { align-items: flex-start; flex-direction: column; }
-      .play-button { width: 100%; justify-content: center; }
-      .case-fact, .turn-trigger { grid-template-columns: 1fr; gap: 3px; }
-      .case-turns { padding-left: 20px; }
-      .case-turn::before { left: -18px; }
-      .case-turn summary { grid-template-columns: 36px minmax(0, 1fr) auto; }
+      .system-map, .edge-list, .workflow-layers, .case-summary, .boundaries { grid-template-columns: 1fr; }
+      .edge:nth-child(odd), .boundary { border-right: 0; }
+      .boundary:nth-last-child(2) { border-bottom: 1px solid var(--line); }
+      .lifecycle-track, .auth-flow { grid-template-columns: 1fr; }
+      .life-state, .life-state:nth-child(3), .auth-step, .auth-step:nth-child(2) { border-right: 0; border-bottom: 1px solid var(--line); }
+      .life-state:last-child, .auth-step:last-child { border-bottom: 0; }
+      .case-turn summary { grid-template-columns: 52px minmax(0, 1fr); }
       .case-turn summary .state-pill { display: none; }
-      .turn-title { grid-column: 2; }
-      .case-turn summary::after { grid-column: 3; grid-row: 1; }
-      .turn-body { padding: 14px; }
+      .turn-trigger, .command { grid-template-columns: 1fr; gap: 4px; }
       .footer-inner { flex-direction: column; }
     }
 
@@ -1143,19 +313,11 @@
 <body>
   <header class="topbar">
     <div class="topbar-inner">
-      <a class="brand" href="#overview" aria-label="返回 Symphonz 服务机制顶部">
-        <span class="brand-mark">S</span>
-        <span>Symphonz</span>
-        <span class="version">v0.3.1</span>
-      </a>
-      <nav class="nav-links" aria-label="页面章节">
-        <a href="#system-map">系统地图</a>
-        <a href="#linear-polling">Linear 监听</a>
-        <a href="#codex-trigger">Codex 触发</a>
-        <a href="#workflow-anatomy">WORKFLOW</a>
-        <a href="#issue-lifecycle">状态链路</a>
-        <a href="#real-case-simulation">真实案例</a>
-        <a href="#implementation-boundaries">实现边界</a>
+      <a class="brand" href="#overview" aria-label="返回指南顶部"><span class="brand-mark">S</span><span>Symphonz</span><span class="version">v0.4.0</span></a>
+      <nav class="nav-links" aria-label="开发者指南章节">
+        <a href="#system-map">架构</a><a href="#linear-polling">轮询</a><a href="#codex-trigger">协议</a>
+        <a href="#workflow-anatomy">WORKFLOW</a><a href="#persistence-reporting">报告</a>
+        <a href="#dashboard-auth">认证</a><a href="#real-case-simulation">案例</a><a href="#project-layout">运维</a>
       </nav>
     </div>
   </header>
@@ -1164,95 +326,59 @@
     <section class="overview" id="overview">
       <div class="section-inner overview-grid">
         <div>
-          <div class="eyebrow"><span class="eyebrow-dot"></span>Developer Guide · Current Implementation</div>
-          <h1>一条 Linear Issue，如何变成一次 Codex 工程任务</h1>
-          <p class="overview-copy">Symphonz 是连接任务系统和编码代理的轻量调度层。它持续监听 Linear，将符合条件的 Issue 放进独立工作目录，再通过 Codex app-server 启动一轮带完整项目规则的开发会话。</p>
-          <div class="fact-row" aria-label="核心事实">
-            <span class="fact">默认每 5 秒轮询</span>
-            <span class="fact">每个 Issue 独立 Workspace</span>
-            <span class="fact">JSON-RPC 触发 Codex</span>
-          </div>
+          <div class="eyebrow">Developer Guide · Runtime v0.4.0</div>
+          <h1>从 Linear Issue 到可审阅、可恢复的实现报告</h1>
+          <p class="overview-copy">Symphonz 轮询 Linear，把符合条件的 Issue 交给独立 Codex app-server 进程；Runtime 持久化任务、事件、错误和结构化报告，并用认证 Dashboard 提供重启后仍可访问的审核入口。</p>
+          <div class="fact-row"><span class="fact">标准库 Runtime</span><span class="fact">SQLite 持久历史</span><span class="fact">结构化报告工具</span><span class="fact">LAN 单用户认证</span></div>
         </div>
-        <div class="overview-flow" aria-label="服务流程概览">
-          <div class="flow-stop"><span class="flow-index">01</span><div><strong>监听 Linear</strong><span>按项目、状态和标签查询候选 Issue</span></div></div>
-          <div class="flow-stop"><span class="flow-index">02</span><div><strong>准备 Workspace</strong><span>创建目录，首次进入时克隆目标仓库</span></div></div>
-          <div class="flow-stop"><span class="flow-index">03</span><div><strong>触发 Codex</strong><span>渲染 WORKFLOW Prompt，启动 thread 和 turn</span></div></div>
-          <div class="flow-stop"><span class="flow-index">04</span><div><strong>发布与审核</strong><span>Codex 根据 Issue 状态推送分支并创建 PR / MR</span></div></div>
+        <div class="chain" aria-label="0.4.0 核心链路">
+          <div class="chain-step"><strong>1. Poll 与路由</strong><span>项目、状态、标签、依赖和 attempt 预算共同决定 eligibility</span></div>
+          <div class="chain-step"><strong>2. Workspace 与 Codex</strong><span>复用 issue 目录和分支，每次 invocation 建立 app-server thread</span></div>
+          <div class="chain-step"><strong>3. Review 与报告</strong><span>Agent 创建 PR/MR，Runtime 验证、保存、渲染并同步报告评论</span></div>
+          <div class="chain-step"><strong>4. Human Review 与清理</strong><span>人工决定 Rework/Merging；终态删除 workspace，但历史与 artifact 保留</span></div>
         </div>
       </div>
     </section>
 
     <section class="section" id="system-map">
       <div class="section-inner">
-        <div class="section-kicker">01 · Architecture</div>
-        <h2 class="section-heading">先看边界：谁调用谁，谁负责改变外部状态</h2>
-        <p class="section-lead">Symphonz Runtime 负责发现和分发任务；Codex 根据 <code>WORKFLOW.md</code> 执行代码修改以及 Linear、GitHub、GitLab 上的操作。点击组件可查看它的输入与输出。</p>
-        <hr class="section-rule">
-
+        <div class="section-kicker">01 · System Map</div>
+        <h2 class="section-heading">先分清控制面、执行面和持久化边界</h2>
+        <p class="section-lead">Runtime 拥有调度、存储、报告渲染、认证和 Linear 报告评论；Agent 拥有代码改动、Workpad、分支和 review request 操作。点击组件查看输入输出。</p>
+        <hr class="rule">
         <div class="map-layout">
-          <div class="diagram-shell">
-            <div class="diagram-toolbar">
-              <span class="diagram-title">组件与数据流</span>
-              <div class="legend" aria-label="连线说明">
-                <span class="legend-item"><span class="legend-line"></span>Runtime 直接调用</span>
-                <span class="legend-item"><span class="legend-line dashed"></span>Codex 按工作流执行</span>
-              </div>
-            </div>
+          <div class="diagram-frame">
+            <div class="diagram-head"><strong>组件与数据流</strong><span>实线职责由 Runtime 执行；Agent 操作由 WORKFLOW 约束</span></div>
             <div class="system-map">
-              <svg class="map-connections" viewBox="0 0 900 480" role="img" aria-label="组件之间的定向调用关系" preserveAspectRatio="none">
-                <defs>
-                  <marker id="arrow-direct" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L8,4 L0,8 Z" fill="#5e6ad2"></path></marker>
-                  <marker id="arrow-delegated" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L8,4 L0,8 Z" fill="#9b6015"></path></marker>
-                </defs>
-                <path class="edge-direct" data-edge="runtime-linear" d="M400 218 L218 126"></path>
-                <text x="275" y="162">query issues</text>
-                <path class="edge-direct" data-edge="runtime-workflow" d="M450 185 L450 126"></path>
-                <text x="458" y="158">read</text>
-                <path class="edge-direct" data-edge="runtime-workspace" d="M395 282 L215 358"></path>
-                <text x="272" y="326">create / reuse</text>
-                <path class="edge-direct" data-edge="runtime-codex" d="M505 210 L688 126"></path>
-                <text x="572" y="162">JSON-RPC</text>
-                <path class="edge-direct" data-edge="runtime-state" d="M450 292 L450 356"></path>
-                <text x="458" y="330">record</text>
-                <path class="edge-delegated" data-edge="codex-linear" d="M744 62 C650 10 250 10 156 62"></path>
-                <text x="365" y="24">status / workpad</text>
-                <path class="edge-delegated" data-edge="codex-provider" d="M760 126 L760 355"></path>
-                <text x="770" y="248">push / PR / MR</text>
-              </svg>
-
-              <button class="map-node linear" type="button" data-component="linear" aria-pressed="false">
-                <span class="node-type">Tracker</span><strong>Linear GraphQL</strong><small>Issue、状态、标签、描述</small>
-              </button>
-              <button class="map-node workflow" type="button" data-component="workflow" aria-pressed="false">
-                <span class="node-type">Definition</span><strong>WORKFLOW.md</strong><small>运行配置 + Prompt 模板</small>
-              </button>
-              <button class="map-node codex" type="button" data-component="codex" aria-pressed="false">
-                <span class="node-type">Agent Protocol</span><strong>Codex app-server</strong><small>thread、turn、事件流</small>
-              </button>
-              <button class="map-node runtime" type="button" data-component="runtime" aria-pressed="true">
-                <span class="node-type">Orchestration</span><strong>Symphonz Runtime</strong><small>Runner · Orchestrator · Clients</small>
-              </button>
-              <button class="map-node workspace" type="button" data-component="workspace" aria-pressed="false">
-                <span class="node-type">Filesystem</span><strong>Issue Workspace</strong><small>.symphonz/workspace/ZHA-8</small>
-              </button>
-              <button class="map-node state" type="button" data-component="state" aria-pressed="false">
-                <span class="node-type">Observability</span><strong>Runtime State / Dashboard</strong><small>running、completed、blocked</small>
-              </button>
-              <button class="map-node provider" type="button" data-component="provider" aria-pressed="false">
-                <span class="node-type">Publishing</span><strong>GitHub / GitLab</strong><small>branch、PR / MR、merge</small>
-              </button>
+              <button class="map-node linear" type="button" data-component="linear" aria-pressed="false"><span class="node-type">Control plane</span><strong>Linear GraphQL</strong><small>Issue 状态、Workpad、Runtime 报告评论</small></button>
+              <button class="map-node workflow" type="button" data-component="workflow" aria-pressed="false"><span class="node-type">Definition</span><strong>WORKFLOW.md</strong><small>front matter 配置 + Agent Prompt</small></button>
+              <button class="map-node runtime" type="button" data-component="runtime" aria-pressed="true"><span class="node-type">Orchestrator</span><strong>Symphonz Runtime</strong><small>轮询、claim、retry、cleanup</small></button>
+              <button class="map-node workspace" type="button" data-component="workspace" aria-pressed="false"><span class="node-type">Ephemeral</span><strong>Issue Workspace</strong><small>仓库、issue branch、验证现场</small></button>
+              <button class="map-node codex" type="button" data-component="codex" aria-pressed="false"><span class="node-type">Execution</span><strong>Codex app-server</strong><small>initialize、thread、turn、tools</small></button>
+              <button class="map-node provider" type="button" data-component="provider" aria-pressed="false"><span class="node-type">Review</span><strong>GitHub / GitLab</strong><small>branch、PR/MR、checks、merge</small></button>
+              <button class="map-node report" type="button" data-component="report" aria-pressed="false"><span class="node-type">Publisher</span><strong>ReportPublisher</strong><small>校验 JSON、原子 bundle、Linear sync</small></button>
+              <button class="map-node store" type="button" data-component="store" aria-pressed="false"><span class="node-type">Durable state</span><strong>RuntimeStore</strong><small>task、timeline、error、report、session</small></button>
+              <button class="map-node dashboard" type="button" data-component="dashboard" aria-pressed="false"><span class="node-type">Operations UI</span><strong>Dashboard + Auth</strong><small>登录、任务、错误、稳定报告路由</small></button>
+            </div>
+            <div class="edge-list" aria-label="架构边语义">
+              <div class="edge" data-edge="runtime-linear"><strong>Runtime → Linear</strong><span>poll / reconcile</span></div>
+              <div class="edge" data-edge="runtime-workflow"><strong>Runtime → WORKFLOW</strong><span>parse / render</span></div>
+              <div class="edge" data-edge="runtime-workspace"><strong>Runtime → Workspace</strong><span>create / reuse / remove</span></div>
+              <div class="edge" data-edge="runtime-codex"><strong>Runtime → Codex</strong><span>JSON-RPC</span></div>
+              <div class="edge" data-edge="runtime-store"><strong>Runtime → RuntimeStore</strong><span>milestones / errors</span></div>
+              <div class="edge" data-edge="codex-linear"><strong>Codex → Linear</strong><span>linear_graphql Workpad</span></div>
+              <div class="edge" data-edge="codex-report"><strong>Codex → ReportPublisher</strong><span>symphonz_report</span></div>
+              <div class="edge" data-edge="report-store"><strong>ReportPublisher → Store</strong><span>authoritative generation</span></div>
+              <div class="edge" data-edge="report-linear"><strong>ReportPublisher → Linear</strong><span>one runtime comment</span></div>
+              <div class="edge" data-edge="dashboard-store"><strong>Dashboard → Store</strong><span>tasks / history / sessions</span></div>
+              <div class="edge" data-edge="dashboard-auth"><strong>Dashboard → Auth</strong><span>KDF / cookie / rate limit</span></div>
+              <div class="edge" data-edge="codex-provider"><strong>Codex → Provider</strong><span>push / PR / MR / merge</span></div>
             </div>
           </div>
-
           <aside class="component-detail" id="component-detail" aria-live="polite">
-            <span class="detail-label">Selected component</span>
-            <h3 id="detail-title">Symphonz Runtime</h3>
-            <p id="detail-description">Python 内置服务。读取工作流、构造客户端、驱动轮询，并把每个候选 Issue 转换为一次 Codex turn。</p>
-            <div class="io-list">
-              <div class="io-item"><span>输入</span><strong id="detail-input">WORKFLOW.md、环境变量、Linear Issue</strong></div>
-              <div class="io-item"><span>输出</span><strong id="detail-output">Workspace、Codex session、Runtime event</strong></div>
-              <div class="io-item"><span>代码位置</span><strong class="mono" id="detail-code">runner.py · orchestrator.py</strong></div>
-            </div>
+            <span class="detail-label">Selected component</span><h3 id="detail-title">Symphonz Runtime</h3>
+            <p id="detail-description">Runner 组装共享服务，Orchestrator 轮询、分发、持久化里程碑并处理重试和终态清理。</p>
+            <div class="detail-grid"><div><span>输入</span><strong id="detail-input">WORKFLOW、Linear Issue、配置与凭据引用</strong></div><div><span>输出</span><strong id="detail-output">Codex turn、RuntimeEvent、持久任务状态</strong></div><div><span>代码</span><strong id="detail-code">runner.py · orchestrator.py</strong></div></div>
           </aside>
         </div>
       </div>
@@ -1261,42 +387,35 @@
     <section class="section" id="linear-polling">
       <div class="section-inner">
         <div class="section-kicker">02 · Linear Polling</div>
-        <h2 class="section-heading">Linear 不是发 Webhook，而是由服务周期性拉取</h2>
-        <p class="section-lead"><code>run_service()</code> 按 <code>polling.interval_ms</code> 进入循环。每轮查询指定项目中处于活动状态的 Issue，再由 Orchestrator 做标签和运行中去重。</p>
-        <hr class="section-rule">
-
-        <div class="poll-grid">
-          <div class="poll-loop" aria-label="Linear 轮询步骤">
-            <div class="poll-stage"><span class="poll-number">1</span><div><h3>加载工作流配置</h3><p>读取项目 slug、API key 引用、活动状态、必需标签与轮询间隔。</p></div></div>
-            <div class="poll-stage"><span class="poll-number">2</span><div><h3>执行 SymphonzPoll</h3><p>向 Linear GraphQL 发送查询，一次最多获取 50 条候选 Issue。</p></div></div>
-            <div class="poll-stage"><span class="poll-number">3</span><div><h3>筛选候选 Issue</h3><p>GraphQL 已按项目和状态过滤；本地再确认 <code>required_labels</code>。</p></div></div>
-            <div class="poll-stage"><span class="poll-number">4</span><div><h3>跳过正在运行的 Issue</h3><p>若 identifier 已存在于 <code>state.running</code>，本轮不重复启动。</p></div></div>
-            <div class="poll-stage"><span class="poll-number">5</span><div><h3>同步执行并等待</h3><p>当前实现逐条调用 <code>run_issue()</code>，一个 Codex turn 完成后才处理下一条。</p></div></div>
-            <div class="poll-stage"><span class="poll-number">6</span><div><h3>等待下一轮</h3><p>默认休眠 5000ms，最小强制为 1000ms，然后重新查询 Linear。</p></div></div>
+        <h2 class="section-heading">轮询结果先过 eligibility，再按状态选择工程路由</h2>
+        <p class="section-lead"><code>SymphonzPoll</code> 分页读取 <code>active_states</code>；Orchestrator 再检查标签、阻塞依赖、并发 claim、终态和持久 attempt 预算。Linear 是外部控制面，状态变化就是下一次 Agent 指令。</p>
+        <hr class="rule">
+        <div class="two-column">
+          <div class="step-list" aria-label="Linear 轮询和资格判断">
+            <div class="step"><span class="step-index">1</span><div><h3>加载 tracker 配置</h3><p>读取 project slug、API key 环境变量名、active/terminal states、required labels。</p></div></div>
+            <div class="step"><span class="step-index">2</span><div><h3>分页执行 SymphonzPoll</h3><p>每页最多 50 条；缺少 end cursor 或 GraphQL errors 会形成结构化 tracker error。</p></div></div>
+            <div class="step"><span class="step-index">3</span><div><h3>检查 eligibility</h3><p>排除缺标签、被未完成 Issue 阻塞、已 claimed、终态或超过 max_attempts 的记录。</p></div></div>
+            <div class="step"><span class="step-index">4</span><div><h3>按状态路由</h3><p>Todo/In Progress 实现，Ready to Publish 发布，Rework 返工，Merging 合并。</p></div></div>
+            <div class="step"><span class="step-index">5</span><div><h3>并发与退避</h3><p>不同 Issue 受 max_concurrent_agents 限制；失败进入有预算的指数退避，预算跨重启保留。</p></div></div>
           </div>
-
           <div>
-            <div class="code-panel" aria-label="Linear GraphQL 查询示例">
-              <div class="code-head"><span>SymphonzPoll.graphql</span><span>linear.py</span></div>
-              <pre><span class="code-key">query</span> SymphonzPoll(
-  <span class="code-string">$projectSlug</span>: String!,
-  <span class="code-string">$stateNames</span>: [String!]!,
-  <span class="code-string">$first</span>: Int!
-) {
-  issues(filter: {
-    project: { slugId: { eq: <span class="code-string">$projectSlug</span> } },
-    state: { name: { in: <span class="code-string">$stateNames</span> } }
-  }, first: <span class="code-string">$first</span>) {
-    nodes {
-      id identifier title description priority
-      state { name }
-      branchName url
-      labels { nodes { name } }
-    }
-  }
-}</pre>
-            </div>
-            <div class="poll-note"><strong>当前调度模型：</strong>Orchestrator 按优先级领取候选 Issue，过滤未完成 blocker，并依据 <code>agent.max_concurrent_agents</code> 进行有界并发执行。同一 Issue 的 claim 保证每轮只会进入一个 worker。</div>
+            <div class="code-panel"><div class="code-head"><span>eligibility.route</span><span>orchestrator.py</span></div><pre>candidate = project + active_state + labels
+
+eligible = (
+  not claimed
+  and dependencies_completed
+  and attempt_budget_available
+  and state not in terminal_states
+)
+
+Todo / In Progress   -> implement
+Ready to Publish     -> publish report + review
+Human Review         -> inactive pause
+Rework               -> address feedback
+Merging              -> verify + merge
+Done / Closed / Cancelled / Canceled / Duplicate
+                     -> terminal cleanup</pre></div>
+            <div class="note"><strong>重启语义：</strong><code>attempts.sqlite3</code> 保存状态级预算，<code>runtime.sqlite3</code> 保存可查询历史。服务重启不会把失败任务伪装成第一次执行，也不依赖进程内最近 200 条事件恢复 Dashboard。</div>
           </div>
         </div>
       </div>
@@ -1304,51 +423,31 @@
 
     <section class="section" id="codex-trigger">
       <div class="section-inner">
-        <div class="section-kicker">03 · Codex Trigger</div>
-        <h2 class="section-heading">每个 Issue 如何触发一次 Codex app-server turn</h2>
-        <p class="section-lead">Symphonz 不调用一次性的 <code>codex exec</code>。它启动配置中的 app-server 命令，通过逐行 JSON-RPC 建立客户端、创建 thread、启动 turn，并持续消费事件直到结束。</p>
-        <hr class="section-rule">
-
-        <div class="sequence-wrap">
-          <div class="sequence-controls">
-            <span class="sequence-help">点击任一步查看说明；完整标签在无 JavaScript 时仍可阅读。</span>
-            <button class="play-button" id="play-sequence" type="button" aria-label="播放 Codex 触发链路"><span class="play-icon">▶</span><span id="play-label">播放链路</span></button>
+        <div class="section-kicker">03 · Codex Protocol</div>
+        <h2 class="section-heading">每次 worker invocation 都建立明确的 app-server 生命周期</h2>
+        <p class="section-lead">Runtime 在 Issue Workspace 中启动独立子进程，完成 <code>initialize</code> 握手、<code>initialized</code> 通知、<code>thread/start</code> 和一个或多个 <code>turn/start</code>。所有工具调用、事件和退出都经过同一 JSON-RPC 流。</p>
+        <hr class="rule">
+        <div class="sequence-controls"><span class="sequence-help">逐步点击可查看触发条件与持久化效果。</span><button class="play-button" id="play-sequence" type="button" aria-label="播放 Codex 触发链路"><span id="play-label">播放链路</span></button></div>
+        <div class="sequence-diagram">
+          <div class="sequence-actors" aria-hidden="true"><span class="actor">#</span><span class="actor">Linear</span><span class="actor">Runtime</span><span class="actor">Workspace</span><span class="actor">Codex</span><span class="actor">Store</span></div>
+          <div class="sequence-steps">
+            <button class="sequence-step" type="button" data-sequence-step="poll" aria-pressed="false"><span class="sequence-number">01</span><span class="sequence-message"><span class="sequence-route">Runtime → Linear</span><span class="sequence-label">SymphonzPoll(active_states)</span></span></button>
+            <button class="sequence-step" type="button" data-sequence-step="eligibility" aria-pressed="false"><span class="sequence-number">02</span><span class="sequence-message"><span class="sequence-route">Runtime · local</span><span class="sequence-label">eligibility + status route + attempt claim</span></span></button>
+            <button class="sequence-step" type="button" data-sequence-step="workspace" aria-pressed="false"><span class="sequence-number">03</span><span class="sequence-message"><span class="sequence-route">Runtime → Workspace</span><span class="sequence-label">prepare / hook / branch context</span></span></button>
+            <button class="sequence-step" type="button" data-sequence-step="initialize" aria-pressed="false"><span class="sequence-number">04</span><span class="sequence-message"><span class="sequence-route">Runtime → Codex</span><span class="sequence-label">initialize { clientInfo, capabilities }</span></span></button>
+            <button class="sequence-step" type="button" data-sequence-step="initialized" aria-pressed="false"><span class="sequence-number">05</span><span class="sequence-message"><span class="sequence-route">Runtime → Codex</span><span class="sequence-label">initialized notification</span></span></button>
+            <button class="sequence-step" type="button" data-sequence-step="thread" aria-pressed="false"><span class="sequence-number">06</span><span class="sequence-message"><span class="sequence-route">Runtime → Codex</span><span class="sequence-label">thread/start { cwd, sandbox, dynamicTools }</span></span></button>
+            <button class="sequence-step" type="button" data-sequence-step="turn" aria-pressed="false"><span class="sequence-number">07</span><span class="sequence-message"><span class="sequence-route">Runtime → Codex</span><span class="sequence-label">turn/start { threadId, title, input, sandboxPolicy }</span></span></button>
+            <button class="sequence-step" type="button" data-sequence-step="linear-tool" aria-pressed="false"><span class="sequence-number">08</span><span class="sequence-message"><span class="sequence-route">Codex → Runtime</span><span class="sequence-label">linear_graphql(query, variables)</span></span></button>
+            <button class="sequence-step" type="button" data-sequence-step="report-tool" aria-pressed="false"><span class="sequence-number">09</span><span class="sequence-message"><span class="sequence-route">Codex → Runtime</span><span class="sequence-label">symphonz_report(operation=publish)</span></span></button>
+            <button class="sequence-step" type="button" data-sequence-step="persist" aria-pressed="false"><span class="sequence-number">10</span><span class="sequence-message"><span class="sequence-route">Runtime → Store</span><span class="sequence-label">task / timeline / error / report milestones</span></span></button>
+            <button class="sequence-step" type="button" data-sequence-step="report-sync" aria-pressed="false"><span class="sequence-number">11</span><span class="sequence-message"><span class="sequence-route">Runtime → Linear</span><span class="sequence-label">create or update one report comment</span></span></button>
+            <button class="sequence-step" type="button" data-sequence-step="human-review" aria-pressed="false"><span class="sequence-number">12</span><span class="sequence-message"><span class="sequence-route">Linear · gate</span><span class="sequence-label">Human Review pauses automatic execution</span></span></button>
+            <button class="sequence-step" type="button" data-sequence-step="terminal-cleanup" aria-pressed="false"><span class="sequence-number">13</span><span class="sequence-message"><span class="sequence-route">Runtime → Workspace</span><span class="sequence-label">terminal state removes workspace, preserves artifacts</span></span></button>
           </div>
-
-          <div class="sequence-diagram">
-            <div class="sequence-actors" aria-hidden="true">
-              <div class="actor">#</div><div class="actor">Runner</div><div class="actor">Orchestrator</div><div class="actor" data-actor="linear">Linear</div><div class="actor">Workspace</div><div class="actor">Codex</div><div class="actor">Runtime State</div>
-            </div>
-            <div class="sequence-steps">
-              <button class="sequence-step" type="button" data-sequence-step="poll" aria-pressed="false"><span class="step-index">01</span><span class="step-message runner-orchestrator"><span class="step-route">Runner → Orchestrator</span><span class="step-label">poll_once()</span></span></button>
-              <button class="sequence-step" type="button" data-sequence-step="linear-query" aria-pressed="false"><span class="step-index">02</span><span class="step-message orchestrator-linear"><span class="step-route">Orchestrator → Linear</span><span class="step-label">fetch_candidate_issues(active_states)</span></span></button>
-              <button class="sequence-step" type="button" data-sequence-step="candidate" aria-pressed="false"><span class="step-index">03</span><span class="step-message orchestrator-linear reverse"><span class="step-route">Linear → Orchestrator</span><span class="step-label">issues[]</span></span></button>
-              <button class="sequence-step" type="button" data-sequence-step="workspace" aria-pressed="false"><span class="step-index">04</span><span class="step-message orchestrator-workspace"><span class="step-route">Orchestrator → Workspace</span><span class="step-label">prepare_workspace(issue)</span></span></button>
-              <button class="sequence-step" type="button" data-sequence-step="hook" aria-pressed="false"><span class="step-index">05</span><span class="step-message orchestrator-workspace reverse"><span class="step-route">Workspace → Orchestrator</span><span class="step-label">path · after_create when new</span></span></button>
-              <button class="sequence-step" type="button" data-sequence-step="prompt" aria-pressed="false"><span class="step-index">06</span><span class="step-message orchestrator-local"><span class="step-route">Orchestrator · local</span><span class="step-label">render_prompt(WORKFLOW, issue)</span></span></button>
-              <button class="sequence-step" type="button" data-sequence-step="spawn" aria-pressed="false"><span class="step-index">07</span><span class="step-message orchestrator-codex"><span class="step-route">Orchestrator → Codex</span><span class="step-label">spawn codex app-server</span></span></button>
-              <button class="sequence-step" type="button" data-sequence-step="initialize" aria-pressed="false"><span class="step-index">08</span><span class="step-message orchestrator-codex"><span class="step-route">Orchestrator → Codex</span><span class="step-label">initialize { clientInfo, capabilities }</span></span></button>
-              <button class="sequence-step" type="button" data-sequence-step="initialize-result" aria-pressed="false"><span class="step-index">09</span><span class="step-message orchestrator-codex reverse"><span class="step-route">Codex → Orchestrator</span><span class="step-label">initialize result</span></span></button>
-              <button class="sequence-step" type="button" data-sequence-step="initialized" aria-pressed="false"><span class="step-index">10</span><span class="step-message orchestrator-codex"><span class="step-route">Orchestrator → Codex</span><span class="step-label">initialized notification</span></span></button>
-              <button class="sequence-step" type="button" data-sequence-step="thread" aria-pressed="false"><span class="step-index">11</span><span class="step-message orchestrator-codex"><span class="step-route">Orchestrator → Codex</span><span class="step-label">thread/start { cwd, sandbox }</span></span></button>
-              <button class="sequence-step" type="button" data-sequence-step="thread-result" aria-pressed="false"><span class="step-index">12</span><span class="step-message orchestrator-codex reverse"><span class="step-route">Codex → Orchestrator</span><span class="step-label">thread.id</span></span></button>
-              <button class="sequence-step" type="button" data-sequence-step="turn" aria-pressed="false"><span class="step-index">13</span><span class="step-message orchestrator-codex"><span class="step-route">Orchestrator → Codex</span><span class="step-label">turn/start { threadId, input }</span></span></button>
-              <button class="sequence-step" type="button" data-sequence-step="events" aria-pressed="false"><span class="step-index">14</span><span class="step-message orchestrator-codex reverse"><span class="step-route">Codex → Orchestrator</span><span class="step-label">turn/* events · completion</span></span></button>
-              <button class="sequence-step" type="button" data-sequence-step="state" aria-pressed="false"><span class="step-index">15</span><span class="step-message orchestrator-state"><span class="step-route">Orchestrator → Runtime State</span><span class="step-label">completed / blocked + RuntimeEvent</span></span></button>
-            </div>
-            <div class="sequence-explain" aria-live="polite">
-              <span id="sequence-title">完整链路</span>
-              <p id="sequence-description">从一次 Linear 轮询开始，依次准备 workspace、渲染 Prompt、创建 Codex thread 和 turn，最后把结果写入内存状态。</p>
-            </div>
-          </div>
+          <div class="sequence-explain" aria-live="polite"><span id="sequence-title">完整链路</span><p id="sequence-description">从 Linear 候选查询开始，到持久报告、人工审核门和终态清理结束。</p></div>
         </div>
-
-        <div class="protocol-grid" aria-label="Codex JSON-RPC 四个关键消息">
-          <div class="protocol-step"><strong>initialize</strong><p>携带 <code>clientInfo.name=symphonz</code>、当前版本和 experimental API capability。</p></div>
-          <div class="protocol-step"><strong>initialized</strong><p>收到 initialize result 后发送通知，完成客户端握手；该通知没有请求 id。</p></div>
-          <div class="protocol-step"><strong>thread/start</strong><p>设置 Issue workspace 为 cwd，并传入 approval policy 与 thread sandbox。</p></div>
-          <div class="protocol-step"><strong>turn/start</strong><p>把渲染后的 Issue Prompt 放入 text input，同时设置 title 与 turn sandbox policy。</p></div>
-        </div>
+        <div class="note"><strong>进程边界：</strong>每次 invocation 创建一个 app-server 进程和 thread；同一 invocation 的 continuation turn 复用 thread。结束、取消或 timeout 时 Runtime 关闭整个进程组，避免遗留 child process。</div>
       </div>
     </section>
 
@@ -1356,191 +455,22 @@
       <div class="section-inner">
         <div class="section-kicker">04 · WORKFLOW Anatomy</div>
         <h2 class="section-heading">当前 WORKFLOW.md 为什么这样写</h2>
-        <p class="section-lead"><code>WORKFLOW.md</code> 同时承担两种职责：Front matter 是 Symphonz Runtime 读取的配置层，正文是每次完整发送给 Codex 的 Prompt 层。把两层放在一个文件中，可以让“何时触发”和“触发后怎么做”保持同一个版本。</p>
-        <hr class="section-rule">
-
+        <p class="section-lead"><code>WORKFLOW.md</code> 把“何时触发”和“触发后必须完成什么”放在同一个可版本化文件中。Front matter 是 Runtime 的配置层，正文是完整发送给 Codex 的 Prompt 层；Runtime 不假装理解项目工程步骤，Agent 也不能接管认证、报告存储或清理。</p>
+        <hr class="rule">
         <div class="workflow-layers">
-          <div class="workflow-layer">
-            <h3>配置层 · Runtime 读取</h3>
-            <p>定义 Linear 查询条件、轮询、workspace hook 和 Codex app-server 启动参数。Python 服务只解析 front matter，不执行正文里的 Git/Linear 操作步骤。</p>
-          </div>
-          <div class="workflow-layer prompt-layer">
-            <h3>Prompt 层 · Codex 执行</h3>
-            <p>把 Issue 上下文、状态路由、Workpad 格式、分支约定、验证和发布规则作为一次完整工程任务发送给 Codex。</p>
-          </div>
+          <div class="workflow-layer"><h3>配置层 · Runtime 读取</h3><p>tracker 查询、workspace hooks、并发/重试预算、Codex command、approval policy 和 sandbox 都是确定性运行参数。</p></div>
+          <div class="workflow-layer"><h3>Prompt 层 · Agent 执行</h3><p>Issue context、状态路由、Workpad 格式、分支/Review 约定、验证、报告发布和 Human Review 门是工程行为约束。</p></div>
         </div>
-
-        <div class="workflow-list">
-          <article class="workflow-row" data-workflow-part="tracker">
-            <div>
-              <h3>1. Tracker 与活动状态</h3>
-              <pre class="workflow-snippet">tracker:
-  api_key: $LINEAR_API_KEY
-  project_slug: "..."
-  active_states:
-    - Todo
-    - In Progress
-    - Ready to Publish
-    - Merging
-    - Rework</pre>
-            </div>
-            <div class="workflow-rationale">
-              <span class="rationale-title">设计目的</span>
-              <p>密钥只写环境变量引用，避免安装生成的文件落入真实 secret。<code>active_states</code> 不是“未完成列表”，而是可触发 Codex 的命令集合：Todo/In Progress 做开发，Ready to Publish 做发布，Rework 做返工，Merging 做合并。</p>
-              <p><strong>Linear 是外部控制面：</strong>人或外部自动化通过改变 Issue 状态选择下一种执行路径。Human Review 被刻意排除，因此审核期间不会持续消耗 Codex。</p>
-              <div class="workflow-meta"><span class="owner-tag runtime">Runtime 查询</span><span class="owner-tag human">人改变状态</span></div>
-              <p class="workflow-limit">Runtime 使用线程安全 claim 去重；若 Issue 后续仍处于活动状态，会在下一轮继续同一 workspace，并携带递增的 attempt 上下文。</p>
-            </div>
-          </article>
-
-          <article class="workflow-row" data-workflow-part="workspace">
-            <div>
-              <h3>2. 轮询、Workspace 与首次 Hook</h3>
-              <pre class="workflow-snippet">polling:
-  interval_ms: 5000
-workspace:
-  root: .symphonz/workspace
-hooks:
-  after_create: |
-    git clone --depth 1 "$SYMPHONZ_REPO_URL" .</pre>
-            </div>
-            <div class="workflow-rationale">
-              <span class="rationale-title">设计目的</span>
-              <p>轮询让接入方不需要部署 Webhook endpoint。每个 Issue 使用固定目录，使不同任务隔离，同时让后续 turn 能看到前一轮留下的分支、commit 和测试结果。</p>
-              <p><code>after_create</code> 只在目录第一次创建时执行，避免每轮重新 clone 覆盖未发布改动；之后直接复用现有 workspace。</p>
-              <div class="workflow-meta"><span class="owner-tag runtime">Runtime 创建目录</span><span class="owner-tag runtime">Runtime 执行 Hook</span></div>
-              <p class="workflow-limit">任务按 <code>max_concurrent_agents</code> 有界并发执行；同一 Issue 的 workspace 生命周期 hook 仍保持顺序。</p>
-            </div>
-          </article>
-
-          <article class="workflow-row" data-workflow-part="codex">
-            <div>
-              <h3>3. Codex app-server 与 Sandbox</h3>
-              <pre class="workflow-snippet">codex:
-  command: codex ... app-server
-  approval_policy: never
-  thread_sandbox: workspace-write
-  turn_sandbox_policy:
-    type: workspaceWrite
-    networkAccess: true</pre>
-            </div>
-            <div class="workflow-rationale">
-              <span class="rationale-title">设计目的</span>
-              <p>app-server 提供明确的 <code>initialize → thread/start → turn/start</code> 协议和事件流。无人值守场景使用 <code>approval_policy: never</code>，避免 turn 等待无法回应的确认框。</p>
-              <p>写权限限制在 Issue workspace；网络访问用于 Linear、Git provider、依赖下载和 CI 查询。权限边界由 Runtime 传给 Codex，但工具凭据仍由运行环境提供。</p>
-              <div class="workflow-meta"><span class="owner-tag runtime">Runtime 启动/约束</span><span class="owner-tag codex">Codex 执行工程任务</span></div>
-            </div>
-          </article>
-
-          <article class="workflow-row" data-workflow-part="issue-context">
-            <div>
-              <h3>4. 每轮都附带 Issue 与 Runtime 上下文</h3>
-              <pre class="workflow-snippet">Identifier: {{ issue.identifier }}
-Title: {{ issue.title }}
-Current status: {{ issue.state }}
-Labels: {{ issue.labels }}
-URL: {{ issue.url }}
-
-Description:
-{{ issue.description }}</pre>
-            </div>
-            <div class="workflow-rationale">
-              <span class="rationale-title">设计目的</span>
-              <p>每次 worker invocation 创建一个 Codex thread，并在 Issue 仍处于活动状态时复用该 thread 运行最多 <code>max_turns</code> 个 turn。后续重试会创建新 thread，因此 Issue 字段、workspace 位置、基础分支和 Git provider 仍会重新注入，使会话可从文件系统和 Linear Workpad 恢复上下文。</p>
-              <div class="workflow-meta"><span class="owner-tag runtime">Runtime 渲染变量</span><span class="owner-tag codex">Codex 读取上下文</span></div>
-              <p class="workflow-limit">失败或活动状态续跑会进入指数退避队列；新 invocation 会把递增的 <code>attempt</code> 注入 Prompt。达到 <code>max_attempts</code> 后进入 Blocked，只有 Linear 状态变化才会重置预算。预算按 Issue 与状态持久化到 <code>.symphonz/logs/attempts.sqlite3</code>，重启服务、并发服务实例或短暂移除标签都不会绕过限制；Linear 查询失败也不会消耗 Codex 额度。</p>
-            </div>
-          </article>
-
-          <article class="workflow-row" data-workflow-part="operating-rules">
-            <div>
-              <h3>5. Operating Rules</h3>
-              <pre class="workflow-snippet">1. Unattended session; do not ask a human.
-2. Work only inside the workspace.
-3. Keep one persistent Workpad.
-4. Ticket Validation/Test Plan is required.
-5. Reproduce before changing bug behavior.
-6. Keep Linear, branch and review state synced.</pre>
-            </div>
-            <div class="workflow-rationale">
-              <span class="rationale-title">设计目的</span>
-              <p>无人值守不是降低标准，而是把原本依赖人工提醒的工程纪律写进 Prompt：限制目录、先复现、遵守验收条件、持续同步外部状态，并在缺少权限时留下可诊断的 blocker。</p>
-              <div class="workflow-meta"><span class="owner-tag codex">Codex 强制遵守</span></div>
-            </div>
-          </article>
-
-          <article class="workflow-row" data-workflow-part="workpad">
-            <div>
-              <h3>6. 单一持久 Workpad</h3>
-              <pre class="workflow-snippet">## Symphonz Workpad
-
-### Plan
-### Acceptance Criteria
-### Validation
-### Review Request
-### Notes
-### Confusions</pre>
-            </div>
-            <div class="workflow-rationale">
-              <span class="rationale-title">设计目的</span>
-              <p><strong>一个 Issue 只维护一个 Workpad</strong>，避免每个 turn 创建新的进度评论。固定结构同时服务三方：新 Codex turn 用它恢复进度，reviewer 用它检查验证证据，维护者用它定位环境和 blocker。</p>
-              <p>清单必须反映真实状态，Review Request URL 和验证命令也放在同一处，因此 Linear 文档可以成为 workspace 之外的持久执行账本。</p>
-              <div class="workflow-meta"><span class="owner-tag codex">Codex 更新</span><span class="owner-tag human">人审阅</span></div>
-            </div>
-          </article>
-
-          <article class="workflow-row" data-workflow-part="status-map">
-            <div>
-              <h3>7. 状态映射就是执行路由</h3>
-              <pre class="workflow-snippet">Todo             → start implementation
-In Progress      → continue workspace
-Ready to Publish → publish branch + PR/MR
-Human Review     → pause
-Rework           → address feedback
-Merging          → validate + merge
-Done             → terminal</pre>
-            </div>
-            <div class="workflow-rationale">
-              <span class="rationale-title">设计目的</span>
-              <p><strong>Ready to Publish 是发布命令，Done 是终态。</strong>这样“实现完成”“准备发布”和“已经安全进入主分支”不会混为一谈。Human Review 是明确的人机边界，Rework 与 Merging 则由外部状态变化重新唤醒 Runtime。</p>
-              <div class="workflow-meta"><span class="owner-tag human">人选择路由</span><span class="owner-tag codex">Codex 执行路由</span></div>
-            </div>
-          </article>
-
-          <article class="workflow-row" data-workflow-part="review-convention">
-            <div>
-              <h3>8. 确定性分支与 Review Request</h3>
-              <pre class="workflow-snippet">branch:
-  symphonz/{{ issue.identifier }}-&lt;slug&gt;
-title:
-  {{ issue.identifier }}: {{ issue.title }}
-target:
-  SYMPHONZ_MR_TARGET → base branch → main</pre>
-            </div>
-            <div class="workflow-rationale">
-              <span class="rationale-title">设计目的</span>
-              <p>稳定命名让后续 turn 能找到同一分支和开放中的 PR/MR。若 review request 仍开放就复用，避免重复创建；若已关闭或合并，才从最新主分支重新开始。</p>
-              <div class="workflow-meta"><span class="owner-tag codex">Codex 创建/复用</span><span class="owner-tag human">人审核</span></div>
-            </div>
-          </article>
-
-          <article class="workflow-row" data-workflow-part="guardrails">
-            <div>
-              <h3>9. Guardrails 与阻塞处理</h3>
-              <pre class="workflow-snippet">Never push unvalidated changes.
-Never expand scope silently.
-Publish only from Ready to Publish.
-Treat Done as terminal.
-Do not merge with failing checks.
-On missing provider auth:
-  record blocker → Human Review</pre>
-            </div>
-            <div class="workflow-rationale">
-              <span class="rationale-title">设计目的</span>
-              <p>这些规则把高风险操作变成显式门槛。网络、凭据或 provider 工具缺失时，Codex 保留本地 commit、更新 Workpad 并转 Human Review，而不是丢失工作或伪造成功。</p>
-              <div class="workflow-meta"><span class="owner-tag codex">Codex 停止高风险动作</span><span class="owner-tag human">人处理 blocker</span></div>
-            </div>
-          </article>
+        <div class="workflow-parts">
+          <article class="workflow-part" data-workflow-part="tracker"><h3>1. tracker 与 polling</h3><p>声明 Linear project、active/terminal states 和标签。Linear 是外部控制面，Human Review 故意不在 active_states。</p><span class="owner runtime" data-owner="runtime">Runtime-owned</span></article>
+          <article class="workflow-part" data-workflow-part="workspace"><h3>2. workspace 与 hooks</h3><p>一个 identifier 对应一个可复用目录；首次 clone，轮次前后检查，终态执行 before_remove 后安全删除。</p><span class="owner runtime" data-owner="runtime">Runtime-owned</span></article>
+          <article class="workflow-part" data-workflow-part="codex"><h3>3. Codex 与 sandbox</h3><p>固定 app-server command、timeout、workspace-write 和 networkAccess；Runtime 传递边界并负责进程组退出。</p><span class="owner runtime" data-owner="runtime">Runtime-owned</span></article>
+          <article class="workflow-part" data-workflow-part="issue-context"><h3>4. Issue context</h3><p>每个 turn 都注入 identifier、title、state、labels、URL、description 和 attempt，允许从 Linear 与文件系统恢复。</p><span class="owner runtime" data-owner="runtime">Runtime-owned</span></article>
+          <article class="workflow-part" data-workflow-part="operating-rules"><h3>5. Operating Rules</h3><p>限制工作目录、禁止虚构成功、要求验证和同步，使 unattended session 有明确停止条件。</p><span class="owner agent" data-owner="agent">Agent-owned</span></article>
+          <article class="workflow-part" data-workflow-part="workpad"><h3>6. 单一 Workpad</h3><p>一个 Issue 只维护一个 Workpad。它记录计划、验收、验证、branch、review 和 report URL，跨 turn 保留 Agent 上下文。</p><span class="owner agent" data-owner="agent">Agent-owned</span></article>
+          <article class="workflow-part" data-workflow-part="status-map"><h3>7. Status Map</h3><p>Todo 实现、Ready to Publish 发布、Rework 修改、Merging 合并。Ready to Publish 是发布命令，Done 是终态。</p><span class="owner agent" data-owner="agent">Agent-owned</span></article>
+          <article class="workflow-part" data-workflow-part="review-convention"><h3>8. Branch 与 Review</h3><p>确定性 issue branch、目标分支、PR/MR 标题和复用规则减少并发 turn 对 provider 状态的歧义。</p><span class="owner agent" data-owner="agent">Agent-owned</span></article>
+          <article class="workflow-part" data-workflow-part="guardrails"><h3>9. 发布门与 guardrails</h3><p>报告必须在 review request 存在之后发布；报告同步 pending 时不得进入 Human Review。Runtime-owned 报告评论与 Agent-owned Workpad 分离。</p><span class="owner runtime" data-owner="runtime">Runtime + Agent</span></article>
         </div>
       </div>
     </section>
@@ -1548,348 +478,188 @@ On missing provider auth:
     <section class="section" id="issue-lifecycle">
       <div class="section-inner">
         <div class="section-kicker">05 · Issue Lifecycle</div>
-        <h2 class="section-heading">Linear 状态既是队列，也是 Codex 的执行路由</h2>
-        <p class="section-lead">Runtime 负责把活动状态 Issue 交给 Codex；具体应该实现、发布、返工还是合并，由 <code>WORKFLOW.md</code> 中的状态规则决定。特别注意：<code>Ready to Publish</code> 是发布触发器，<code>Done</code> 是终态。</p>
-        <hr class="section-rule">
-
-        <div class="lifecycle-track" aria-label="Linear Issue 状态轨道">
-          <div class="lifecycle-main">
-            <div class="life-state"><span class="state-pill active">Todo</span><p>进入队列；Codex 先转到 In Progress。</p></div>
-            <div class="life-state"><span class="state-pill active">In Progress</span><p>在既有 workspace 内实现并验证。</p></div>
-            <div class="life-state"><span class="state-pill publish">Ready to Publish</span><p>推送 issue 分支并创建 PR / MR。</p></div>
-            <div class="life-state"><span class="state-pill review">Human Review</span><p>暂停自动调度，等待人工决定下一状态。</p></div>
-            <div class="life-state"><span class="state-pill publish">Merging</span><p>审核通过后，同步 main、确认 CI、执行 merge。</p></div>
-            <div class="life-state"><span class="state-pill terminal">Done</span><p>合并完成后的正常终态，并清理 workspace。</p></div>
-          </div>
-          <div class="review-loop" data-transition="rework-return">
-            <span class="state-pill review">Human Review</span><span>反馈需要修改 →</span><span class="state-pill active">Rework</span><span>完成后返回 →</span><span class="state-pill review">Human Review</span>
-          </div>
-          <div class="terminal-rail"><span>任意阶段终止 →</span><span class="state-pill terminal">Cancelled / Canceled / Duplicate</span></div>
+        <h2 class="section-heading">状态既是队列，也是 Codex 指令选择器</h2>
+        <p class="section-lead">Runtime 只调度活动状态；Agent 按 Prompt 中的状态表执行。Human Review 是人工审核门，不是后台轮询 review comments 的状态。</p>
+        <hr class="rule">
+        <div class="lifecycle-track" aria-label="Linear 状态路由">
+          <div class="life-state"><span class="state-pill active">Todo</span><p>claim 后先转 In Progress，建立 Workpad 与 issue branch。</p></div>
+          <div class="life-state"><span class="state-pill active">In Progress</span><p>实现、测试、commit；仍活动时 continuation/retry。</p></div>
+          <div class="life-state"><span class="state-pill publish">Ready to Publish</span><p>push、创建 PR/MR、调用 symphonz_report、等待 sync。</p></div>
+          <div class="life-state"><span class="state-pill review">Human Review</span><p>暂停 Codex，由人决定 Rework 或 Merging。</p></div>
+          <div class="life-state"><span class="state-pill publish">Merging</span><p>更新 base、检查 CI、merge 成功后转 Done。</p></div>
+          <div class="life-state"><span class="state-pill terminal">Done</span><p>Runtime 持久化完成并执行终态清理。</p></div>
         </div>
-        <div class="poll-note"><strong>默认暂停点：</strong>Human Review 默认不在 active_states，Runtime 不会主动轮询 PR / MR 评论。需要人工或外部自动化把 Issue 改为 <code>Rework</code> 或 <code>Merging</code>，才会再次触发 Codex。</div>
+        <div class="rework-return" data-transition="rework-return"><span class="state-pill review">Human Review</span><span>reviewer 要求修改 →</span><span class="state-pill active">Rework</span><span>复用 branch/report comment →</span><span class="state-pill review">Human Review</span><span>；Cancelled / Canceled / Duplicate 直接进入终态清理。</span></div>
+      </div>
+    </section>
 
-        <div class="review-boundary">
-          <div class="responsibility">
-            <h3>Symphonz Runtime 直接负责</h3>
-            <p>运行循环与 Codex 会话的基础设施职责。</p>
-            <ul><li>Linear GraphQL 查询</li><li>Issue 标签筛选</li><li>Workspace 创建与 after_create hook</li><li>Prompt 渲染与 Codex JSON-RPC</li><li>运行事件和 Dashboard 状态</li></ul>
-          </div>
-          <div class="responsibility codex-owned">
-            <h3>Codex 按 WORKFLOW.md 负责</h3>
-            <p>需要项目凭据、工具和业务判断的外部操作。</p>
-            <ul><li>更新 Linear 状态和 Workpad</li><li>修改代码、运行测试、创建 commit</li><li>推送 issue 分支</li><li>创建 GitHub PR 或 GitLab MR</li><li>在 Rework 处理已提供的反馈</li><li>在 Merging 检查 CI 并执行 merge</li></ul>
-          </div>
+    <section class="section" id="persistence-reporting">
+      <div class="section-inner">
+        <div class="section-kicker">06 · Persistence & Reporting</div>
+        <h2 class="section-heading">报告由 Agent 提供结构，Runtime 决定安全形态和同步状态</h2>
+        <p class="section-lead"><code>symphonz_report</code> 只接受有界 JSON 字段。ReportPublisher 校验 Issue 身份、URL、节点/边和证据，转义所有文本，原子写入版本化 JSON/HTML，再让 RuntimeStore 切换权威 generation。</p>
+        <hr class="rule">
+        <div class="ops-grid">
+          <article class="ops-panel"><h3>结构化事件与错误</h3><p><code>runtime.jsonl</code> 保留完整诊断流；RuntimeStore 只记录 service、issue、Codex、Git、Linear、report、retry 和 cleanup 里程碑。</p><ul><li>失败事件写 <code>runtime_errors</code></li><li>同一错误追加到 <code>errors.jsonl</code></li><li>authorization 与 secret-like key 递归替换为 [REDACTED]</li></ul><div class="status-line"><strong>RuntimeStore</strong><span>runtime.sqlite3</span></div><div class="status-line"><strong>AttemptStore</strong><span>attempts.sqlite3</span></div></article>
+          <article class="ops-panel"><h3>报告渲染与稳定路由</h3><p>JSON 与 HTML bundle 位于 <code>.symphonz/artifacts/&lt;issue&gt;</code>，不在 workspace。渲染器使用固定 HTML/CSS，不执行 Agent HTML、JavaScript、Markdown 或 Mermaid。</p><ul><li>写两份文件并 fsync 后才提交路径</li><li>失败 publish 保留上一代权威报告</li><li><code>/issues/{identifier}/report</code> 只读取 Store 指向的 HTML</li></ul><div class="status-line"><strong>ReportPublisher</strong><span>publish + render</span></div><div class="status-line"><strong>ReportArtifactReader</strong><span>pinned dir_fd read</span></div></article>
+          <article class="ops-panel"><h3>Linear 幂等同步</h3><p>Runtime 维护一个标题为 <code>## Symphonz Implementation Report</code> 的独立评论，其中包含报告、review target、branch、commit、发布时间和摘要。</p><ul><li>首次创建，后续 publish 更新相同 comment id</li><li>报告 URL 可点击；Agent 提供的 review URL 在评论中做 Markdown neutralization，真实链接保留在报告页与 task metadata</li><li>失败保持 <code>linear_sync_status=pending</code>，PendingReportSynchronizer 跨重启恢复</li></ul><div class="status-line"><strong>PendingReportSynchronizer</strong><span>pending → synced</span></div><div class="status-line"><strong>Human Review gate</strong><span>requires synced</span></div></article>
+        </div>
+        <div class="note"><strong>生命周期结论：</strong>workspace 是可删除的执行现场；RuntimeStore 和 artifacts 是权威历史。终态清理后，task、timeline、error、report、review URL 与稳定报告页面继续存在。</div>
+      </div>
+    </section>
+
+    <section class="section" id="dashboard-auth">
+      <div class="section-inner">
+        <div class="section-kicker">07 · Dashboard Auth</div>
+        <h2 class="section-heading">Dashboard 读取持久历史，并用单用户 LAN session 保护每条业务路由</h2>
+        <p class="section-lead"><code>symphonz install</code> 或 <code>symphonz configure-dashboard</code> 写入非 secret 的 <code>[dashboard]</code> 与 mode 0600 的 <code>auth.toml</code>。除 <code>/login</code> 和 <code>/healthz</code> 外，HTML、report 和 API 都先认证。</p>
+        <hr class="rule">
+        <div class="auth-flow" aria-label="Dashboard 登录与 session 生命周期">
+          <div class="auth-step"><h3>1. 配置与 KDF</h3><p>优先 scrypt-v1；不可用时使用 600,000 次 PBKDF2-SHA256。salt、password hash、session secret 不写 config.toml。</p></div>
+          <div class="auth-step"><h3>2. 登录限流</h3><p>稳定 64 个 client bucket，每个请求先获得 SQLite reservation，再执行 KDF；第五次失败锁定 15 分钟。</p></div>
+          <div class="auth-step"><h3>3. Session cookie</h3><p>浏览器拿随机 token，数据库只存 SHA-256 digest。Cookie 使用 <code>HttpOnly</code>、<code>SameSite=Lax</code>、Path=/ 和 Max-Age。</p></div>
+          <div class="auth-step"><h3>4. 重启与轮换</h3><p>session 存在 RuntimeStore，服务重启后仍有效；username 或 session secret 轮换会使旧 session 失效，logout 删除记录。</p></div>
+        </div>
+        <div class="security-note"><strong>0.4.0 安全边界</strong><span>这是 trusted LAN 单用户认证，不是公网身份系统。HTTP 请求会持续显示“未加密连接”提示；公网部署、TLS termination、SSO、注册、角色和找回密码均不在本版本范围。</span></div>
+      </div>
+    </section>
+
+    <section class="section" id="human-review">
+      <div class="section-inner">
+        <div class="section-kicker">08 · Human Review Gate</div>
+        <h2 class="section-heading">Human Review 把自动执行和最终决策明确分开</h2>
+        <p class="section-lead">Agent 只有在 branch、review request、验证、报告 artifact 和 Linear 报告评论全部同步后，才可把 Issue 从 Ready to Publish 移入 Human Review。</p>
+        <hr class="rule">
+        <div class="review-gate">
+          <article class="gate-stage"><h3>进入门前</h3><p>Review request 已存在；<code>symphonz_report</code> 返回稳定 URL；Runtime-owned 评论包含可点击 report URL 与经 neutralization 的 review target；sync state 是 synced。</p></article>
+          <article class="gate-stage"><h3>门内暂停</h3><p>Human Review 不触发 Codex。Reviewer 在 GitHub/GitLab 审查，外部人员或自动化把 Linear 改为 Rework 或 Merging。</p></article>
+          <article class="gate-stage"><h3>门后路由</h3><p>Rework 复用 branch、Workpad、review 和同一报告评论；Merging 重新检查 base 与 CI，成功 merge 后才写 Done。</p></article>
         </div>
       </div>
     </section>
 
     <section class="section" id="real-case-simulation">
       <div class="section-inner">
-        <div class="section-kicker">06 · Real-Structure Simulation</div>
-        <h2 class="section-heading">PAY-214：从 Todo 到 Done 的最简四轮路径</h2>
-        <p class="section-lead">下面按当前 <code>WORKFLOW.md</code> 做一次完整流程级模拟。重点不是虚构 Codex 输出，而是逐轮展示：Runtime 为什么触发、完整 Prompt 中哪些指令对本轮生效、Linear 文档如何增量更新，以及 Git/PR 状态如何同步。</p>
-        <hr class="section-rule">
-
-        <div class="case-disclaimer"><strong>模拟边界：</strong>离线真实结构模拟，不访问 Linear 或 GitHub，不产生外部写操作。所有状态、评论、commit、PR URL 和 CI 结果均标记为预期执行记录，用于解释机制。</div>
-
-        <div class="case-overview">
-          <dl class="case-facts">
-            <div class="case-fact"><dt>Issue</dt><dd><strong>PAY-214</strong> · 防止支付页重复提交造成重复扣款</dd></div>
-            <div class="case-fact"><dt>Labels</dt><dd>bug · payments · codex-ready</dd></div>
-            <div class="case-fact"><dt>验收条件</dt><dd>同一支付请求只有一个进行中提交；提交期间按钮禁用；覆盖快速双击与 3DS 返回路径。</dd></div>
-            <div class="case-fact"><dt>Provider</dt><dd>GitHub · base/main · target/main</dd></div>
-            <div class="case-fact"><dt>Workspace</dt><dd class="mono">.symphonz/workspace/PAY-214</dd></div>
-            <div class="case-fact"><dt>Branch</dt><dd class="mono">symphonz/PAY-214-prevent-duplicate-payment</dd></div>
-            <div class="case-fact"><dt>PR title</dt><dd>PAY-214: 防止支付页重复提交造成重复扣款</dd></div>
-          </dl>
-
-          <div class="case-state-path">
-            <h3>完整状态路径</h3>
-            <p class="state-path-text">Todo → In Progress → Ready to Publish → Human Review → Rework → Human Review → Merging → Done</p>
-            <div class="simulation-legend" aria-label="案例角色图例">
-              <span class="owner-tag runtime">Runtime：发现并触发</span>
-              <span class="owner-tag codex">Codex：代码/文档/Provider 操作</span>
-              <span class="owner-tag human">人或外部自动化：审核状态切换</span>
-            </div>
-            <p class="workflow-limit" style="margin-top: 14px;">Human Review 不触发 Codex。这个最简四轮路径假设负责人在 Turn 1 完成后把 Issue 在下一次 poll 前改为 Ready to Publish；若它继续停留在 In Progress，实际运行可能出现额外的 In Progress turn。后续也只有外部把 Issue 改为 Rework 或 Merging，下一轮 Linear poll 才会创建新的 Codex thread 和 turn。</p>
-          </div>
-        </div>
-
-        <div class="shared-frame">
-          <h3>每一轮共同携带的固定 Prompt 框架</h3>
-          <p>Runtime 实际传入的是完整 <code>WORKFLOW.md</code> 正文，不会只发送下面某一条状态路由。每个案例 Prompt 块展示的是“本轮变化的 Issue context + 从完整规则中生效的指令”。固定部分始终包括：</p>
-          <ul>
-            <li>无人值守执行，不要求人完成正常步骤</li>
-            <li>只能修改当前 Issue workspace</li>
-            <li>只维护一个 <code>## Symphonz Workpad</code></li>
-            <li>Issue Validation/Test Plan 是强制验收条件</li>
-            <li>Bug 必须先复现或检查现状</li>
-            <li>Linear、Workpad、branch、commit、PR/MR 必须同步</li>
-            <li>缺少权限时记录 blocker 并进入 Human Review</li>
-            <li>状态映射与 Todo/In Progress/Ready to Publish/Rework/Merging 步骤</li>
-            <li>固定 branch、PR/MR title 和 target 约定</li>
-            <li>未经验证不得 push，检查失败不得 merge</li>
-          </ul>
-        </div>
-
+        <div class="section-kicker">09 · Simulated Issue</div>
+        <h2 class="section-heading">PAY-214：防止支付页重复提交造成重复扣款</h2>
+        <p class="section-lead">下面逐轮列出 Runtime 触发条件、发送给 Codex 的状态指令、Agent-owned Workpad/代码更新，以及 Runtime-owned 报告评论和 sync state。</p>
+        <hr class="rule">
+        <div class="case-disclaimer"><strong>模拟边界：</strong>离线真实结构模拟，不访问 Linear 或 GitHub，不产生外部写操作。URL、commit、CI 和评论内容用于说明 0.4.0 协议。</div>
+        <div class="case-summary"><div><strong>完整状态路径</strong><span>Todo → In Progress → Ready to Publish → Human Review → Rework → Human Review → Merging → Done</span></div><div><strong>所有权</strong><span>Workpad 由 Agent 维护；Implementation Report 评论由 Runtime 维护。Human Review 不触发 Codex。</span></div></div>
         <div class="case-turns">
           <details class="case-turn" data-case-turn="todo" open>
-            <summary><span class="turn-index">TURN 1</span><span class="state-pill active">Todo</span><span class="turn-title">实现与本地验证<span class="turn-subtitle">Runtime poll → 新 thread/turn → In Progress</span></span></summary>
+            <summary><span class="turn-index">TURN 1</span><span class="state-pill active">Todo</span><span class="turn-title">实现与验证<span class="turn-subtitle">新 workspace · 新 branch · 新 Workpad</span></span></summary>
             <div class="turn-body">
-              <span class="expected-record">预期执行记录</span>
-              <div class="turn-trigger"><strong>触发前</strong><p>Linear 返回 PAY-214，状态是 Todo，项目和标签满足筛选条件，identifier 不在 <code>state.running</code>。Runtime 创建 workspace，首次执行 clone hook，渲染完整 Prompt 并启动新的 Codex thread/turn。</p></div>
-              <h3 class="prompt-heading">发送给 Codex（完整 Prompt 中与本轮相关的内容）</h3>
-              <pre class="prompt-block">You are working on Linear ticket `PAY-214` for a project managed by `symphonz`.
-
-Issue context:
+              <div class="turn-trigger"><strong>Runtime 触发</strong><p>SymphonzPoll 返回 PAY-214；项目、Todo、codex-ready 标签、依赖和 attempt 预算均合格。Runtime 创建 workspace，执行 after_create，启动 app-server 并持久化 issue_started。</p></div>
+              <h3 class="prompt-heading">发送给 Codex 的本轮指令</h3>
+              <pre class="prompt-block">Issue context:
 Identifier: PAY-214
-Title: 防止支付页重复提交造成重复扣款
 Current status: Todo
-Labels: bug, payments, codex-ready
-URL: https://linear.example/PAY-214
 
-Description:
-快速双击“确认支付”会并发发送两次 POST /api/payments，可能造成重复扣款。
-Acceptance criteria:
-- only one payment request may be in flight
-- disable submit controls while pending
-- cover rapid double-click and 3DS return paths
-
-Effective route from the included Status Map and Steps:
-1. Fetch PAY-214 explicitly and move Todo → In Progress before code work.
-2. Find or create the single `## Symphonz Workpad` comment.
-3. Fill Plan, Acceptance Criteria, Validation and Review Request sections.
-4. Fetch origin/main and create branch
-   symphonz/PAY-214-prevent-duplicate-payment.
-5. Reproduce or inspect the duplicate submission signal.
-6. Implement one in-flight payment guard and pending UI state.
-7. Add focused tests for rapid double-click and the 3DS return path.
-8. Run the ticket validation and the narrowest reliable project checks.
-9. Record commands/results in the Workpad and create a local PAY-214 commit.
-10. Keep Review Request URL as pending; publishing is routed by Ready to Publish.</pre>
-
+1. Move PAY-214 to In Progress with linear_graphql.
+2. Find or create exactly one `## Symphonz Workpad` comment.
+3. Create branch symphonz/PAY-214-prevent-duplicate-payment from origin/main.
+4. Reproduce duplicate submit, add a shared pending guard, and cover the 3DS return path.
+5. Run `npm test -- payment-submit payment-3ds`.
+6. Commit the scoped implementation; do not publish before Ready to Publish.</pre>
               <div class="turn-sync-grid">
-                <div class="linear-sync">
-                  <h3 class="sync-heading">Linear 同步</h3>
-                  <p><strong>状态：</strong>Todo → In Progress。创建唯一 Workpad，后续 turn 继续编辑同一评论。</p>
-                  <pre class="workpad-preview">## Symphonz Workpad
-
-```text
-runner-01:/workspaces/PAY-214@91bd204
-```
+                <div class="linear-sync"><h3 class="sync-heading">Linear 同步</h3><p>Agent 使用 <code>linear_graphql</code> 把 Todo 改为 In Progress，并创建 Agent-owned Workpad。</p><pre class="workpad-preview">## Symphonz Workpad
 
 ### Plan
-- [x] 1. Reproduce duplicate submission
-- [x] 2. Add in-flight request guard
-- [x] 3. Disable controls while pending
-- [x] 4. Add focused tests
-
-### Acceptance Criteria
-- [x] One POST /api/payments while pending
-- [x] Submit controls disabled while pending
-- [x] 3DS return path covered
+- [x] Reproduce duplicate submit
+- [x] Add shared pending guard
+- [x] Cover 3DS return path
 
 ### Validation
-- [x] command: `npm test -- payment-submit payment-3ds`
+- [x] `npm test -- payment-submit payment-3ds`
 
 ### Review Request
 - Branch: symphonz/PAY-214-prevent-duplicate-payment
-- URL: pending
-
-### Notes
-- Duplicate request reproduced with rapid double-click.
-- Existing 3DS return path is covered by the shared guard.</pre>
-                </div>
-                <div class="review-sync">
-                  <h3 class="sync-heading">代码与 Review 同步</h3>
-                  <ul class="sync-list">
-                    <li>Workspace：创建并 clone 仓库</li>
-                    <li>Branch：从 origin/main 创建确定性分支</li>
-                    <li>Commit：<code>a13c9f2 PAY-214 prevent duplicate payment submissions</code></li>
-                    <li>Push：未执行</li>
-                    <li>GitHub PR：pending</li>
-                    <li>RuntimeState：本次 turn 进入 completed；Linear 仍是 In Progress</li>
-                  </ul>
-                  <p>实现完成后，由人或外部规则确认结果并把 Linear 从 In Progress 改为 Ready to Publish，触发发布轮次。</p>
-                </div>
+- URL: pending</pre><div class="sync-state">Sync state · Workpad comment created</div></div>
+                <div class="review-sync"><h3 class="sync-heading">代码 / Runtime</h3><p>Agent commit <code>a13c9f2</code>，workspace stamp 为 <code>runner-01:/workspaces/PAY-214@a13c9f2</code>。RuntimeStore 记录 thread、turn、process、validation milestone；尚无 review/report URL。</p><ul class="sync-list"><li>Branch：symphonz/PAY-214-prevent-duplicate-payment</li><li>Commit：a13c9f2</li><li>Linear state：In Progress</li></ul><div class="sync-state">Sync state · implementation local</div></div>
               </div>
             </div>
           </details>
 
           <details class="case-turn" data-case-turn="ready-to-publish">
-            <summary><span class="turn-index">TURN 2</span><span class="state-pill publish">Ready to Publish</span><span class="turn-title">发布分支并创建 PR<span class="turn-subtitle">人工状态切换 → 新 thread/turn → Human Review</span></span></summary>
+            <summary><span class="turn-index">TURN 2</span><span class="state-pill publish">Ready to Publish</span><span class="turn-title">发布 review 与报告<span class="turn-subtitle">新 thread · 复用 workspace/branch</span></span></summary>
             <div class="turn-body">
-              <span class="expected-record">预期执行记录</span>
-              <div class="turn-trigger"><strong>触发前</strong><p data-simulation-actor="human">产品/开发负责人检查 Workpad 后，把 PAY-214 从 In Progress 标为 Ready to Publish。下一次 poll 把 Ready to Publish 作为活动发布状态交给新的 Codex thread/turn；workspace 和本地 commit 被复用。</p></div>
-              <h3 class="prompt-heading">发送给 Codex（完整 Prompt 中与本轮相关的内容）</h3>
+              <div class="turn-trigger"><strong>Runtime 触发</strong><p data-simulation-actor="human">负责人检查 Workpad 后，把 PAY-214 改为 Ready to Publish。下一次 poll 创建新 app-server/thread；Runtime 注入已有 workspace、attempt 和完整 WORKFLOW。</p></div>
+              <h3 class="prompt-heading">发送给 Codex 的本轮指令</h3>
               <pre class="prompt-block">Issue context:
 Identifier: PAY-214
-Title: 防止支付页重复提交造成重复扣款
 Current status: Ready to Publish
-Labels: bug, payments, codex-ready
 
-Effective route from `Ready to Publish -> publish`:
-1. Re-fetch PAY-214 and read the existing Symphonz Workpad.
-2. Inspect the current branch, local commit and validation evidence.
-3. Confirm the workspace is clean except intended committed work.
-4. Re-run required validation if evidence is stale or code changed.
-5. Push symphonz/PAY-214-prevent-duplicate-payment to origin.
-6. Create or reuse GitHub pull request:
-   PAY-214: 防止支付页重复提交造成重复扣款
-7. Put the PR URL and validation result in the same Workpad.
-8. Attach the PR URL to Linear when the available tool supports it.
-9. Move PAY-214 to Human Review.
-10. Do not continue code work while Human Review is inactive.</pre>
-
+1. Re-read the existing Workpad, branch, commit and validation evidence.
+2. Push symphonz/PAY-214-prevent-duplicate-payment.
+3. Create or reuse PR #482 targeting main.
+4. Call `symphonz_report` only after the review URL exists.
+5. Require report_url and linear_sync_status=synced.
+6. Update the Workpad with review and report URLs.
+7. Move to Human Review only after Runtime link synchronization succeeds.</pre>
               <div class="turn-sync-grid">
-                <div class="linear-sync">
-                  <h3 class="sync-heading">Linear 同步</h3>
-                  <p><strong>状态：</strong>Ready to Publish → Human Review。更新原 Workpad，不新建发布评论。</p>
-                  <pre class="workpad-preview">Workpad delta:
+                <div class="linear-sync"><h3 class="sync-heading">Linear 同步</h3><p>Agent 更新原 Workpad；Runtime 另建一个 Runtime-owned 评论，不覆盖 Workpad。</p><pre class="workpad-preview">## Symphonz Implementation Report
 
-### Acceptance Criteria
-- [x] One POST /api/payments while pending
-- [x] Submit controls disabled while pending
-- [x] 3DS return path covered
-
-### Validation
-- [x] command: `npm test -- payment-submit payment-3ds`
-
-### Review Request
-- Branch: symphonz/PAY-214-prevent-duplicate-payment
-- URL: https://github.example/acme/payments/pull/482
-
-### Notes
-- Branch pushed; PR #482 created.
-- Linear moved to Human Review.</pre>
-                </div>
-                <div class="review-sync">
-                  <h3 class="sync-heading">代码与 Review 同步</h3>
-                  <ul class="sync-list">
-                    <li>Push：<code>a13c9f2</code> 推送到 origin</li>
-                    <li>PR：#482 created，target main</li>
-                    <li>PR body：Linear URL、实现摘要、验证证据</li>
-                    <li>CI：payment-submit check queued</li>
-                    <li>RuntimeState：本次发布 turn completed</li>
-                  </ul>
-                  <p>Human Review 不在默认 active_states。即使 reviewer 留言，Runtime 也不会自动触发 Codex，直到 Linear 被外部改为 Rework 或 Merging。</p>
-                </div>
+Report: https://symphonz.example/issues/PAY-214/report
+Review target: https：／／github.example/acme/payments/pull/482
+Branch: symphonz/PAY-214-prevent-duplicate-payment
+Commit: a13c9f2
+Summary: Shared guard prevents duplicate payment requests.</pre><div class="sync-state">Sync state · linear_sync_status: synced</div></div>
+                <div class="review-sync"><h3 class="sync-heading">代码 / Review / Report</h3><p>Agent push branch 并创建 PR #482；Runtime 校验 <code>symphonz_report</code> payload，写 report JSON/HTML，保存稳定 URL，再同步一个报告评论。</p><ul class="sync-list"><li>PR：https://github.example/acme/payments/pull/482</li><li>Report：https://symphonz.example/issues/PAY-214/report</li><li>Linear：Ready to Publish → Human Review</li></ul><div class="sync-state">Sync state · report artifact authoritative</div></div>
               </div>
             </div>
           </details>
 
           <details class="case-turn" data-case-turn="rework">
-            <summary><span class="turn-index">TURN 3</span><span class="state-pill active">Rework</span><span class="turn-title">处理审核反馈<span class="turn-subtitle">人工反馈路由 → 新 thread/turn → Human Review</span></span></summary>
+            <summary><span class="turn-index">TURN 3</span><span class="state-pill active">Rework</span><span class="turn-title">处理审核反馈<span class="turn-subtitle">复用 PR #482 与同一报告评论</span></span></summary>
             <div class="turn-body">
-              <span class="expected-record">预期执行记录</span>
-              <div class="turn-trigger"><strong>触发前</strong><p data-simulation-actor="human">Reviewer 在 PR #482 提出：“3DS 返回后重试按钮仍可能快速触发两次请求，请共用相同 guard 并补测试。”负责人把 Linear 状态改为 Rework，下一次 poll 才重新触发 Codex。</p></div>
-              <h3 class="prompt-heading">发送给 Codex（完整 Prompt 中与本轮相关的内容）</h3>
+              <div class="turn-trigger"><strong>Runtime 触发</strong><p data-simulation-actor="human">Reviewer 指出 3DS 返回后快速重试仍可能提交两次。负责人把 Linear 改为 Rework，Runtime 才创建新 thread/turn。</p></div>
+              <h3 class="prompt-heading">发送给 Codex 的本轮指令</h3>
               <pre class="prompt-block">Issue context:
 Identifier: PAY-214
 Current status: Rework
-Description and original acceptance criteria remain attached.
 
-Effective route from `Rework -> address feedback`:
-1. Re-read the Issue, existing Workpad, PR body and review comments.
-2. Reuse the current open branch and PR.
-3. Add the review item to Workpad Plan and Acceptance Criteria.
-4. Inspect the existing implementation before editing.
-5. Apply the actionable review feedback discovered after launch.
-6. Add or update focused regression tests for that feedback.
-7. Run focused validation and record the exact result.
-8. Commit and push the update to the same branch.
-9. Update the existing PR; do not create a second PR.
-10. Mark the feedback addressed and move Linear to Human Review.</pre>
-              <div class="discovered-context"><strong>Codex 启动后查询得到</strong><p>Runtime 只注入 Issue context 与完整 WORKFLOW。Codex 随后从 Workpad 定位 PR #482，读取 review comment，得到“3DS 返回后的快速重试也必须复用 shared guard，并补回归测试”这一可执行反馈。</p></div>
-
+1. Re-read Workpad, PR #482 and current review comments.
+2. Reuse the open branch and review request.
+3. Apply the actionable review feedback discovered after launch.
+4. Add a focused rapid-retry regression test for the 3DS return path.
+5. Run `npm test -- payment-submit payment-3ds`.
+6. Commit c71b640 and push the same branch.
+7. Republish `symphonz_report`; update, do not duplicate, the Runtime comment.
+8. Return to Human Review only when report link sync is complete.</pre>
               <div class="turn-sync-grid">
-                <div class="linear-sync">
-                  <h3 class="sync-heading">Linear 同步</h3>
-                  <p><strong>状态：</strong>Rework → Human Review。原 Workpad 增量补充反馈项和验证，不覆盖历史。</p>
-                  <pre class="workpad-preview">Workpad delta:
-
-### Plan
-- [x] 5. Apply shared guard to 3DS retry
-- [x] 6. Add rapid retry regression test
-
-### Acceptance Criteria
+                <div class="linear-sync"><h3 class="sync-heading">Linear 同步</h3><p>Agent 在原 Workpad 增加 feedback 与验证；Runtime 根据已保存 comment id 更新同一个 Implementation Report 评论。</p><pre class="workpad-preview">Workpad delta:
 - [x] Rapid retry after 3DS return uses shared guard
-
-### Validation
-- [x] command: `npm test -- payment-submit payment-3ds`
-
-### Notes
-- PR #482 feedback addressed in commit c71b640.
-- Returned to Human Review.</pre>
-                </div>
-                <div class="review-sync">
-                  <h3 class="sync-heading">代码与 Review 同步</h3>
-                  <ul class="sync-list">
-                    <li>Branch：复用原 issue branch</li>
-                    <li>Commit：<code>c71b640 PAY-214 guard 3DS retry submissions</code></li>
-                    <li>Push：更新 origin 同一分支</li>
-                    <li>PR：复用 #482，回复并解决 review thread</li>
-                    <li>CI：payment-submit + payment-3ds queued</li>
-                  </ul>
-                  <p>返回 Human Review 后再次暂停。Codex 不会自己轮询 reviewer 是否批准。</p>
-                </div>
+- [x] `npm test -- payment-submit payment-3ds`
+- Commit: c71b640
+- PR #482 feedback addressed</pre><div class="sync-state">Sync state · linear_sync_status: synced</div></div>
+                <div class="review-sync"><h3 class="sync-heading">代码 / Review / Report</h3><p>PR #482 保持同一 URL；报告 generation 更新，旧 generation 清理，稳定 route 不变。评论中仍只有一个 <code>## Symphonz Implementation Report</code>。</p><ul class="sync-list"><li>Commit：c71b640</li><li>Report summary：3DS rapid retry covered</li><li>Linear：Rework → Human Review</li></ul><div class="sync-state">Sync state · one runtime report comment</div></div>
               </div>
             </div>
           </details>
 
           <details class="case-turn" data-case-turn="merging">
-            <summary><span class="turn-index">TURN 4</span><span class="state-pill publish">Merging</span><span class="turn-title">检查 CI、合并并完成<span class="turn-subtitle">人工批准路由 → 新 thread/turn → Done</span></span></summary>
+            <summary><span class="turn-index">TURN 4</span><span class="state-pill publish">Merging</span><span class="turn-title">合并与终态清理<span class="turn-subtitle">检查 CI · merge · Done</span></span></summary>
             <div class="turn-body">
-              <span class="expected-record">预期执行记录</span>
-              <div class="turn-trigger"><strong>触发前</strong><p data-simulation-actor="human">Reviewer 批准 PR #482，required checks 全绿。负责人或外部自动化把 PAY-214 从 Human Review 改为 Merging；下一次 poll 创建第四个 Codex thread/turn。</p></div>
-              <h3 class="prompt-heading">发送给 Codex（完整 Prompt 中与本轮相关的内容）</h3>
+              <div class="turn-trigger"><strong>Runtime 触发</strong><p data-simulation-actor="human">Reviewer 批准 PR #482，required checks 全绿。负责人把 Issue 改为 Merging，下一次 poll 启动最终 thread/turn。</p></div>
+              <h3 class="prompt-heading">发送给 Codex 的本轮指令</h3>
               <pre class="prompt-block">Issue context:
 Identifier: PAY-214
 Current status: Merging
 
-Effective route from `Merging -> integrate`:
-1. Re-fetch PAY-214, Workpad, the referenced review request and its current review/check state.
-2. Fetch the latest origin/main.
-3. Update the issue branch according to project policy.
-4. Resolve conflicts if present; do not merge with unresolved conflicts.
-5. Re-run required validation against the updated branch.
-6. Confirm all required GitHub checks are green.
-7. Merge the open review request with the configured provider tool/API.
-8. Record merge commit and final validation in the Workpad.
-9. Move PAY-214 to Done only after merge succeeds.
-10. If checks fail, keep Merging and record the blocker; do not claim success.</pre>
-
+1. Re-fetch Workpad, PR #482, reviews and required checks.
+2. Update from origin/main and resolve conflicts without discarding work.
+3. Re-run `npm test -- payment-submit payment-3ds`.
+4. Merge only when all required checks are green.
+5. Record merge commit 85b27de in the existing Workpad.
+6. Move PAY-214 to Done only after provider merge succeeds.</pre>
               <div class="turn-sync-grid">
-                <div class="linear-sync">
-                  <h3 class="sync-heading">Linear 同步</h3>
-                  <p><strong>状态：</strong>Merging → Done，仅在 provider 确认 merge 成功后执行。</p>
-                  <pre class="workpad-preview">Final Workpad delta:
-
-### Validation
-- [x] command: `npm test -- payment-submit payment-3ds`
-- [x] GitHub required checks: 5/5 passed
-
-### Review Request
-- Branch: symphonz/PAY-214-prevent-duplicate-payment
-- URL: https://github.example/acme/payments/pull/482
-- State: merged
-
-### Notes
-- PR #482 merged as 85b27de.
-- Linear moved to Done.</pre>
-                </div>
-                <div class="review-sync">
-                  <h3 class="sync-heading">代码与 Review 同步</h3>
-                  <ul class="sync-list">
-                    <li>Base sync：origin/main fetched</li>
-                    <li>Conflicts：none</li>
-                    <li>CI：5/5 required checks passed</li>
-                    <li>PR：#482 merged</li>
-                    <li>Merge commit：<code>85b27de</code></li>
-                    <li>Linear：Done，终态查询触发 workspace 清理</li>
-                  </ul>
-                  <p>RuntimeState.completed 仍只表示第四个 turn 正常结束；真正的业务终态来自 Linear Done 和 provider merge 两个外部事实。</p>
-                </div>
+                <div class="linear-sync"><h3 class="sync-heading">Linear 同步</h3><p>Agent 更新 Workpad 的 final validation、PR state 和 merge commit，再用 <code>linear_graphql</code> 写 Done。</p><pre class="workpad-preview">Final Workpad delta:
+- PR #482: merged
+- Merge commit: 85b27de
+- Required checks: 5/5 passed
+- State: Done</pre><div class="sync-state">Sync state · Linear terminal state confirmed</div></div>
+                <div class="review-sync"><h3 class="sync-heading">Runtime 清理</h3><p>Runtime 终态查询持久化完成信息，执行 before_remove 并删除 workspace。报告 artifact 保留，Dashboard 仍可显示 task/timeline/error/report。</p><ul class="sync-list"><li>workspace_cleanup_status: removed</li><li>report URL：仍为稳定认证路由</li><li>PR merge：85b27de</li></ul><div class="sync-state">Sync state · terminal cleanup complete</div></div>
               </div>
             </div>
           </details>
@@ -1899,26 +669,33 @@ Effective route from `Merging -> integrate`:
 
     <section class="section" id="project-layout">
       <div class="section-inner">
-        <div class="section-kicker">07 · Project Layout</div>
-        <h2 class="section-heading">安装后的项目结构与启动方式</h2>
-        <p class="section-lead"><code>symphonz install</code> 把工作流配置写入当前项目。运行时本身来自全局安装的 Symphonz CLI，不再要求项目 clone 外部 Symphony 或安装 mise / Elixir。</p>
-        <hr class="section-rule">
-
+        <div class="section-kicker">10 · Project Layout</div>
+        <h2 class="section-heading">安装结构、迁移命令和数据保留</h2>
+        <p class="section-lead">安装只把可版本化的 WORKFLOW 与非 secret 配置放进项目；认证、数据库、日志、artifact 和 workspace 都在 <code>.gitignore</code> 中。</p>
+        <hr class="rule">
         <div class="layout-grid">
-          <div class="tree-panel" aria-label="安装后的目录树"><pre>project/
-├── .symphonz/
-│   ├── WORKFLOW.md       # 配置与 Codex Prompt
-│   ├── config.toml       # 安装信息、环境变量引用
-│   ├── logs/             # 服务日志目录
-│   └── workspace/
-│       ├── ZHA-8/        # 一个 Issue 一个工作目录
-│       └── ZHA-9/
-└── ...                   # 原项目文件</pre></div>
-          <div class="command-list" aria-label="常用命令">
-            <div class="command"><code>symphonz install</code><span>交互式收集 Linear 与 Git provider 配置，并创建 .symphonz。</span></div>
-            <div class="command"><code>symphonz run</code><span>仅启动 Linear 监听和 Codex 调度，不启动 Web Dashboard。</span></div>
-            <div class="command"><code>symphonz run --port 4100</code><span>同时在 127.0.0.1:4100 提供 Runtime Dashboard。</span></div>
-            <div class="command"><code>symphonz version</code><span>查看当前 CLI 版本；本介绍页对应 v0.3.1。</span></div>
+          <div class="tree-panel"><pre>project/
+└── .symphonz/
+    ├── WORKFLOW.md
+    ├── config.toml
+    ├── auth.toml              # 0600, ignored
+    ├── artifacts/
+    │   └── PAY-214/
+    │       ├── report-&lt;generation&gt;.json
+    │       └── report-&lt;generation&gt;.html
+    ├── logs/
+    │   ├── attempts.sqlite3
+    │   ├── runtime.sqlite3
+    │   ├── runtime.jsonl
+    │   └── errors.jsonl
+    └── workspace/
+        └── PAY-214/           # terminal state removes this</pre></div>
+          <div class="command-list">
+            <div class="command"><code>symphonz install</code><span>收集 Linear、Git、Dashboard 与密码，创建 0.4.0 布局和 auth.toml。</span></div>
+            <div class="command"><code>symphonz configure-dashboard</code><span>升级现有项目的 [dashboard] 与 auth，不覆盖 WORKFLOW.md。</span></div>
+            <div class="command"><code>symphonz run</code><span>按配置启动 poller、RuntimeStore、report sync 和认证 Dashboard。</span></div>
+            <div class="command"><code>symphonz run --host ... --port ...</code><span>临时覆盖 bind；报告链接仍使用 public_base_url，端口不一致会警告。</span></div>
+            <div class="command"><code>symphonz version</code><span>当前指南对应 <strong>v0.4.0</strong>。</span></div>
           </div>
         </div>
       </div>
@@ -1926,99 +703,53 @@ Effective route from `Merging -> integrate`:
 
     <section class="section" id="implementation-boundaries">
       <div class="section-inner">
-        <div class="section-kicker">08 · Implementation Boundaries</div>
-        <h2 class="section-heading">阅读运行结果时，需要知道的八个当前边界</h2>
-        <p class="section-lead">这些不是工作流愿景，而是 v0.3.1 内置 Runtime 的真实行为。明确它们，才能正确理解 Dashboard 和 Linear 中看到的状态。</p>
-        <hr class="section-rule">
-
+        <div class="section-kicker">11 · Implementation Boundaries</div>
+        <h2 class="section-heading">阅读运行结果时必须保留的边界</h2>
+        <p class="section-lead">这些约束决定 0.4.0 的恢复、安全和审核语义。</p>
+        <hr class="rule">
         <div class="boundaries">
-          <article class="boundary"><span class="boundary-index">01</span><h3>状态保存在进程内存</h3><p><code>RuntimeState</code> 没有持久化存储；服务重启后，running、completed、blocked 和事件历史会从空状态重新开始。</p></article>
-          <article class="boundary"><span class="boundary-index">02</span><h3>有界并发执行</h3><p>Orchestrator 依据 <code>max_concurrent_agents</code> 并发处理不同 Issue，并通过 claim 防止同一 Issue 重复执行。</p></article>
-          <article class="boundary"><span class="boundary-index">03</span><h3>completed 不等于 Linear Done</h3><p>Dashboard 的 completed 表示当前 Codex turn 正常结束；Linear Issue 可能仍是 Todo、In Progress、Ready to Publish、Rework 或 Merging。</p></article>
-          <article class="boundary"><span class="boundary-index">04</span><h3>活动 Issue 会继续推进</h3><p>若 Issue 下一轮仍属于 <code>active_states</code>，Runtime 会复用 workspace，并用 attempt 和 Workpad 恢复上下文。</p></article>
-          <article class="boundary"><span class="boundary-index">05</span><h3>发布依赖 Codex 环境</h3><p>Git push、GitHub PR、GitLab MR 与 Linear 状态更新依赖 Codex 会话中可用的 token、CLI 或 MCP 工具。</p></article>
-          <article class="boundary"><span class="boundary-index">06</span><h3>终态负责自动清理</h3><p>Runtime 会单独查询终态，取消仍在执行的 worker，运行 <code>before_remove</code>，再安全删除对应 workspace。</p></article>
-          <article class="boundary"><span class="boundary-index">07</span><h3>有预算的指数退避</h3><p>失败 turn 会进入 <code>retrying</code>，按 attempt 指数退避，并受 <code>max_retry_backoff_ms</code>、<code>max_turns</code> 和 <code>max_attempts</code> 限制。Codex 预算会跨服务重启保留，Linear 网络重试单独计数，超限后保持 Blocked。</p></article>
-          <article class="boundary"><span class="boundary-index">08</span><h3>结构化运行日志</h3><p>Runtime 同时维护进程内存状态，并把事件追加写入 <code>.symphonz/logs/runtime.jsonl</code>，便于故障追踪。</p></article>
+          <article class="boundary"><span class="boundary-index">01</span><h3>RuntimeState 不是历史数据库</h3><p>进程内集合服务当前调度；Dashboard 的 task/timeline/error/report 查询来自 RuntimeStore。</p></article>
+          <article class="boundary"><span class="boundary-index">02</span><h3>completed 不等于 Linear Done</h3><p>turn completed 只表示协议正常结束；业务终态必须由 Linear 与 provider 外部事实确认。</p></article>
+          <article class="boundary"><span class="boundary-index">03</span><h3>Workpad 与报告评论分离</h3><p>Agent 更新工作过程；Runtime 幂等维护报告链接。重试不能覆盖或复制另一方的评论。</p></article>
+          <article class="boundary"><span class="boundary-index">04</span><h3>pending 报告可用但不可交审</h3><p>本地 artifact 和 URL 已存在时，Linear 暂时失败仍返回 pending；后台重试，直到 synced 才过发布门。</p></article>
+          <article class="boundary"><span class="boundary-index">05</span><h3>artifact 不随 workspace 删除</h3><p>报告 bundle、SQLite 和日志位于 workspace 之外，Done/Closed/Cancelled 清理不破坏审核历史。</p></article>
+          <article class="boundary"><span class="boundary-index">06</span><h3>认证是 LAN 边界</h3><p>单用户 session、KDF 和限流不等于公网 TLS、反向代理、SSO 或多租户授权。</p></article>
+          <article class="boundary"><span class="boundary-index">07</span><h3>Agent 不能提交可执行报告</h3><p>symphonz_report 接收结构化字段；Runtime 转义文本并使用固定渲染器，避免同源脚本和报告漂移。</p></article>
+          <article class="boundary"><span class="boundary-index">08</span><h3>失败必须可查询</h3><p>失败 event 写结构化 error 与 errors.jsonl；恢复操作设置 resolved_at 和 resolving_event，不抹除历史。</p></article>
         </div>
-        <div class="closing-note"><strong>工程结论</strong><span>Symphonz 当前是一个轻量、可观察的轮询与会话调度器；项目级开发流程的智能部分由 Codex 在 WORKFLOW Prompt 约束下完成。</span></div>
       </div>
     </section>
   </main>
 
-  <footer>
-    <div class="footer-inner"><strong>Symphonz Developer Guide</strong><span>对应内置 Runtime v0.3.1 · 离线静态页面</span></div>
-  </footer>
+  <footer><div class="footer-inner"><strong>Symphonz Developer Guide</strong><span>Runtime v0.4.0 · 中文 · 离线静态页面</span></div></footer>
 
   <script>
     const componentData = {
-      runtime: {
-        title: "Symphonz Runtime",
-        description: "Python 内置服务。读取工作流、构造客户端、驱动轮询，并把每个候选 Issue 转换为一次 Codex turn。",
-        input: "WORKFLOW.md、环境变量、Linear Issue",
-        output: "Workspace、Codex session、Runtime event",
-        code: "runner.py · orchestrator.py"
-      },
-      linear: {
-        title: "Linear GraphQL",
-        description: "通过 SymphonzPoll 查询指定 project_slug 中处于 active_states 的 Issue，返回描述、标签、状态和分支信息。",
-        input: "LINEAR_API_KEY、project_slug、active_states",
-        output: "分页读取全部标准化 Issue",
-        code: "linear.py"
-      },
-      workflow: {
-        title: "WORKFLOW.md",
-        description: "Front matter 是 Runtime 配置；正文是传给 Codex 的 Prompt 模板。安装时会写入项目、API key 环境变量名和 workspace 路径。",
-        input: "安装交互信息、Issue 模型",
-        output: "WorkflowDefinition、渲染后的 Prompt",
-        code: "workflow.py · WORKFLOW.md"
-      },
-      workspace: {
-        title: "Issue Workspace",
-        description: "每个 identifier 对应一个可复用目录。只有首次创建目录时才运行 after_create hook，默认在其中 clone 目标仓库。",
-        input: "project_root、workspace.root、Issue",
-        output: ".symphonz/workspace/<identifier>",
-        code: "workspace.py"
-      },
-      codex: {
-        title: "Codex app-server",
-        description: "Symphonz 启动一个子进程，通过 stdin/stdout 发送逐行 JSON-RPC。每次 worker invocation 创建 thread，并在连续 turn 间复用。",
-        input: "cwd、Prompt、sandbox、approval policy",
-        output: "thread id、turn id、事件流",
-        code: "codex_app_server.py"
-      },
-      state: {
-        title: "Runtime State / Dashboard",
-        description: "线程安全地记录 claimed、running、completed、blocked、retrying 和最近 200 个事件，并把事件追加到 runtime.jsonl。Dashboard 每 3 秒读取 /api/state。",
-        input: "Issue lifecycle 与 Codex stream events",
-        output: "Dashboard JSON 和活动列表",
-        code: "models.py · dashboard.py"
-      },
-      provider: {
-        title: "GitHub / GitLab",
-        description: "不是 Orchestrator 的直接 provider client。Codex 根据 WORKFLOW.md 使用 gh、glab 或 provider API 推送分支并创建 review request。",
-        input: "代码改动、凭据、provider 配置",
-        output: "远程分支、Pull Request / Merge Request",
-        code: "WORKFLOW.md"
-      }
+      linear: ["Linear GraphQL", "外部控制面。Runtime 轮询候选和终态；Agent 通过 linear_graphql 维护状态与 Workpad；Runtime 单独同步报告评论。", "project、state、label、issue id", "Issue、评论、状态", "linear.py"],
+      workflow: ["WORKFLOW.md", "Front matter 由 Runtime 解析，正文作为完整 Prompt 发送给每个 Codex turn。", "安装配置、Issue context", "WorkflowDefinition、Prompt", "workflow.py · WORKFLOW.md"],
+      runtime: ["Symphonz Runtime", "Runner 组装共享服务，Orchestrator 轮询、分发、持久化里程碑并处理重试和终态清理。", "WORKFLOW、Linear Issue、配置与凭据引用", "Codex turn、RuntimeEvent、持久任务状态", "runner.py · orchestrator.py"],
+      workspace: ["Issue Workspace", "每个 identifier 对应一个可复用 Git 目录。终态删除该目录，不删除 Store 或 artifacts。", "Issue、repo、base branch", "branch、commit、验证现场", "workspace.py"],
+      codex: ["Codex app-server", "Runtime 通过 JSON-RPC 完成 initialize、thread/start、turn/start、动态工具调用和进程组清理。", "Prompt、cwd、sandbox、tools", "thread/turn ids、events", "codex_app_server.py"],
+      provider: ["GitHub / GitLab", "Agent 按 WORKFLOW 创建或复用 PR/MR、检查 CI、处理 review 并执行 merge。", "branch、commit、provider auth", "review URL、checks、merge", "WORKFLOW.md"],
+      report: ["ReportPublisher", "校验结构化报告，原子持久化 JSON/HTML，渲染固定页面并维护 Linear 报告评论。", "symphonz_report payload", "artifact、stable URL、sync state", "reporting.py"],
+      store: ["RuntimeStore", "SQLite 权威历史，保存 issue_runs、runtime_events、runtime_errors、reports、dashboard_sessions 和 login_attempts。", "milestones、errors、reports、sessions", "Dashboard 查询与恢复状态", "runtime_store.py"],
+      dashboard: ["Dashboard + Auth", "所有业务页面与 API 先验证 session；稳定报告 route 只读取 RuntimeStore 指向的权威 generation。", "cookie、RuntimeStore、artifact reader", "tasks、timeline、errors、report", "dashboard.py · auth.py"]
     };
 
     const sequenceData = {
-      poll: ["01 · poll_once()", "Runner 按 interval_ms 调用 Orchestrator.poll_once()，开始一轮候选 Issue 调度。"],
-      "linear-query": ["02 · fetch candidates", "Orchestrator 调用 LinearClient.fetch_candidate_issues(active_states)，由客户端发送 SymphonzPoll GraphQL 查询。"],
-      candidate: ["03 · issues[]", "Linear 返回标准化 Issue；Orchestrator 再检查 required_labels 和 state.running。"],
-      workspace: ["04 · prepare_workspace", "使用安全化后的 identifier 创建或复用 .symphonz/workspace/<issue_identifier>。"],
-      hook: ["05 · workspace ready", "仅在目录首次创建时运行 after_create hook；默认 clone 目标仓库并 fetch 基础分支。"],
-      prompt: ["06 · render_prompt", "Orchestrator 在本地把 identifier、title、description、state、labels 和 URL 注入 WORKFLOW.md 正文模板。"],
-      spawn: ["07 · spawn app-server", "在 Issue workspace 中启动 codex.command，并把 stdin/stdout 作为 JSON-RPC 通道。"],
-      initialize: ["08 · initialize", "发送 clientInfo{name:symphonz, version} 与 experimentalApi capability。"],
-      "initialize-result": ["09 · initialize result", "Codex app-server 返回 initialize 请求的 JSON-RPC result；错误会立即阻塞本次 Issue。"],
-      initialized: ["10 · initialized", "Symphonz 发送无 id 的 initialized 通知，完成 app-server 客户端握手。"],
-      thread: ["11 · thread/start", "创建 thread，cwd 指向 workspace，同时传入 approvalPolicy、sandbox 和可执行的 linear_graphql dynamic tool。"],
-      "thread-result": ["12 · thread.id", "Codex 返回 thread.id；缺失 id 会被视为无效响应并阻塞本次 Issue。"],
-      turn: ["13 · turn/start", "把渲染后的 Prompt 作为 text input，并关联 threadId、title 和 sandboxPolicy。"],
-      events: ["14 · event stream", "持续读取 turn/* 通知；completed 结束本次 turn，failed 或异常进入 blocked。"],
-      state: ["15 · Runtime State", "从 running 移出 Issue，补充 session_id 和时间，再写入 completed 或 blocked。"]
+      poll: ["01 · Poll", "按 active_states 分页查询 Linear；查询失败记录 tracker error，不消耗 Codex attempt。"],
+      eligibility: ["02 · Eligibility", "检查标签、依赖、claim、终态和 attempt budget，然后按 Linear 状态选择 Prompt 路由。"],
+      workspace: ["03 · Workspace", "创建或复用 issue 目录，运行 hook，并把 cwd 与 sandbox policy 传给 Codex。"],
+      initialize: ["04 · initialize", "启动 app-server 后发送 clientInfo、当前版本和 experimental API capability，等待对应 result。"],
+      initialized: ["05 · initialized", "initialize 成功后发送无 request id 的 initialized notification，完成握手。"],
+      thread: ["06 · thread/start", "创建 thread，声明 cwd、approval policy、sandbox，以及 linear_graphql 和 symphonz_report。"],
+      turn: ["07 · turn/start", "把渲染后的完整 WORKFLOW Prompt 作为 text input，并关联 thread id、title 和 turn sandbox。"],
+      "linear-tool": ["08 · linear_graphql", "Runtime 校验单一 GraphQL operation，使用配置的 Linear client 执行并把结构化 result 返回 Codex。"],
+      "report-tool": ["09 · symphonz_report", "Runtime 校验 issue identity 和报告 schema；Agent 永远不能提交任意 HTML 或脚本。"],
+      persist: ["10 · Persist", "任务、结构化里程碑、错误、报告元数据和 session 写入 WAL SQLite；完整事件另写 JSONL。"],
+      "report-sync": ["11 · Linear sync", "issue-scoped lease 保护一个 Runtime-owned 评论；失败保留 pending，并由后台 synchronizer 重试。"],
+      "human-review": ["12 · Human Review", "报告和 review 链接 synced 后进入人工审核门；该状态默认不触发 Codex。"],
+      "terminal-cleanup": ["13 · Terminal cleanup", "Done/Closed/Cancelled/Canceled/Duplicate 触发 workspace 清理，Store 与报告 artifact 继续保留。"]
     };
 
     const componentNodes = Array.from(document.querySelectorAll("[data-component]"));
@@ -2032,13 +763,12 @@ Effective route from `Merging -> integrate`:
       const detail = componentData[name];
       if (!detail) return;
       componentNodes.forEach(node => node.setAttribute("aria-pressed", String(node.dataset.component === name)));
-      detailTitle.textContent = detail.title;
-      detailDescription.textContent = detail.description;
-      detailInput.textContent = detail.input;
-      detailOutput.textContent = detail.output;
-      detailCode.textContent = detail.code;
+      detailTitle.textContent = detail[0];
+      detailDescription.textContent = detail[1];
+      detailInput.textContent = detail[2];
+      detailOutput.textContent = detail[3];
+      detailCode.textContent = detail[4];
     }
-
     componentNodes.forEach(node => node.addEventListener("click", () => selectComponent(node.dataset.component)));
 
     const sequenceSteps = Array.from(document.querySelectorAll("[data-sequence-step]"));
@@ -2057,37 +787,27 @@ Effective route from `Merging -> integrate`:
       sequenceTitle.textContent = detail[0];
       sequenceDescription.textContent = detail[1];
     }
-
     function stopPlayback() {
       if (playTimer !== null) window.clearInterval(playTimer);
       playTimer = null;
       playLabel.textContent = "播放链路";
       playButton.setAttribute("aria-label", "播放 Codex 触发链路");
     }
-
     function startPlayback() {
-      if (reducedMotionQuery.matches) return;
+      if (reducedMotionQuery.matches || sequenceSteps.length === 0) return;
       stopPlayback();
       playIndex = 0;
-      selectSequence(sequenceSteps[playIndex].dataset.sequenceStep);
+      selectSequence(sequenceSteps[0].dataset.sequenceStep);
       playLabel.textContent = "停止播放";
       playButton.setAttribute("aria-label", "停止播放 Codex 触发链路");
       playTimer = window.setInterval(() => {
         playIndex += 1;
-        if (playIndex >= sequenceSteps.length) {
-          stopPlayback();
-          return;
-        }
+        if (playIndex >= sequenceSteps.length) { stopPlayback(); return; }
         selectSequence(sequenceSteps[playIndex].dataset.sequenceStep);
       }, 850);
     }
-
-    sequenceSteps.forEach(step => step.addEventListener("click", () => {
-      stopPlayback();
-      selectSequence(step.dataset.sequenceStep);
-    }));
+    sequenceSteps.forEach(step => step.addEventListener("click", () => { stopPlayback(); selectSequence(step.dataset.sequenceStep); }));
     playButton.addEventListener("click", () => playTimer === null ? startPlayback() : stopPlayback());
-
     function configureMotionPreference() {
       stopPlayback();
       playButton.disabled = reducedMotionQuery.matches;
@@ -2096,10 +816,7 @@ Effective route from `Merging -> integrate`:
         playButton.setAttribute("aria-label", "自动播放已因减少动态效果设置而停用");
       }
     }
-
-    if (typeof reducedMotionQuery.addEventListener === "function") {
-      reducedMotionQuery.addEventListener("change", configureMotionPreference);
-    }
+    if (typeof reducedMotionQuery.addEventListener === "function") reducedMotionQuery.addEventListener("change", configureMotionPreference);
     configureMotionPreference();
   </script>
 </body>
