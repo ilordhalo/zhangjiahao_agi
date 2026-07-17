@@ -269,3 +269,30 @@ messages while the complete suite exited successfully.
     tests changed, with no local paths or plaintext password fixtures in
     production/documentation/report files.
 11. `docs/index.html` remains deferred and unchanged.
+
+## Final Semantic TOML Gap
+
+- Root-level TOML key definitions that semantically create `dashboard`, including
+  bare dotted keys, quoted keys, Unicode-escaped quoted keys, and inline tables,
+  are now detected before dashboard classification can select legacy mode.
+- The scanner reuses the existing TOML key-path decoder for headers and key
+  assignments. It only considers assignments before a table header to be root
+  definitions, so `dashboard.*` keys under unrelated tables remain valid and
+  byte-preserved by `configure-dashboard`.
+- Any root dashboard definition, including one combined with canonical
+  `[dashboard]`, now fails closed with resolution guidance before password
+  prompting, `.gitignore`, config, or auth mutation.
+- Added a direct `_write_synced_file` close-failure test proving an earlier
+  write error remains the exception cause; existing committed-close tests
+  continue to cover warning-only cleanup diagnostics after durable commits.
+
+### Final Gap TDD and Validation
+
+1. RED: root dotted and inline dashboard definitions were accepted by
+   `configure-dashboard`, while runtime reached generic ambiguity handling
+   instead of identifying their semantic dashboard definition.
+2. GREEN focused tests: PASS, 5 tests covering bare, quoted, Unicode-escaped,
+   and inline roots; canonical-plus-root conflict; no getpass or mutations;
+   unrelated nested key preservation; and direct write/close failure precedence.
+3. Complete CLI and service modules: PASS, 221 tests in 16.340s.
+4. Dashboard non-socket handler, startup, and template modules: PASS, 10 tests.

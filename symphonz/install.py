@@ -36,6 +36,7 @@ _ARRAY_TABLE_HEADER = re.compile(
     rf"^[ \t]*\[\[[ \t]*(?P<name>{_TOML_KEY_PATH})"
     r"[ \t]*\]\][ \t]*(?:#.*)?$"
 )
+_TOML_KEY_VALUE = re.compile(rf"^[ \t]*(?P<name>{_TOML_KEY_PATH})[ \t]*=")
 _GENERATED_TOML_STRING = re.compile(r'^"(?:\\["\\]|[^"\\\r\n])*"$')
 _LEGACY_CONFIG_LAYOUT = (
     "[runtime]",
@@ -305,8 +306,22 @@ def _table_header_path(line: str) -> tuple[bool, tuple[str, ...]] | None:
     if match is None:
         return None
 
+    parts = _decode_toml_key_path(match.group("name"))
+    if parts is None:
+        return None
+    return is_array, parts
+
+
+def _toml_key_value_path(line: str) -> tuple[str, ...] | None:
+    match = _TOML_KEY_VALUE.match(line.rstrip("\r\n"))
+    if match is None:
+        return None
+    return _decode_toml_key_path(match.group("name"))
+
+
+def _decode_toml_key_path(key_path: str) -> tuple[str, ...] | None:
     parts = []
-    for key_match in _TOML_KEY_PART_PATTERN.finditer(match.group("name")):
+    for key_match in _TOML_KEY_PART_PATTERN.finditer(key_path):
         value = key_match.group(0)
         if value.startswith('"'):
             decoded = _decode_basic_toml_key(value)
@@ -316,7 +331,7 @@ def _table_header_path(line: str) -> tuple[bool, tuple[str, ...]] | None:
         elif value.startswith("'"):
             value = value[1:-1]
         parts.append(value)
-    return is_array, tuple(parts)
+    return tuple(parts)
 
 
 def _decode_basic_toml_key(value: str) -> str | None:
@@ -372,10 +387,25 @@ def classify_dashboard_config(content: str) -> str:
 
 def _classify_dashboard_tables(content: str) -> str | None:
     dashboard_headers = []
+    root_dashboard_definitions = []
+    current_table: tuple[bool, tuple[str, ...]] | None = None
     for line in content.splitlines():
         header = _table_header_path(line)
-        if header is not None and header[1] and header[1][0] == "dashboard":
-            dashboard_headers.append(header)
+        if header is not None:
+            current_table = header
+            if header[1] and header[1][0] == "dashboard":
+                dashboard_headers.append(header)
+            continue
+        if current_table is None:
+            key_path = _toml_key_value_path(line)
+            if key_path and key_path[0] == "dashboard":
+                root_dashboard_definitions.append(key_path)
+
+    if root_dashboard_definitions:
+        raise RuntimeError(
+            "Configuration contains a root-level dashboard definition; resolve it to a single canonical "
+            "[dashboard] section, then run `symphonz configure-dashboard`"
+        )
 
     direct_tables = [header for header in dashboard_headers if not header[0] and header[1] == ("dashboard",)]
     if len(direct_tables) > 1 and len(direct_tables) == len(dashboard_headers):

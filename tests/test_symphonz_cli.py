@@ -14,6 +14,7 @@ from unittest.mock import patch
 from symphonz.cli import main
 from symphonz.install import (
     InstallConfig,
+    _write_synced_file,
     collect_install_config,
     configure_dashboard,
     detect_git_defaults,
@@ -42,6 +43,20 @@ def _legacy_config_content() -> str:
 
 
 class ConfigTests(unittest.TestCase):
+    def test_write_synced_file_keeps_write_error_primary_when_close_also_fails(self):
+        class FailingOutput:
+            def write(self, content):
+                raise OSError("write failed")
+
+            def close(self):
+                raise OSError("close failed")
+
+        with self.assertRaisesRegex(RuntimeError, "write failed.*close failed") as raised:
+            _write_synced_file(FailingOutput(), "content", "test close")
+
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertEqual(str(raised.exception.__cause__), "write failed")
+
     def test_auth_config_is_private_hashed_and_gitignored(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -718,6 +733,91 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(read_config(config_path)["dashboard"]["host"], "127.0.0.2")
             self.assertNotIn("environment-secret", content)
             self.assertIn(".symphonz/artifacts/", (root / ".gitignore").read_text())
+
+    def test_root_dashboard_definitions_are_rejected_before_password_or_mutation(self):
+        definitions = [
+            'dashboard.host = "127.0.0.1"',
+            '"dashboard".host = "127.0.0.1"',
+            '"dash\\u0062oard".host = "127.0.0.1"',
+            'dashboard = { host = "127.0.0.1" }',
+        ]
+        for definition in definitions:
+            with self.subTest(definition=definition), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_path = root / ".symphonz" / "config.toml"
+                config_path.parent.mkdir()
+                original = definition + "\n" + _legacy_config_content()
+                config_path.write_text(original)
+                getpass_calls = []
+
+                with self.assertRaisesRegex(RuntimeError, "root-level dashboard definition.*configure-dashboard"):
+                    configure_dashboard(
+                        root,
+                        getpass_func=lambda prompt: getpass_calls.append(prompt) or "unexpected-password",
+                    )
+
+                self.assertEqual(getpass_calls, [])
+                self.assertEqual(config_path.read_text(), original)
+                self.assertFalse((root / ".gitignore").exists())
+                self.assertFalse((root / ".symphonz" / "auth.toml").exists())
+
+    def test_configure_dashboard_rejects_canonical_table_and_root_definition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / ".symphonz" / "config.toml"
+            write_config(
+                config_path,
+                InstallConfig(
+                    runtime_mode="embedded",
+                    runtime_command="symphonz-internal",
+                    linear_api_key_env="LINEAR_API_KEY",
+                    linear_project_slug="project",
+                    git_provider="github",
+                    repo_url="https://github.com/example/project.git",
+                    base_branch="main",
+                    mr_target="main",
+                    gitlab_base_url="",
+                    workspace_root=".symphonz/workspace",
+                    logs_root=".symphonz/logs",
+                ),
+            )
+            original = 'dashboard.host = "127.0.0.1"\n' + config_path.read_text()
+            config_path.write_text(original)
+
+            with self.assertRaisesRegex(RuntimeError, "root-level dashboard definition.*configure-dashboard"):
+                configure_dashboard(root, password="unexpected-password")
+
+            self.assertEqual(config_path.read_text(), original)
+            self.assertFalse((root / ".gitignore").exists())
+            self.assertFalse((root / ".symphonz" / "auth.toml").exists())
+
+    def test_configure_dashboard_preserves_unrelated_nested_dashboard_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / ".symphonz" / "config.toml"
+            write_config(
+                config_path,
+                InstallConfig(
+                    runtime_mode="embedded",
+                    runtime_command="symphonz-internal",
+                    linear_api_key_env="LINEAR_API_KEY",
+                    linear_project_slug="project",
+                    git_provider="github",
+                    repo_url="https://github.com/example/project.git",
+                    base_branch="main",
+                    mr_target="main",
+                    gitlab_base_url="",
+                    workspace_root=".symphonz/workspace",
+                    logs_root=".symphonz/logs",
+                ),
+            )
+            nested = '[unrelated]\ndashboard.host = "preserve-me"\n'
+            config_path.write_text(config_path.read_text() + "\n" + nested)
+
+            configure_dashboard(root, port=4200, password="nested-key-password")
+
+            self.assertIn(nested, config_path.read_text())
+            self.assertEqual(read_config(config_path)["dashboard"]["port"], "4200")
 
     def test_configure_dashboard_migrates_no_dashboard_config_with_comments(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1624,6 +1724,23 @@ class RuntimeTests(unittest.TestCase):
 
                 self.assertFalse(service.call_args.kwargs["_legacy_unauthenticated_dashboard"])
                 self.assertEqual(service.call_args.kwargs["dashboard_username"], "admin")
+
+    def test_root_dashboard_definitions_never_enable_legacy_mode(self):
+        definitions = [
+            'dashboard.host = "127.0.0.1"',
+            '"dashboard".host = "127.0.0.1"',
+            '"dash\\u0062oard".host = "127.0.0.1"',
+            'dashboard = { host = "127.0.0.1" }',
+        ]
+        for definition in definitions:
+            with self.subTest(definition=definition), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_path = root / ".symphonz" / "config.toml"
+                config_path.parent.mkdir()
+                config_path.write_text(definition + "\n" + _legacy_config_content())
+
+                with self.assertRaisesRegex(RuntimeError, "root-level dashboard definition.*configure-dashboard"):
+                    build_run_command(root, port=4700)
 
     def test_noncanonical_dashboard_tables_fail_closed_before_runtime(self):
         headers = [
