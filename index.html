@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      name="description"
+      content="基于 ZHA-5 AGI 调研报告的交互式本地网页，展示当前 AI 进展与 AGI 相关性的排序、信号和风险。"
+    >
+    <title>AGI 进展观测台</title>
+    <link rel="stylesheet" href="src/styles.css">
+    <script src="src/main.js" defer></script>
+  </head>
+  <body>
+    <header class="site-header" aria-label="站点导航">
+      <a class="brand" href="#hero" aria-label="回到顶部">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span>AGI 进展观测台</span>
+      </a>
+      <nav class="nav-links" aria-label="页面分区">
+        <a href="#ranking">排序</a>
+        <a href="#domains">图谱</a>
+        <a href="#signals">观察</a>
+        <a href="#sources">来源</a>
+      </nav>
+    </header>
+
+    <main>
+      <section id="hero" class="hero section-band" aria-labelledby="hero-title">
+        <canvas id="intelligenceMap" aria-hidden="true"></canvas>
+        <div class="hero-inner">
+          <p class="eyebrow">截至 2026-07-07 · ZHA-5 调研转译</p>
+          <h1 id="hero-title">哪些 AI 新进展更接近 AGI？</h1>
+          <p class="hero-copy">
+            这不是“谁已经实现 AGI”的排行榜，而是把公开模型、智能体、世界模型、机器人、评测与安全信号
+            放在同一张图上，判断哪些进展更直接触及通用智能的核心能力。
+          </p>
+          <div class="hero-actions" aria-label="快速跳转">
+            <a class="primary-link" href="#ranking">查看相关性排序</a>
+            <a class="secondary-link" href="#domains">筛选能力图谱</a>
+          </div>
+          <dl class="signal-strip" aria-label="核心结论">
+            <div>
+              <dt>最高相关</dt>
+              <dd>长周期智能体</dd>
+            </div>
+            <div>
+              <dt>关键机制</dt>
+              <dd>推理时扩展</dd>
+            </div>
+            <div>
+              <dt>现实入口</dt>
+              <dd>世界模型与具身智能</dd>
+            </div>
+          </dl>
+        </div>
+      </section>
+
+      <section class="intro section-band" aria-labelledby="summary-title">
+        <div class="section-inner intro-grid">
+          <div>
+            <p class="eyebrow">执行摘要</p>
+            <h2 id="summary-title">能力重心正在从“回答”转向“行动”。</h2>
+          </div>
+          <p>
+            ZHA-5 的核心判断是：AGI 相关性最强的信号，不是单次问答榜单继续上涨，而是模型能否在开放环境中
+            维持目标、拆解任务、使用工具、观察失败并持续修正。智能体、可验证推理、世界模型和具身反馈，
+            是比单纯参数规模或视频生成质量更直接的 AGI 线索。
+          </p>
+        </div>
+      </section>
+
+      <section id="ranking" class="section-band ranking" aria-labelledby="ranking-title">
+        <div class="section-inner">
+          <div class="section-heading">
+            <p class="eyebrow">AGI 相关性排序</p>
+            <h2 id="ranking-title">九类进展，按“是否触及通用智能核心能力”排序。</h2>
+          </div>
+          <div class="ranking-list" aria-label="AGI 相关性排行榜">
+            <article class="rank-card rank-card-strong">
+              <span class="rank-number">01</span>
+              <h3>长周期智能体、电脑使用、工具使用、编码与研究代理</h3>
+              <p>最接近实用 AGI 定义：在真实环境中完成多步任务，而不是只输出答案。</p>
+              <div class="score-line" aria-label="AGI相关性 5分"><span style="width: 100%"></span></div>
+            </article>
+            <article class="rank-card rank-card-strong">
+              <span class="rank-number">02</span>
+              <h3>推理时扩展、思考预算、RL 训练出的推理行为</h3>
+              <p>能力提升越来越来自搜索、验证、分解和自我纠错，而不是一次前向生成。</p>
+              <div class="score-line" aria-label="AGI相关性 5分"><span style="width: 100%"></span></div>
+            </article>
+            <article class="rank-card">
+              <span class="rank-number">03</span>
+              <h3>世界模型、交互式仿真、多模态时空一致性</h3>
+              <p>智能体需要预测行动后果；可导航动态世界是更接近环境建模的信号。</p>
+              <div class="score-line" aria-label="AGI相关性 4分"><span style="width: 80%"></span></div>
+            </article>
+            <article class="rank-card">
+              <span class="rank-number">04</span>
+              <h3>具身智能和机器人基础模型</h3>
+              <p>现实物体、空间反馈和安全约束直接考验泛化，但公开证据仍以演示为主。</p>
+              <div class="score-line" aria-label="AGI相关性 4分"><span style="width: 80%"></span></div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="domains" class="section-band domains" aria-labelledby="domains-title">
+        <div class="section-inner">
+          <div class="section-heading with-controls">
+            <div>
+              <p class="eyebrow">交互式能力图谱</p>
+              <h2 id="domains-title">按方向筛选 AGI 信号。</h2>
+            </div>
+            <div class="filter-bar" role="group" aria-label="筛选能力方向">
+              <button type="button" data-filter="all" aria-pressed="true">全部</button>
+              <button type="button" data-filter="agent" aria-pressed="false">智能体</button>
+              <button type="button" data-filter="embodied" aria-pressed="false">世界与具身</button>
+              <button type="button" data-filter="evals" aria-pressed="false">评测安全</button>
+              <button type="button" data-filter="infra" aria-pressed="false">基础设施</button>
+            </div>
+          </div>
+          <p id="filterStatus" class="filter-status" aria-live="polite">显示全部 AGI 相关方向。</p>
+          <div id="domainGrid" class="domain-grid" aria-label="能力方向卡片"></div>
+        </div>
+      </section>
+
+      <section id="signals" class="section-band signals" aria-labelledby="signals-title">
+        <div class="section-inner signals-layout">
+          <div class="section-heading">
+            <p class="eyebrow">未来 6-12 个月观察指标</p>
+            <h2 id="signals-title">真正值得盯的不是单点演示，而是稳定性曲线。</h2>
+          </div>
+          <div id="signalList" class="signal-list" aria-label="观察指标列表"></div>
+        </div>
+      </section>
+
+      <section id="uncertainty" class="section-band uncertainty" aria-labelledby="uncertainty-title">
+        <div class="section-inner">
+          <div class="section-heading">
+            <p class="eyebrow">反信号与不确定性</p>
+            <h2 id="uncertainty-title">越接近 AGI，可靠性和安全边界越重要。</h2>
+          </div>
+          <div class="risk-grid">
+            <article>
+              <h3>供应商评测需要复核</h3>
+              <p>模型卡和发布页提供方向性证据，但应与第三方评测、可复现实验和真实工作流结果一起判断。</p>
+            </article>
+            <article>
+              <h3>长任务最缺可靠性</h3>
+              <p>智能体能完成惊艳任务，也会在权限、目标漂移、文件状态和提示注入上犯错。</p>
+            </article>
+            <article>
+              <h3>世界模型不等于物理理解</h3>
+              <p>视频一致性与可导航环境是信号，但仍不代表模型掌握可迁移因果动力学。</p>
+            </article>
+            <article>
+              <h3>安全能力和危险能力共生</h3>
+              <p>更强的编码、网络安全、生物化学和研究辅助能力，同时提高生产力与误用风险。</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="sources" class="section-band sources" aria-labelledby="sources-title">
+        <div class="section-inner source-layout">
+          <div>
+            <p class="eyebrow">资料来源</p>
+            <h2 id="sources-title">内容基于本仓库追踪的 ZHA-5 中文研究报告。</h2>
+            <p>
+              完整报告保存在
+              <code>docs/research/agi-related-ai-progress-2026-07.md</code>，包含排序依据、证据强弱和参考链接。
+            </p>
+          </div>
+          <ul class="source-links" aria-label="代表性来源">
+            <li><a href="https://openai.com/index/introducing-gpt-5-5/">OpenAI GPT-5.5</a></li>
+            <li><a href="https://www.anthropic.com/news/claude-sonnet-5">Anthropic Claude Sonnet 5</a></li>
+            <li><a href="https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-3-5/">Google Gemini 3.5</a></li>
+            <li><a href="https://deepmind.google/blog/genie-3-a-new-frontier-for-world-models/">Google DeepMind Genie 3</a></li>
+            <li><a href="https://metr.org/time-horizons/">METR time horizons</a></li>
+            <li><a href="https://arcprize.org/arc-agi/2">ARC-AGI-2</a></li>
+          </ul>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
